@@ -1,0 +1,98 @@
+# VAE 批次訓練實驗配置文件
+# Batch Training Experiments Configuration
+
+# 基礎配置 (所有實驗共用的預設值)
+base_config:
+  data_root: './npz_dataset'
+  out_dir: './runs'
+  epochs: 50
+  batch_size: 32
+  lr: 0.001
+  kl_beta: 0.001
+  seed: 42
+
+# 實驗列表 (會覆蓋 base_config 中的對應參數)
+experiments:
+  
+  - name: baseline
+    description: 基礎模型，無增強
+    params:
+      aug_mode: enumerate
+  
+  - name: rot_y_4x
+    description: Y軸旋轉增強 (4x)
+    params:
+      aug_mode: enumerate
+      aug_rot_y: true
+  
+  - name: rot_xyz_64x
+    description: 三軸旋轉增強 (64x)
+    params:
+      aug_mode: enumerate
+      aug_rot_x: true
+      aug_rot_y: true
+      aug_rot_z: true
+  
+  - name: full_aug_512x
+    description: 全增強 旋轉+翻轉 (512x)
+    params:
+      aug_mode: enumerate
+      aug_rot_x: true
+      aug_rot_y: true
+      aug_rot_z: true
+      aug_flip_x: true
+      aug_flip_y: true
+      aug_flip_z: true
+  
+  - name: weighted_loss
+    description: 加權損失 (降低空氣權重)
+    params:
+      aug_mode: enumerate
+      aug_rot_y: true
+      class_weights: '0.5,1.0,1.0'
+  
+  - name: high_kl_beta
+    description: 高 KL 權重 (更強正則化)
+    params:
+      aug_mode: enumerate
+      aug_rot_y: true
+      kl_beta: 0.01
+  
+  - name: large_latent_512
+    description: 大潛在空間 (512維)
+    params:
+      aug_mode: enumerate
+      aug_rot_y: true
+      latent_dim: 512
+  
+  - name: random_aug_full
+    description: 隨機增強模式 (runtime sampling)
+    params:
+      aug_mode: random
+      aug_rot_x: true
+      aug_rot_y: true
+      aug_rot_z: true
+      aug_flip_x: true
+      aug_flip_y: true
+      aug_flip_z: true
+
+  # 更多實驗 - 取消註解來啟用
+  
+  # - name: small_batch
+  #   description: 小批次訓練
+  #   params:
+  #     batch_size: 16
+  #     aug_rot_y: true
+  
+  # - name: low_lr
+  #   description: 低學習率
+  #   params:
+  #     lr: 0.0001
+  #     aug_rot_y: true
+  
+  # - name: longer_training
+  #   description: 更長訓練週期
+  #   params:
+  #     epochs: 100
+  #     aug_rot_y: true
+
