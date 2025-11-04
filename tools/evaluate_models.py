@@ -14,7 +14,7 @@ Usage example:
 Outputs:
 - Console: compact summary per model
 - TXT (JSON Lines) and CSV will be created under --out_dir with base name:
-  <YYYY-MM-DD_HH-MM-SS>.txt  and  <YYYY-MM-DD_HH-MM-SS>.csv
+  eval_<YYYY-MM-DD_HH-MM-SS>.txt  and  eval_<YYYY-MM-DD_HH-MM-SS>.csv
 """
 
 import argparse
@@ -27,11 +27,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 from datetime import datetime
 
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
+from rich.panel import Panel
+
 try:
     from scipy.ndimage import label as cc_label
     _HAS_SCIPY = True
 except Exception:
     _HAS_SCIPY = False
+
+# 允許 numpy 相關的全域變數以支援 PyTorch 2.6+ 的 weights_only 安全檢查
+try:
+    import numpy._core.multiarray
+    torch.serialization.add_safe_globals([numpy._core.multiarray._reconstruct])
+except (ImportError, AttributeError):
+    # 如果 numpy 版本不同或結構不同，fallback 到 weights_only=False
+    pass
 
 
 # --- Models ---
@@ -136,8 +148,10 @@ def connected_components_count(mask):
 
 # --- Core Eval ---
 @torch.no_grad()
-def eval_model(model_path, test_files, device):
-    ckpt = torch.load(model_path, map_location='cpu')
+def eval_model(model_path, test_files, device, progress=None, task=None):
+    # 使用 weights_only=False 以支援包含 numpy 物件的檢查點（PyTorch 2.6+ 相容性）
+    # 這些檢查點來自受信任的訓練過程，因此可以安全載入
+    ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
     if isinstance(ckpt, dict) and 'model' in ckpt:
         state_dict = ckpt['model']
         args = ckpt.get('args', {})
@@ -153,7 +167,7 @@ def eval_model(model_path, test_files, device):
     aryx_err, azx_err = [], []
     comps_nonair, comps_log = [], []
 
-    for f in test_files:
+    for idx, f in enumerate(test_files):
         with np.load(f, allow_pickle=False) as d:
             arr = d['arr_0'] if 'arr_0' in d else d[list(d.files)[0]]
         gt = arr.astype(np.uint8)
@@ -172,6 +186,10 @@ def eval_model(model_path, test_files, device):
         c_log = connected_components_count(pred==1)
         if c_all>=0: comps_nonair.append(c_all)
         if c_log>=0: comps_log.append(c_log)
+        
+        # 更新進度條（如果提供）
+        if progress is not None and task is not None:
+            progress.update(task, advance=1)
 
     iou, dice = iou_from_stats(agg), dice_from_stats(agg)
     conn = {}
@@ -196,10 +214,11 @@ def eval_model(model_path, test_files, device):
 
 # --- Main ---
 def main():
+    console = Console()
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", required=True, help="Path to test directory with .npz files")
     ap.add_argument("--models_dir", required=True, help="Root dir containing model checkpoints (*.pt|*.pth)")
-    ap.add_argument("--out_dir", required=True, help="Output directory; program will create <DATE_TIME>.txt and .csv here")
+    ap.add_argument("--out_dir", required=True, help="Output directory; program will create eval_<DATE_TIME>.txt and .csv here")
     ap.add_argument("--device", default="cuda", help="cuda or cpu")
     args = ap.parse_args()
 
@@ -216,12 +235,18 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    out_txt = out_dir / f"{ts}.txt"
-    out_csv = out_dir / f"{ts}.csv"
+    out_txt = out_dir / f"eval_{ts}.txt"
+    out_csv = out_dir / f"eval_{ts}.csv"
 
-    print(f"[INFO] Found {len(test_files)} test files, {len(model_files)} models, device={device}")
-    print(f"[INFO] Writing TXT to {out_txt}")
-    print(f"[INFO] Writing CSV to {out_csv}")
+    # 顯示啟動資訊
+    console.print(Panel.fit(
+        f"[bold cyan]3D VAE 模型評估[/bold cyan]\n"
+        f"測試檔案數: [yellow]{len(test_files)}[/yellow]\n"
+        f"模型數量: [yellow]{len(model_files)}[/yellow]\n"
+        f"裝置: [yellow]{device}[/yellow]\n"
+        f"輸出目錄: [cyan]{out_dir}[/cyan]",
+        border_style="cyan"
+    ))
 
     with out_txt.open("w",encoding="utf-8") as ft, open(out_csv,"w",newline="",encoding="utf-8") as fc:
         writer = csv.writer(fc)
@@ -239,36 +264,77 @@ def main():
             "scipy_connectivity": _HAS_SCIPY,
             "timestamp": ts
         }
-        print(json.dumps({"run_header": run_header}, ensure_ascii=False))
+        console.print(json.dumps({"run_header": run_header}, ensure_ascii=False))
         ft.write(json.dumps({"run_header": run_header}, ensure_ascii=False) + "\n")
 
-        for mp in model_files:
-            print(f"\n[MODEL] {mp}")
-            try:
-                res = eval_model(mp,test_files,device)
-            except Exception as e:
-                err = str(e)
-                print(f"  [ERROR] {err}")
-                ft.write(json.dumps({"model":str(mp),"error":err},ensure_ascii=False)+"\n")
-                writer.writerow([str(mp)] + [""]*15 + [err])
-                continue
+        # 使用 Rich 進度條評估所有模型
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            models_task = progress.add_task(
+                f"[cyan]評估模型中...",
+                total=len(model_files)
+            )
 
-            iou,dice=res["iou"],res["dice"]
-            print(f"  IoU={res['iou_mean']:.4f} Dice={res['dice_mean']:.4f} OccErr={res['occ_err']:.4f}")
-            ft.write(json.dumps(res,ensure_ascii=False)+"\n")
+            for idx, mp in enumerate(model_files, 1):
+                model_name = mp.name
+                progress.update(models_task, description=f"[cyan]評估模型 {idx}/{len(model_files)}: {model_name}")
+                
+                try:
+                    # 為每個模型創建測試檔案進度條
+                    test_task = progress.add_task(
+                        f"[dim]處理測試檔案...",
+                        total=len(test_files),
+                        visible=len(test_files) > 10  # 只有測試檔案很多時才顯示
+                    )
+                    
+                    res = eval_model(mp, test_files, device, progress, test_task)
+                    
+                    # 移除測試檔案進度條
+                    progress.remove_task(test_task)
+                    
+                    iou, dice = res["iou"], res["dice"]
+                    console.print(
+                        f"[green]✓[/green] [{idx}/{len(model_files)}] {model_name}\n"
+                        f"  [dim]IoU={res['iou_mean']:.4f} Dice={res['dice_mean']:.4f} OccErr={res['occ_err']:.4f}[/dim]"
+                    )
+                    ft.write(json.dumps(res, ensure_ascii=False) + "\n")
 
-            conn=res["connectivity"]
-            writer.writerow([
-                res["model"], res["iou_mean"], res["dice_mean"],
-                iou[0], iou[1], iou[2],
-                dice[0], dice[1], dice[2],
-                res["occ_pred"], res["occ_gt"], res["occ_err"],
-                res["aryx_err"], res["azx_err"],
-                conn.get("non_air_mean",""), conn.get("log_mean",""),
-                conn.get("note","")
-            ])
+                    conn = res["connectivity"]
+                    writer.writerow([
+                        res["model"], res["iou_mean"], res["dice_mean"],
+                        iou[0], iou[1], iou[2],
+                        dice[0], dice[1], dice[2],
+                        res["occ_pred"], res["occ_gt"], res["occ_err"],
+                        res["aryx_err"], res["azx_err"],
+                        conn.get("non_air_mean", ""), conn.get("log_mean", ""),
+                        conn.get("note", "")
+                    ])
+                    
+                except Exception as e:
+                    err = str(e)
+                    console.print(f"[red]✗[/red] [{idx}/{len(model_files)}] {model_name}: [red]{err}[/red]")
+                    ft.write(json.dumps({"model": str(mp), "error": err}, ensure_ascii=False) + "\n")
+                    writer.writerow([str(mp)] + [""] * 15 + [err])
+                
+                # 更新模型進度條
+                progress.update(models_task, advance=1)
 
-    print("\n[DONE] Evaluation complete.")
+    console.print(Panel.fit(
+        f"[bold green]✓ 評估完成！[/bold green]\n"
+        f"結果已保存至:\n"
+        f"  [cyan]TXT: {out_txt}[/cyan]\n"
+        f"  [cyan]CSV: {out_csv}[/cyan]",
+        border_style="green"
+    ))
 
 if __name__ == "__main__":
     main()
