@@ -610,8 +610,16 @@ def train(args, resume_checkpoint=None):
     )
     val_ds = VoxelDataset(val_files, aug_mode='random', aug_perturb=False, 
                          preload=args.preload, console=console)
-    test_ds = VoxelDataset(test_files, aug_mode='random', aug_perturb=False,
-                          preload=args.preload, console=console)
+    # Test dataset: explicitly disable all augmentations for reproducible results
+    test_ds = VoxelDataset(
+        test_files, 
+        aug_mode='random',  # Mode doesn't matter when all aug flags are False
+        aug_flip_x=False, aug_flip_y=False, aug_flip_z=False,
+        aug_rot_x=False, aug_rot_y=False, aug_rot_z=False,
+        aug_perturb=False,
+        preload=args.preload, 
+        console=console
+    )
 
     # Only use pin_memory on CUDA devices
     use_pin_memory = device.type == 'cuda'
