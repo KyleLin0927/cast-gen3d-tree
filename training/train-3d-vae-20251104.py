@@ -4,6 +4,7 @@ Minecraft 3D VAE (32x32x32 voxels, 3 classes: 0=air,1=oak_log,2=oak_leaves)
 
 - Input: dataset directory containing train/val/test subdirectories with .npz files
   (each .npz file should contain a 32x32x32 int8 array)
+  OR zip file containing the same structure (automatically extracted to temp directory)
 - Model: 3D VAE with categorical reconstruction (per-voxel logits over 3 classes)
 - Output: CSV files and model in out_dir, samples in out_dir/samples/
 
@@ -86,6 +87,13 @@ python train-3d-autoencoder-20251102.py \
 
 # 訓練中按 Ctrl+C 會自動保存當前 epoch 的 checkpoint
 # 顯示恢復命令後優雅退出
+
+# 使用 zip 壓縮檔作為輸入（自動解壓縮）
+python train-3d-vae-20251104.py \
+  --data_zip ./dataset.zip \
+  --out_dir ./runs \
+  --exp_name vae_from_zip \
+  --epochs 50 --batch_size 32
 """
 
 import argparse
@@ -95,6 +103,9 @@ import random
 import time
 import csv
 import signal
+import zipfile
+import tempfile
+import shutil
 from datetime import datetime
 from glob import glob
 from pathlib import Path
@@ -129,6 +140,85 @@ def fmt_secs(s: float) -> str:
     if h > 0:
         return f"{h:d}h {m:02d}m {s:02d}s"
     return f"{m:02d}m {s:02d}s"
+
+def extract_zip_to_temp(zip_path: str, console=None) -> tuple[str, tempfile.TemporaryDirectory]:
+    """Extract zip file to a temporary directory.
+    
+    Args:
+        zip_path: Path to the zip file
+        console: Optional Rich console for progress messages
+        
+    Returns:
+        Tuple of (extracted_directory_path, TemporaryDirectory_object)
+        The TemporaryDirectory object should be kept alive during training
+        and will be cleaned up automatically when it goes out of scope.
+    """
+    if not os.path.exists(zip_path):
+        raise FileNotFoundError(f"Zip file not found: {zip_path}")
+    
+    if not zipfile.is_zipfile(zip_path):
+        raise ValueError(f"Not a valid zip file: {zip_path}")
+    
+    # Create a temporary directory
+    temp_dir = tempfile.TemporaryDirectory(prefix='train_vae_zip_')
+    extract_dir = temp_dir.name
+    
+    if console:
+        console.print(f"[cyan]Extracting zip file: {zip_path}[/cyan]")
+        console.print(f"[dim]Temporary extraction directory: {extract_dir}[/dim]")
+    
+    # Extract all files from zip
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_dir)
+        
+        # List extracted files for verification
+        extracted_files = zip_ref.namelist()
+        if console:
+            console.print(f"[green]✓[/green] Extracted {len(extracted_files)} items from zip")
+    
+    # Verify that train/val/test subdirectories exist
+    train_dir = os.path.join(extract_dir, 'train')
+    val_dir = os.path.join(extract_dir, 'val')
+    test_dir = os.path.join(extract_dir, 'test')
+    
+    # Check if structure is flat (files in root) or nested (train/val/test subdirs)
+    # Handle both cases: zip might have train/val/test at root, or nested
+    if not os.path.exists(train_dir):
+        # Try to find train directory in subdirectories
+        found_dirs = []
+        for root, dirs, files in os.walk(extract_dir):
+            if os.path.basename(root) in ['train', 'val', 'test']:
+                found_dirs.append(root)
+        
+        if not found_dirs:
+            raise ValueError(
+                f"Zip file does not contain train/val/test subdirectories.\n"
+                f"Expected structure: zip_root/train/, zip_root/val/, zip_root/test/\n"
+                f"Found in zip: {os.listdir(extract_dir)}"
+            )
+        
+        # If we found nested directories, use the parent as data_root
+        # Find the common parent of train/val/test directories
+        if len(found_dirs) >= 3:
+            # Get common parent
+            common_parent = os.path.commonpath(found_dirs)
+            extract_dir = common_parent
+            train_dir = os.path.join(extract_dir, 'train')
+            val_dir = os.path.join(extract_dir, 'val')
+            test_dir = os.path.join(extract_dir, 'test')
+    
+    # Final verification
+    if not os.path.exists(train_dir):
+        raise ValueError(f"train/ directory not found in extracted zip (checked: {train_dir})")
+    if not os.path.exists(val_dir):
+        raise ValueError(f"val/ directory not found in extracted zip (checked: {val_dir})")
+    if not os.path.exists(test_dir):
+        raise ValueError(f"test/ directory not found in extracted zip (checked: {test_dir})")
+    
+    if console:
+        console.print(f"[green]✓[/green] Verified train/val/test structure in extracted directory")
+    
+    return extract_dir, temp_dir
 
 # ----------------------
 # Dataset & Augmentations
@@ -538,7 +628,11 @@ def train(args, resume_checkpoint=None):
     if class_weights is None:
         console.print("[bold]Class weights:[/bold] NONE (uniform)")
     else:
+        # Explicitly show which weight corresponds to which class
         console.print(f"[bold]Class weights:[/bold] {class_weights.tolist()}")
+        console.print(f"[dim]  • weight[0] = {class_weights[0]:.4f} → class 0 (air)[/dim]")
+        console.print(f"[dim]  • weight[1] = {class_weights[1]:.4f} → class 1 (oak_log/wood)[/dim]")
+        console.print(f"[dim]  • weight[2] = {class_weights[2]:.4f} → class 2 (oak_leaves)[/dim]")
     
     console.print(f"[bold]Augmentation:[/bold] mode={args.aug_mode}, "
                   f"Dataset size: train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}\n")
@@ -548,9 +642,19 @@ def train(args, resume_checkpoint=None):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     
     # Use new API for GradScaler (torch >= 2.0)
-    # Enable AMP for CUDA, disable for MPS (MPS has its own optimizations) and CPU
-    use_amp = device.type == 'cuda'
+    # Enable AMP for CUDA by default, but allow disabling via --no_amp flag
+    # Disable for MPS (MPS has its own optimizations) and CPU
+    use_amp = (device.type == 'cuda') and not args.no_amp
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp) if use_amp else None
+    
+    # Display AMP status
+    if device.type == 'cuda':
+        if use_amp:
+            console.print(f"[bold]AMP:[/bold] [green]ENABLED[/green] (mixed precision training)")
+        else:
+            console.print(f"[bold]AMP:[/bold] [yellow]DISABLED[/yellow] (full precision training)")
+    else:
+        console.print(f"[bold]AMP:[/bold] [dim]N/A (not using CUDA)[/dim]")
 
     # Create experiment directory and subdirectories
     os.makedirs(exp_dir, exist_ok=True)
@@ -657,16 +761,55 @@ def train(args, resume_checkpoint=None):
             # Training phase
             model.train()
             running = 0.0
-            for onehot, labels in train_loader:
+            # Track class distribution and logits stats for debugging (first epoch only)
+            if epoch == start_epoch:
+                class_counts = torch.zeros(3, dtype=torch.long, device=device)
+                logits_stats_collected = False  # Only collect stats from first batch
+            
+            for batch_idx, (onehot, labels) in enumerate(train_loader):
                 # Check for interruption during training
                 if interrupted['flag']:
                     break
                     
                 onehot = onehot.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
+                
+                # Track class distribution for debugging (first epoch only)
+                if epoch == start_epoch:
+                    for c in range(3):
+                        class_counts[c] += (labels == c).sum().item()
+                
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                     logits, mu, logvar = model(onehot)
+                    
+                    # Collect logits statistics for debugging (first epoch, first batch only)
+                    if epoch == start_epoch and batch_idx == 0 and not logits_stats_collected:
+                        # Convert to float32 for accurate statistics
+                        logits_fp32 = logits.float().detach()
+                        logits_mean = logits_fp32.mean().item()
+                        logits_std = logits_fp32.std().item()
+                        logits_min = logits_fp32.min().item()
+                        logits_max = logits_fp32.max().item()
+                        # Per-class logits stats (mean over spatial dimensions)
+                        logits_per_class = logits_fp32.mean(dim=(2, 3, 4))  # [B, 3]
+                        logits_per_class_mean = logits_per_class.mean(dim=0).cpu().tolist()  # [3]
+                        
+                        console.print(f"[dim]Logits statistics (first batch, epoch {epoch}):[/dim]")
+                        console.print(f"[dim]  • Overall: mean={logits_mean:.4f}, std={logits_std:.4f}, min={logits_min:.4f}, max={logits_max:.4f}[/dim]")
+                        console.print(f"[dim]  • Per class (mean logits):[/dim]")
+                        console.print(f"[dim]    - class 0 (air): {logits_per_class_mean[0]:.4f}[/dim]")
+                        console.print(f"[dim]    - class 1 (wood): {logits_per_class_mean[1]:.4f}[/dim]")
+                        console.print(f"[dim]    - class 2 (leaves): {logits_per_class_mean[2]:.4f}[/dim]")
+                        
+                        # Check for potential underflow issues
+                        if abs(logits_max) < 1.0 or abs(logits_min) < 1.0:
+                            console.print(f"[yellow]⚠ Warning: Logits values are very small (max={logits_max:.4f}, min={logits_min:.4f})[/yellow]")
+                            console.print(f"[yellow]  This might indicate precision issues, especially with AMP enabled.[/yellow]")
+                            console.print(f"[yellow]  Try --no_amp to disable mixed precision training.[/yellow]")
+                        
+                        logits_stats_collected = True
+                    
                     ce = F.cross_entropy(
                         logits, labels.long(),
                         weight=(class_weights.to(device) if class_weights is not None else None)
@@ -687,6 +830,15 @@ def train(args, resume_checkpoint=None):
                 progress.update(epoch_task, advance=1)
             
             train_loss = running / len(train_loader.dataset)
+            
+            # Display class distribution for first epoch
+            if epoch == start_epoch:
+                total_voxels = class_counts.sum().item()
+                if total_voxels > 0:
+                    console.print(f"[dim]Class distribution (first batch):[/dim]")
+                    console.print(f"[dim]  • class 0 (air): {class_counts[0].item():,} ({100*class_counts[0].item()/total_voxels:.1f}%)[/dim]")
+                    console.print(f"[dim]  • class 1 (wood): {class_counts[1].item():,} ({100*class_counts[1].item()/total_voxels:.1f}%)[/dim]")
+                    console.print(f"[dim]  • class 2 (leaves): {class_counts[2].item():,} ({100*class_counts[2].item()/total_voxels:.1f}%)[/dim]")
             
             # Switch to validation phase (update task description)
             progress.update(epoch_task, description=f"[yellow]Epoch {epoch}/{args.epochs} - Validation")
@@ -928,6 +1080,8 @@ def train(args, resume_checkpoint=None):
         'seed': args.seed,
         'force_cpu': bool_to_str(args.cpu),
         'device': str(device),
+        'amp_enabled': bool_to_str(use_amp),
+        'no_amp': bool_to_str(args.no_amp),
         'preload': bool_to_str(args.preload),
         
         # Model architecture
@@ -986,6 +1140,7 @@ def train(args, resume_checkpoint=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Minecraft Tree 3D VAE")
     parser.add_argument('--data_root', type=str, required=False, help='Directory with train/val/test subdirectories')
+    parser.add_argument('--data_zip', type=str, required=False, help='Zip file containing train/val/test subdirectories (automatically extracted)')
     parser.add_argument('--out_dir', type=str, required=False, help='Base output directory')
     parser.add_argument('--exp_name', type=str, required=False, help='Experiment name (creates subdirectory in out_dir)')
     parser.add_argument('--epochs', type=int, default=50)
@@ -1013,9 +1168,17 @@ if __name__ == "__main__":
 
     # Manual class weights (air,log,leaf). Use 'none' to disable.
     parser.add_argument('--class_weights', type=str, default='none',
-                        help="Comma-separated weights for classes [air,log,leaf], e.g. '1.0,0.6,0.7'; use 'none' to disable")
+                        help="Comma-separated weights for classes [air,log,leaf], e.g. '1.0,2.0,2.0'. "
+                             "Higher weight = higher penalty for misclassification. "
+                             "Classes: 0=air, 1=oak_log/wood, 2=oak_leaves. "
+                             "Use 'none' to disable. "
+                             "Note: If model outputs are mostly empty (all air), try increasing weights for classes 1 and 2.")
 
     parser.add_argument('--cpu', action='store_true', help='Force CPU')
+    parser.add_argument('--no_amp', action='store_true',
+                        help='Disable Automatic Mixed Precision (AMP) even on CUDA. '
+                             'Useful for debugging precision issues when model outputs are mostly empty (all air). '
+                             'AMP can cause underflow in logits/gradients for highly imbalanced classification.')
     parser.add_argument('--preload', action='store_true', 
                         help='Preload all .npz files into RAM (recommended for small datasets)')
     
@@ -1103,12 +1266,27 @@ if __name__ == "__main__":
         print()
     
     # Validate required parameters
-    if not args.data_root:
-        parser.error("--data_root is required (unless resuming from checkpoint)")
+    if not args.data_root and not args.data_zip:
+        parser.error("Either --data_root or --data_zip is required (unless resuming from checkpoint)")
+    if args.data_root and args.data_zip:
+        parser.error("Cannot specify both --data_root and --data_zip. Use only one.")
     if not args.out_dir:
         parser.error("--out_dir is required (unless resuming from checkpoint)")
     if not args.exp_name:
         parser.error("--exp_name is required (unless resuming from checkpoint)")
     
+    # Handle zip file extraction
+    temp_dir_holder = []  # Keep reference to temp directory during training
+    if args.data_zip:
+        console = Console()
+        extract_dir, temp_dir = extract_zip_to_temp(args.data_zip, console=console)
+        args.data_root = extract_dir
+        temp_dir_holder.append(temp_dir)  # Keep reference alive
+        console.print(f"[green]✓[/green] Using extracted directory as data_root: {extract_dir}")
+        console.print(f"[dim]Temporary directory will be cleaned up after training completes[/dim]\n")
+    
     seed_everything(args.seed)
     train(args, resume_checkpoint=resume_checkpoint)
+    
+    # Note: temp_dir_holder will go out of scope after train() completes,
+    # which will trigger cleanup of the temporary directory

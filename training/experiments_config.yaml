@@ -4,12 +4,8 @@
 # 基礎配置 (所有實驗共用的預設值)
 base_config:
   data_root: './npz_dataset'
-  out_dir: './runs'
+  out_dir: './'
   epochs: 50
-  batch_size: 32
-  lr: 0.001
-  kl_beta: 0.001
-  seed: 42
 
 # 實驗列表 (會覆蓋 base_config 中的對應參數)
 experiments:

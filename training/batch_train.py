@@ -129,7 +129,7 @@ def build_command(params, exp_name_with_timestamp):
     params = params.copy()
     params['exp_name'] = exp_name_with_timestamp
     
-    cmd = ['python', 'train-3d-vae-20251103.py']
+    cmd = ['python', 'train-3d-vae-20251104.py']
     
     for key, value in params.items():
         if isinstance(value, bool) and value:
