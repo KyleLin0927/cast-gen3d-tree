@@ -163,7 +163,8 @@ def array_to_schematic(vox: np.ndarray, name: str) -> Schematic:
     # 三類方塊對應：0=空氣, 1=橡木木頭, 2=橡木樹葉
     AIR = BlockState("minecraft:air")
     OAK_WOOD = BlockState("minecraft:oak_wood")
-    OAK_LEAVES = BlockState("minecraft:oak_leaves")
+    # 設定 persistent=true 以防止樹葉腐敗，distance 設為 1 以符合法規定屬性
+    OAK_LEAVES = BlockState("minecraft:oak_leaves", {"persistent": "true", "distance": "1"})
     
     ID_TO_BLOCK = {
         0: AIR,        # 空氣
