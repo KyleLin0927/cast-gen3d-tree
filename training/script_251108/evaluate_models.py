@@ -10,6 +10,7 @@ stochastic variance during evaluation.
 import argparse
 import csv
 import json
+from collections import OrderedDict
 from pathlib import Path
 from datetime import datetime
 
@@ -197,6 +198,78 @@ class UNet3DVAE(nn.Module):
         mu, logvar, skips = self.encoder(x, return_skips=need_skips)
         logits = self.decoder(mu, skips if need_skips else None)  # deterministic: use mean
         return logits, mu, logvar
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint compatibility helpers
+# ---------------------------------------------------------------------------
+
+
+def _pad_tensor_channels(src: torch.Tensor, target_shape, dim: int, key: str):
+    if src.shape == target_shape:
+        return src
+
+    if len(src.shape) != len(target_shape):
+        raise RuntimeError(
+            f"Cannot adapt parameter '{key}': rank mismatch {src.shape} vs {target_shape}"
+        )
+
+    # Validate that only the requested dim needs growth.
+    for axis, (s, t) in enumerate(zip(src.shape, target_shape)):
+        if axis == dim:
+            if s > t:
+                raise RuntimeError(
+                    f"Cannot shrink parameter '{key}' along dim {dim}: {s} -> {t}"
+                )
+            continue
+        if s != t:
+            raise RuntimeError(
+                f"Cannot adapt parameter '{key}': shape mismatch {src.shape} vs {target_shape}"
+            )
+
+    dst = src.new_zeros(target_shape)
+    if dim == 0:
+        dst[: src.shape[0], ...] = src
+    elif dim == 1:
+        dst[:, : src.shape[1], ...] = src
+    else:
+        raise RuntimeError(f"Unsupported padding dim {dim} for '{key}'")
+    return dst
+
+
+def upgrade_decoder_state_dict(state_dict: dict, model_state: dict):
+    """
+    Back-fill legacy decoder weights (without zero-fill skip channels) so that
+    they match the current fixed-width skip architecture.
+    """
+    if not isinstance(state_dict, dict):
+        return state_dict, []
+
+    keys_to_adjust = [
+        ("decoder.up2.weight", 0),
+        ("decoder.up3.weight", 0),
+        ("decoder.out_block.0.weight", 1),
+    ]
+
+    upgraded = OrderedDict(state_dict)
+    adjustments = []
+
+    for key, dim in keys_to_adjust:
+        if key not in upgraded or key not in model_state:
+            continue
+        src = upgraded[key]
+        target_shape = model_state[key].shape
+        if src.shape == target_shape:
+            continue
+        padded = _pad_tensor_channels(src, target_shape, dim=dim, key=key)
+        if padded.shape != target_shape:
+            raise RuntimeError(
+                f"Failed to adapt parameter '{key}' to target shape {target_shape}"
+            )
+        upgraded[key] = padded
+        adjustments.append(key)
+
+    return upgraded, adjustments
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +470,9 @@ def eval_model(
         skip_levels = 3
 
     model = UNet3DVAE(in_ch=3, out_ch=3, base=base, latent_dim=latent, skip_levels=skip_levels).to(device)
-    model.load_state_dict(state_dict, strict=True)
+    model_state = model.state_dict()
+    adapted_state_dict, compat_adjustments = upgrade_decoder_state_dict(state_dict, model_state)
+    model.load_state_dict(adapted_state_dict, strict=True)
     model.eval()
 
     if not use_amp:
@@ -465,6 +540,7 @@ def eval_model(
         "recall_nonair": float(np.mean(recall_list)),
         "f1_nonair": float(np.mean(f1_list)),
         "model_params": model_params,
+        "compat_notes": compat_adjustments,
     }
 
 
@@ -678,6 +754,12 @@ def main():
                         f"Recall={result['recall_nonair']:.4f} "
                         f"F1={result['f1_nonair']:.4f} (non-air)[/dim]"
                     )
+
+                    compat_notes = result.get("compat_notes") or []
+                    if compat_notes:
+                        console.print(
+                            f"[yellow]  相容性調整：自動填補 {', '.join(compat_notes)}[/yellow]"
+                        )
 
                     if params:
                         lines = []
