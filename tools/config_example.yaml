@@ -3,6 +3,7 @@
 
 # 基礎配置 (所有實驗共用的預設值)
 base_config:
+  train_script: 'train_3D_UNetVAE_20251104.py'
   data_root: './npz_dataset'
   out_dir: './'
   epochs: 50
