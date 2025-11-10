@@ -52,7 +52,9 @@ def select_config_file():
         return sys.argv[1]
     
     # 尋找目錄下的 YAML 文件
+    console.log("🔍 偵測當前目錄下的 YAML 配置文件...")
     yaml_files = find_yaml_configs()
+    console.log(f"📄 找到 {len(yaml_files)} 個 YAML 配置文件: {yaml_files if yaml_files else '無'}")
     
     # 沒有找到任何 YAML 文件
     if not yaml_files:
@@ -124,12 +126,12 @@ def merge_configs(base_config, exp_params):
     merged.update(exp_params)
     return merged
 
-def build_command(params, exp_name_with_timestamp):
+def build_command(train_script, params, exp_name):
     """根據參數構建命令"""
     params = params.copy()
-    params['exp_name'] = exp_name_with_timestamp
+    params['exp_name'] = exp_name
     
-    cmd = ['python', 'train-3d-vae-20251104.py']
+    cmd = ['python', train_script]
     
     for key, value in params.items():
         if isinstance(value, bool) and value:
@@ -141,22 +143,28 @@ def build_command(params, exp_name_with_timestamp):
 
 def run_experiment(exp_config, base_config, exp_idx, total_exps):
     """執行單個實驗"""
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     exp_name = exp_config['name']
-    exp_name_with_timestamp = f"{exp_name}_{timestamp}"
     
     # 合併配置
     params = merge_configs(base_config, exp_config.get('params', {}))
+    train_script = params.pop('train_script', None)
+    if not train_script:
+        console.print(Panel.fit(
+            "[bold red]配置錯誤[/bold red]\n"
+            "請在 base_config 或實驗參數中設定 [yellow]train_script[/yellow]",
+            border_style="red"
+        ))
+        sys.exit(1)
     
     console.print(Panel.fit(
         f"[bold cyan]實驗 {exp_idx}/{total_exps}[/bold cyan]\n"
         f"名稱: [magenta]{exp_name}[/magenta]\n"
         f"說明: {exp_config.get('description', 'N/A')}\n"
-        f"完整名稱: [yellow]{exp_name_with_timestamp}[/yellow]",
+        f"完整名稱: [yellow]{exp_name}[/yellow]",
         border_style="cyan"
     ))
     
-    cmd = build_command(params, exp_name_with_timestamp)
+    cmd = build_command(train_script, params, exp_name)
     console.print(f"[dim]指令: {' '.join(cmd)}[/dim]\n")
     
     start_time = time.time()
@@ -178,7 +186,7 @@ def run_experiment(exp_config, base_config, exp_idx, total_exps):
     
     return {
         'exp_name': exp_name,
-        'exp_name_full': exp_name_with_timestamp,
+        'exp_name_full': exp_name,
         'description': exp_config.get('description', ''),
         'success': success,
         'error_msg': error_msg,
@@ -195,8 +203,10 @@ def format_duration(seconds):
     return f"{minutes}m {seconds}s"
 
 def main():
+    console.log("🚀 批次訓練程序啟動，正在初始化...")
     # 自動選擇配置文件
     config_path = select_config_file()
+    console.log(f"🧩 使用配置文件: {config_path}")
     
     console.print(Panel.fit(
         "[bold cyan]🚀 批次訓練系統啟動 (YAML 配置)[/bold cyan]\n"
@@ -206,8 +216,10 @@ def main():
     
     # 載入配置
     config = load_config(config_path)
+    console.log("✅ 配置文件載入完成")
     base_config = config.get('base_config', {})
     experiments = config.get('experiments', [])
+    console.log(f"🧪 準備執行的實驗數量: {len(experiments)}")
     
     if not experiments:
         console.print("[red]錯誤: 配置文件中沒有定義實驗[/red]")
@@ -249,10 +261,17 @@ def main():
     batch_start_time = time.time()
     
     for idx, exp_config in enumerate(experiments, 1):
+        description = f"實驗 {idx}/{len(experiments)}: {exp_config['name']}"
+        console.log(f"▶️ 開始 {description}")
         try:
             result = run_experiment(exp_config, base_config, idx, len(experiments))
             results.append(result)
+            status_text = "成功" if result['success'] else "失敗"
+            console.log(
+                f"⏱️ 完成 {description} | 狀態: {status_text} | 耗時: {format_duration(result['duration_secs'])}"
+            )
         except KeyboardInterrupt:
+            console.log("⏹️ 用戶中斷批次訓練")
             console.print("\n[yellow]用戶中斷批次訓練[/yellow]")
             break
     
