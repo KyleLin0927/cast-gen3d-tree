@@ -1136,6 +1136,8 @@ def train(args, resume_checkpoint=None):
         f"{args.kl_beta} * KL"
     )
 
+    current_script = Path(__file__).name if '__file__' in globals() else 'interactive_session'
+
     metadata = {
         'exp_name': args.exp_name,
         'resumed_from': args.resume if args.resume else 'None',
@@ -1157,6 +1159,7 @@ def train(args, resume_checkpoint=None):
         'data_root': args.data_root,
         'out_dir': args.out_dir,
         'exp_dir': exp_dir,
+        'script_name': current_script,
         'n_train_files': n_train,
         'n_val_files': n_val,
         'n_test_files': n_test,

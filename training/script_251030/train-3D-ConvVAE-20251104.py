@@ -1051,6 +1051,8 @@ def train(args, resume_checkpoint=None):
     def bool_to_str(val):
         return 'TRUE' if val else 'FALSE'
     
+    current_script = Path(__file__).name if '__file__' in globals() else 'interactive_session'
+
     metadata = {
         # Experiment info
         'exp_name': args.exp_name,
@@ -1062,6 +1064,7 @@ def train(args, resume_checkpoint=None):
         'best_model_path': best_model_path,
         'last_checkpoint_path': os.path.join(exp_dir, f'last_{args.exp_name}.pt'),
         'samples_directory': samples_dir,
+        'script_name': current_script,
         
         # Data info
         'data_root': args.data_root,
