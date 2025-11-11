@@ -164,7 +164,11 @@ def array_to_schematic(vox: np.ndarray, name: str) -> Schematic:
     AIR = BlockState("minecraft:air")
     OAK_WOOD = BlockState("minecraft:oak_wood")
     # 設定 persistent=true 以防止樹葉腐敗，distance 設為 1 以符合法規定屬性
-    OAK_LEAVES = BlockState("minecraft:oak_leaves", {"persistent": "true", "distance": "1"})
+    OAK_LEAVES = BlockState(
+        "minecraft:oak_leaves",
+        persistent="true",
+        distance="1",
+    )
     
     ID_TO_BLOCK = {
         0: AIR,        # 空氣
@@ -198,14 +202,28 @@ def inference_single(model, npz_path, device, use_amp=True):
         x = x.float()
     
     # 模型推理
+    def _extract_logits(model_output):
+        logits = model_output
+        while isinstance(logits, (tuple, list)):
+            logits = logits[0]
+        return logits
+
     if use_amp and device.type == 'cuda':
         with torch.cuda.amp.autocast():
-            logits = model(x)[0]  # (3, 32, 32, 32)
-            pred = torch.argmax(F.softmax(logits, dim=0), dim=0).cpu().numpy().astype(np.uint8)
+            logits = _extract_logits(model(x))
     else:
-        logits = model(x)[0]  # (3, 32, 32, 32)
-        pred = torch.argmax(F.softmax(logits, dim=0), dim=0).cpu().numpy().astype(np.uint8)
-    
+        logits = _extract_logits(model(x))
+
+    if logits.dim() == 5:
+        if logits.shape[0] != 1:
+            raise ValueError(
+                f"Expected batch size 1 during inference, got batch dimension {logits.shape[0]}"
+            )
+        logits = logits[0]
+    elif logits.dim() != 4:
+        raise ValueError(f"Unexpected logits shape: {tuple(logits.shape)}")
+
+    pred = torch.argmax(logits, dim=0).to(dtype=torch.uint8).cpu().numpy()
     return pred
 
 def main():
@@ -248,7 +266,7 @@ def main():
 
     # 設定裝置
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
-    use_amp = not args.no_amp
+    use_amp = (not args.no_amp) and device.type == "cuda"
 
     # 顯示啟動資訊
     console.print(f"[bold cyan]模型推理與轉換工具[/bold cyan]")
