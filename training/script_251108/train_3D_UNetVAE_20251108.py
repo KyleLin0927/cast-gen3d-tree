@@ -604,6 +604,17 @@ def train(args, resume_checkpoint=None):
         latent_dim=args.latent_dim,
         skip_levels=skip_levels_effective,
     ).to(device)
+    
+    # Count model parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable_params = total_params - trainable_params
+    
+    console.print(
+        f"[bold]Model parameters:[/bold] total={total_params:,}, "
+        f"trainable={trainable_params:,}, non-trainable={non_trainable_params:,}"
+    )
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     use_amp = (device.type == 'cuda') and not args.no_amp
@@ -1012,6 +1023,12 @@ def train(args, resume_checkpoint=None):
         'preload': bool_to_str(args.preload),
         'base': args.base,
         'latent_dim': args.latent_dim,
+        'latent_spatial_size': '4x4x4',
+        'latent_spatial_size_d': 4,
+        'latent_total_elements': args.latent_dim * 4 * 4 * 4,
+        'model_total_params': total_params,
+        'model_trainable_params': trainable_params,
+        'model_non_trainable_params': non_trainable_params,
         'use_skip_connections': bool_to_str(skip_levels_effective > 0),
         'skip_levels': skip_levels_effective,
         'aug_mode': args.aug_mode,
