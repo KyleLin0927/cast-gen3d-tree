@@ -5,6 +5,19 @@
 Evaluate 3D U-Net VAE checkpoints (.pt/.pth) on 32x32x32 voxel volumes.
 Uses the deterministic mean of the posterior (mu) for reconstruction to avoid
 stochastic variance during evaluation.
+
+Metrics (3-class: 0=air, 1=log, 2=leaves):
+
+For IoU / Dice / Precision / Recall / F1,統一輸出:
+- *_mean: 三類 (air/log/leaves) macro mean
+- *_nonair: 把 log+leaves 當一類 (binary, 相對 air)
+- *_air, *_log, *_leaves: 各別類別
+
+木頭相關額外指標 (從整體混淆矩陣計算):
+- precision_log, recall_log, f1_log (同上，只是特別關心)
+- log_overfill_ratio = FP_log / N_log
+- log_on_air_ratio = FP_log_on_air / N_air
+- log_on_leaves_ratio = FP_log_on_leaves / N_leaves
 """
 
 import argparse
@@ -201,6 +214,219 @@ class UNet3DVAE(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Shallow 16^3 bottleneck variant (single downsample)
+# ---------------------------------------------------------------------------
+
+
+class ShallowEncoder3DUNetVAE(nn.Module):
+    """
+    Down: 32 -> 16 (single downsample).
+    Returns mu/logvar at 16^3 along with optional skip tensors.
+    """
+
+    def __init__(self, in_ch=3, base=64, latent_dim=256):
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv3d(in_ch, base, 3, padding=1),
+            ResBlock3D(base),
+        )
+        self.enc2 = nn.Sequential(
+            nn.Conv3d(base, base * 2, 4, stride=2, padding=1),  # 32 -> 16
+            ResBlock3D(base * 2),
+        )
+        self.mu = nn.Conv3d(base * 2, latent_dim, 1)
+        self.logvar = nn.Conv3d(base * 2, latent_dim, 1)
+
+    def forward(self, x, return_skips: bool = True):
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        mu = self.mu(e2)
+        logvar = self.logvar(e2)
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        skips = (e1, e2) if return_skips else None
+        return mu, logvar, skips
+
+
+class ShallowDecoder3DUNetVAE(nn.Module):
+    """
+    Up: 16 -> 32 with configurable skip connections (0-2 levels).
+    """
+
+    def __init__(self, out_ch=3, base=64, latent_dim=256, skip_levels: int = 2):
+        super().__init__()
+        if skip_levels < 0 or skip_levels > 2:
+            raise ValueError("skip_levels must be between 0 and 2")
+        self.skip_levels = int(skip_levels)
+        self.use_skip_connections = self.skip_levels > 0
+
+        self.rb_latent = ResBlock3D(latent_dim)
+
+        up_in_channels = latent_dim + (base * 2 if self.skip_levels >= 1 else 0)
+        self.up = nn.ConvTranspose3d(up_in_channels, base * 2, 4, stride=2, padding=1)  # 16 -> 32
+        self.rb_up = ResBlock3D(base * 2)
+
+        out_in_channels = base * 2 + (base if self.skip_levels >= 2 else 0)
+        self.out_block = nn.Sequential(
+            nn.Conv3d(out_in_channels, base, 3, padding=1),
+            ResBlock3D(base),
+        )
+        self.out = nn.Conv3d(base, out_ch, 1)
+
+    def forward(self, z, skips=None):
+        if self.use_skip_connections:
+            if skips is None or len(skips) != 2:
+                raise ValueError("ShallowDecoder3DUNetVAE expects (e1,e2) skips when skip_levels > 0.")
+            e1, e2 = skips
+        else:
+            e1 = e2 = None
+
+        h = self.rb_latent(z)
+
+        if self.skip_levels >= 1 and e2 is not None:
+            h = torch.cat([h, e2], dim=1)
+
+        h = self.up(h)
+        h = self.rb_up(h)
+
+        if self.skip_levels >= 2 and e1 is not None:
+            h = torch.cat([h, e1], dim=1)
+
+        h = self.out_block(h)
+        logits = self.out(h)
+        return logits
+
+
+class ShallowUNet3DVAE(nn.Module):
+    def __init__(self, in_ch=3, out_ch=3, base=64, latent_dim=256, skip_levels: int = 2):
+        super().__init__()
+        if skip_levels < 0 or skip_levels > 2:
+            raise ValueError("skip_levels must be between 0 and 2")
+        self.skip_levels = int(skip_levels)
+        self.use_skip_connections = self.skip_levels > 0
+
+        self.encoder = ShallowEncoder3DUNetVAE(in_ch, base, latent_dim)
+        self.decoder = ShallowDecoder3DUNetVAE(out_ch, base, latent_dim, skip_levels=self.skip_levels)
+
+    def forward(self, x):
+        mu, logvar, skips = self.encoder(x, return_skips=self.use_skip_connections)
+        logits = self.decoder(mu, skips if self.use_skip_connections else None)
+        return logits, mu, logvar
+
+
+# ---------------------------------------------------------------------------
+# Mid 8^3 bottleneck variant (two downsamples)
+# ---------------------------------------------------------------------------
+
+
+class MidEncoder3DUNetVAE(nn.Module):
+    """
+    Down: 32 -> 16 -> 8 (spatial latent 8^3).
+    """
+
+    def __init__(self, in_ch=3, base=64, latent_dim=256):
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv3d(in_ch, base, 3, padding=1),
+            ResBlock3D(base),
+        )
+        self.enc2 = nn.Sequential(
+            nn.Conv3d(base, base * 2, 4, stride=2, padding=1),  # 32 -> 16
+            ResBlock3D(base * 2),
+        )
+        self.enc3 = nn.Sequential(
+            nn.Conv3d(base * 2, base * 4, 4, stride=2, padding=1),  # 16 -> 8
+            ResBlock3D(base * 4),
+        )
+        self.mu = nn.Conv3d(base * 4, latent_dim, 1)
+        self.logvar = nn.Conv3d(base * 4, latent_dim, 1)
+
+    def forward(self, x, return_skips: bool = True):
+        e1 = self.enc1(x)  # 32^3
+        e2 = self.enc2(e1)  # 16^3
+        e3 = self.enc3(e2)  # 8^3
+        mu = self.mu(e3)
+        logvar = self.logvar(e3)
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        skips = (e1, e2, e3) if return_skips else None
+        return mu, logvar, skips
+
+
+class MidDecoder3DUNetVAE(nn.Module):
+    """
+    Up: 8 -> 16 -> 32 with optional skip connections (levels 0-3).
+    """
+
+    def __init__(self, out_ch=3, base=64, latent_dim=256, skip_levels: int = 3):
+        super().__init__()
+        if skip_levels < 0 or skip_levels > 3:
+            raise ValueError("skip_levels must be between 0 and 3")
+        self.skip_levels = int(skip_levels)
+        self.use_skip_connections = self.skip_levels > 0
+
+        self.rb_latent = ResBlock3D(latent_dim)
+
+        up1_in_channels = latent_dim + (base * 4 if self.skip_levels >= 1 else 0)
+        self.up1 = nn.ConvTranspose3d(up1_in_channels, base * 4, 4, stride=2, padding=1)
+        self.rb_up1 = ResBlock3D(base * 4)
+
+        up2_in_channels = base * 4 + (base * 2 if self.skip_levels >= 2 else 0)
+        self.up2 = nn.ConvTranspose3d(up2_in_channels, base * 2, 4, stride=2, padding=1)
+        self.rb_up2 = ResBlock3D(base * 2)
+
+        out_in_channels = base * 2 + (base if self.skip_levels >= 3 else 0)
+        self.out_block = nn.Sequential(
+            nn.Conv3d(out_in_channels, base, 3, padding=1),
+            ResBlock3D(base),
+        )
+        self.out = nn.Conv3d(base, out_ch, 1)
+
+    def forward(self, z, skips=None):
+        if self.use_skip_connections:
+            if skips is None or len(skips) != 3:
+                raise ValueError("MidDecoder3DUNetVAE expects (e1,e2,e3) skips when skip_levels > 0.")
+            e1, e2, e3 = skips
+        else:
+            e1 = e2 = e3 = None
+
+        h = self.rb_latent(z)
+
+        if self.skip_levels >= 1 and e3 is not None:
+            h = torch.cat([h, e3], dim=1)
+
+        h = self.up1(h)
+        h = self.rb_up1(h)
+
+        if self.skip_levels >= 2 and e2 is not None:
+            h = torch.cat([h, e2], dim=1)
+
+        h = self.up2(h)
+        h = self.rb_up2(h)
+
+        if self.skip_levels >= 3 and e1 is not None:
+            h = torch.cat([h, e1], dim=1)
+
+        h = self.out_block(h)
+        logits = self.out(h)
+        return logits
+
+
+class MidUNet3DVAE(nn.Module):
+    def __init__(self, in_ch=3, out_ch=3, base=64, latent_dim=256, skip_levels: int = 3):
+        super().__init__()
+        if skip_levels < 0 or skip_levels > 3:
+            raise ValueError("skip_levels must be between 0 and 3")
+        self.skip_levels = int(skip_levels)
+        self.use_skip_connections = self.skip_levels > 0
+        self.encoder = MidEncoder3DUNetVAE(in_ch, base, latent_dim)
+        self.decoder = MidDecoder3DUNetVAE(out_ch, base, latent_dim, skip_levels=self.skip_levels)
+
+    def forward(self, x):
+        mu, logvar, skips = self.encoder(x, return_skips=self.use_skip_connections)
+        logits = self.decoder(mu, skips if self.use_skip_connections else None)
+        return logits, mu, logvar
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint compatibility helpers
 # ---------------------------------------------------------------------------
 
@@ -273,7 +499,7 @@ def upgrade_decoder_state_dict(state_dict: dict, model_state: dict):
 
 
 # ---------------------------------------------------------------------------
-# Metrics helpers (mostly reused from original evaluate_models.py)
+# Metrics helpers
 # ---------------------------------------------------------------------------
 
 
@@ -298,26 +524,26 @@ def iou_from_stats(stats):
 
 
 def dice_from_stats(stats):
-    return [(2 * tp) / (2 * tp + fp + fn) if 2 * tp + fp + fn > 0 else 1.0 for tp, fp, fn in stats]
+    return [
+        (2 * tp) / (2 * tp + fp + fn) if 2 * tp + fp + fn > 0 else 1.0
+        for tp, fp, fn in stats
+    ]
+
+
+def prec_recall_f1_from_stats(stats):
+    precisions, recalls, f1s = [], [], []
+    for tp, fp, fn in stats:
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        precisions.append(p)
+        recalls.append(r)
+        f1s.append(f1)
+    return precisions, recalls, f1s
 
 
 def occupancy_ratio(labels):
     return float((labels != 0).sum()) / labels.size
-
-
-def compute_nonair_metrics(pred, gt):
-    pred_nonair = pred != 0
-    gt_nonair = gt != 0
-
-    tp = np.logical_and(pred_nonair, gt_nonair).sum()
-    fp = np.logical_and(pred_nonair, ~gt_nonair).sum()
-    fn = np.logical_and(~pred_nonair, gt_nonair).sum()
-
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-
-    return float(precision), float(recall), float(f1)
 
 
 def aabb_spans(mask):
@@ -439,6 +665,19 @@ def extract_model_params(model, ckpt, include_weight_stats=False):
     return params
 
 
+def detect_vae_variant(state_dict):
+    if not isinstance(state_dict, dict):
+        return "deep"
+    keys = set(state_dict.keys())
+    has_enc3 = any(k.startswith("encoder.enc3") for k in keys)
+    has_enc4 = any(k.startswith("encoder.enc4") for k in keys)
+    if not has_enc3:
+        return "shallow"
+    if has_enc3 and not has_enc4:
+        return "mid"
+    return "deep"
+
+
 # ---------------------------------------------------------------------------
 # Core evaluation routine
 # ---------------------------------------------------------------------------
@@ -465,13 +704,74 @@ def eval_model(
         state_dict = ckpt
         base = 64
         latent = 256
-    skip_levels = resolve_skip_levels(args)
-    if skip_levels is None:
-        skip_levels = 3
 
-    model = UNet3DVAE(in_ch=3, out_ch=3, base=base, latent_dim=latent, skip_levels=skip_levels).to(device)
-    model_state = model.state_dict()
-    adapted_state_dict, compat_adjustments = upgrade_decoder_state_dict(state_dict, model_state)
+    vae_variant = detect_vae_variant(state_dict)
+    compat_adjustments = []
+    default_skip = 3
+    if vae_variant == "shallow":
+        default_skip = 2
+    skip_levels = resolve_skip_levels(args, default=default_skip)
+    if skip_levels is None:
+        skip_levels = default_skip
+
+    # Build model
+    if vae_variant == "shallow":
+        clamped_skip = int(max(0, min(2, int(skip_levels))))
+        if clamped_skip != skip_levels:
+            compat_adjustments.append(
+                f"clamped_skip_levels_to_{clamped_skip}_for_shallow_variant"
+            )
+        skip_levels = clamped_skip
+        model = ShallowUNet3DVAE(
+            in_ch=3,
+            out_ch=3,
+            base=base,
+            latent_dim=latent,
+            skip_levels=skip_levels,
+        ).to(device)
+        adapted_state_dict = OrderedDict(state_dict)
+        model_variant = "vae_shallow16"
+
+    elif vae_variant == "mid":
+        clamped_skip = int(max(0, min(3, int(skip_levels))))
+        if clamped_skip != skip_levels:
+            compat_adjustments.append(
+                f"clamped_skip_levels_to_{clamped_skip}_for_mid_variant"
+            )
+        skip_levels = clamped_skip
+        model = MidUNet3DVAE(
+            in_ch=3,
+            out_ch=3,
+            base=base,
+            latent_dim=latent,
+            skip_levels=skip_levels,
+        ).to(device)
+        adapted_state_dict = OrderedDict(state_dict)
+        model_variant = "vae_mid8"
+
+    else:
+        clamped_skip = int(max(0, min(3, int(skip_levels))))
+        if clamped_skip != skip_levels:
+            compat_adjustments.append(
+                f"clamped_skip_levels_to_{clamped_skip}_for_deep_variant"
+            )
+        skip_levels = clamped_skip
+        model = UNet3DVAE(
+            in_ch=3,
+            out_ch=3,
+            base=base,
+            latent_dim=latent,
+            skip_levels=skip_levels,
+        ).to(device)
+        model_state = model.state_dict()
+        adapted_state_dict, padding_notes = upgrade_decoder_state_dict(
+            state_dict, model_state
+        )
+        if padding_notes:
+            compat_adjustments.extend(padding_notes)
+        model_variant = "vae_deep4"
+
+    compat_adjustments.append(f"detected_variant={model_variant}")
     model.load_state_dict(adapted_state_dict, strict=True)
     model.eval()
 
@@ -479,11 +779,26 @@ def eval_model(
         model = model.float()
 
     model_params = extract_model_params(model, ckpt, include_weight_stats=include_weight_stats)
+    model_params["detected_variant"] = model_variant
 
+    # Aggregators
+    # agg[c] = [tp, fp, fn]
     agg = np.zeros((3, 3), dtype=np.int64)
+
+    # non-air binary confusion
+    nonair_tp = nonair_fp = nonair_fn = 0
+
+    # occupancy
     occ_pred, occ_gt = [], []
+
+    # bbox shape errors
     aryx_err, azx_err = [], []
-    precision_list, recall_list, f1_list = [], [], []
+
+    # for wood-specific stats
+    total_air = total_log = total_leaves = 0
+    total_pred_log = 0
+    fp_log_on_air = 0
+    fp_log_on_leaves = 0
 
     for idx, npz_path in enumerate(test_files):
         with np.load(npz_path, allow_pickle=False) as data:
@@ -501,44 +816,145 @@ def eval_model(
         else:
             logits, _, _ = model(x)
 
-        pred = torch.argmax(F.softmax(logits[0], dim=0), dim=0).cpu().numpy().astype(np.uint8)
+        pred = torch.argmax(F.softmax(logits[0], dim=0), dim=0).cpu().numpy().astype(
+            np.uint8
+        )
 
-        agg += np.array(compute_confusion_stats(pred, gt))
+        # Per-class confusion
+        stats = compute_confusion_stats(pred, gt)
+        agg += np.array(stats)
+
+        # Non-air confusion (binary)
+        pred_nonair = pred != 0
+        gt_nonair = gt != 0
+        nonair_tp += np.logical_and(pred_nonair, gt_nonair).sum()
+        nonair_fp += np.logical_and(pred_nonair, ~gt_nonair).sum()
+        nonair_fn += np.logical_and(~pred_nonair, gt_nonair).sum()
+
+        # Occupancy
         occ_pred.append(occupancy_ratio(pred))
         occ_gt.append(occupancy_ratio(gt))
 
-        _, (aryx_p, azx_p) = aabb_spans(pred != 0)
-        _, (aryx_g, azx_g) = aabb_spans(gt != 0)
+        # BBox aspect ratio errors (non-air)
+        _, (aryx_p, azx_p) = aabb_spans(pred_nonair)
+        _, (aryx_g, azx_g) = aabb_spans(gt_nonair)
         if aryx_g > 0:
             aryx_err.append(abs(aryx_p - aryx_g))
         if azx_g > 0:
             azx_err.append(abs(azx_p - azx_g))
 
-        precision, recall, f1 = compute_nonair_metrics(pred, gt)
-        precision_list.append(precision)
-        recall_list.append(recall)
-        f1_list.append(f1)
+        # Wood-specific counters
+        total_air += (gt == 0).sum()
+        total_log += (gt == 1).sum()
+        total_leaves += (gt == 2).sum()
+        total_pred_log += (pred == 1).sum()
+        fp_log_on_air += np.logical_and(pred == 1, gt == 0).sum()
+        fp_log_on_leaves += np.logical_and(pred == 1, gt == 2).sum()
 
         if progress is not None and task is not None:
             progress.update(task, advance=1)
 
+    # ------------------------------------------------------------------
+    # Aggregate metrics
+    # ------------------------------------------------------------------
+    # Per-class IoU, Dice
     iou = iou_from_stats(agg)
     dice = dice_from_stats(agg)
 
+    # Per-class Precision / Recall / F1
+    precisions, recalls, f1s = prec_recall_f1_from_stats(agg)
+
+    # Macro means over 3 classes
+    iou_mean = float(np.mean(iou))
+    dice_mean = float(np.mean(dice))
+    precision_mean = float(np.mean(precisions))
+    recall_mean = float(np.mean(recalls))
+    f1_mean = float(np.mean(f1s))
+
+    # Non-air binary metrics
+    if nonair_tp + nonair_fp + nonair_fn > 0:
+        iou_nonair = nonair_tp / (nonair_tp + nonair_fp + nonair_fn)
+        dice_nonair = (2 * nonair_tp) / (2 * nonair_tp + nonair_fp + nonair_fn)
+    else:
+        iou_nonair = 1.0
+        dice_nonair = 1.0
+
+    precision_nonair = (
+        nonair_tp / (nonair_tp + nonair_fp) if (nonair_tp + nonair_fp) > 0 else 0.0
+    )
+    recall_nonair = (
+        nonair_tp / (nonair_tp + nonair_fn) if (nonair_tp + nonair_fn) > 0 else 0.0
+    )
+    f1_nonair = (
+        2 * precision_nonair * recall_nonair / (precision_nonair + recall_nonair)
+        if (precision_nonair + recall_nonair) > 0
+        else 0.0
+    )
+
+    # Wood-specific: class index 1
+    tp_log, fp_log, fn_log = agg[1]
+    precision_log = precisions[1]
+    recall_log = recalls[1]
+    f1_log = f1s[1]
+
+    log_overfill_ratio = (fp_log / total_log) if total_log > 0 else 0.0
+    log_on_air_ratio = (
+        fp_log_on_air / total_air if total_air > 0 else 0.0
+    )
+    log_on_leaves_ratio = (
+        fp_log_on_leaves / total_leaves if total_leaves > 0 else 0.0
+    )
+
+    # Occupancy / shape
+    occ_pred_mean = float(np.mean(occ_pred))
+    occ_gt_mean = float(np.mean(occ_gt))
+    occ_err = float(abs(occ_pred_mean - occ_gt_mean))
+    aryx_err_mean = float(np.mean(aryx_err)) if aryx_err else 0.0
+    azx_err_mean = float(np.mean(azx_err)) if azx_err else 0.0
+
     return {
         "model": str(model_path),
-        "iou": [float(v) for v in iou],
-        "dice": [float(v) for v in dice],
-        "iou_mean": float(np.mean(iou)),
-        "dice_mean": float(np.mean(dice)),
-        "occ_pred": float(np.mean(occ_pred)),
-        "occ_gt": float(np.mean(occ_gt)),
-        "occ_err": float(abs(np.mean(occ_pred) - np.mean(occ_gt))),
-        "aryx_err": float(np.mean(aryx_err)) if aryx_err else 0.0,
-        "azx_err": float(np.mean(azx_err)) if azx_err else 0.0,
-        "precision_nonair": float(np.mean(precision_list)),
-        "recall_nonair": float(np.mean(recall_list)),
-        "f1_nonair": float(np.mean(f1_list)),
+        # IoU
+        "iou_mean": iou_mean,
+        "iou_nonair": float(iou_nonair),
+        "iou_air": float(iou[0]),
+        "iou_log": float(iou[1]),
+        "iou_leaves": float(iou[2]),
+        # Dice
+        "dice_mean": dice_mean,
+        "dice_nonair": float(dice_nonair),
+        "dice_air": float(dice[0]),
+        "dice_log": float(dice[1]),
+        "dice_leaves": float(dice[2]),
+        # Precision
+        "precision_mean": precision_mean,
+        "precision_nonair": float(precision_nonair),
+        "precision_air": float(precisions[0]),
+        "precision_log": float(precision_log),
+        "precision_leaves": float(precisions[2]),
+        # Recall
+        "recall_mean": recall_mean,
+        "recall_nonair": float(recall_nonair),
+        "recall_air": float(recalls[0]),
+        "recall_log": float(recall_log),
+        "recall_leaves": float(recalls[2]),
+        # F1
+        "f1_mean": f1_mean,
+        "f1_nonair": float(f1_nonair),
+        "f1_air": float(f1s[0]),
+        "f1_log": float(f1_log),
+        "f1_leaves": float(f1s[2]),
+        # Occupancy / shape
+        "occ_pred": occ_pred_mean,
+        "occ_gt": occ_gt_mean,
+        "occ_err": occ_err,
+        "aryx_err": aryx_err_mean,
+        "azx_err": azx_err_mean,
+        # Wood-specific error diagnostics
+        "log_overfill_ratio": float(log_overfill_ratio),
+        "log_on_air_ratio": float(log_on_air_ratio),
+        "log_on_leaves_ratio": float(log_on_leaves_ratio),
+        # Model meta
         "model_params": model_params,
         "compat_notes": compat_adjustments,
     }
@@ -653,42 +1069,72 @@ def main():
         )
     )
 
-    with out_txt.open("w", encoding="utf-8") as ft, out_csv.open("w", newline="", encoding="utf-8") as fc:
+    # CSV header
+    header = [
+        "model",
+        # IoU
+        "iou_mean",
+        "iou_nonair",
+        "iou_air",
+        "iou_log",
+        "iou_leaves",
+        # Dice
+        "dice_mean",
+        "dice_nonair",
+        "dice_air",
+        "dice_log",
+        "dice_leaves",
+        # Precision
+        "precision_mean",
+        "precision_nonair",
+        "precision_air",
+        "precision_log",
+        "precision_leaves",
+        # Recall
+        "recall_mean",
+        "recall_nonair",
+        "recall_air",
+        "recall_log",
+        "recall_leaves",
+        # F1
+        "f1_mean",
+        "f1_nonair",
+        "f1_air",
+        "f1_log",
+        "f1_leaves",
+        # Occupancy / shape
+        "occ_pred",
+        "occ_gt",
+        "occ_err",
+        "aryx_err",
+        "azx_err",
+        # Wood-specific diagnostics
+        "log_overfill_ratio",
+        "log_on_air_ratio",
+        "log_on_leaves_ratio",
+        # Model meta
+        "base",
+        "latent_dim",
+        "skip_levels",
+        "use_skip_connections",
+        "total_params",
+        "trainable_params",
+        "model_size_mb",
+        "lr",
+        "batch_size",
+        "epochs",
+        "kl_beta",
+        "checkpoint_epoch",
+        "best_val_loss",
+        # error (空字串表示成功)
+        "error",
+    ]
+
+    with out_txt.open("w", encoding="utf-8") as ft, out_csv.open(
+        "w", newline="", encoding="utf-8"
+    ) as fc:
         writer = csv.writer(fc)
-        writer.writerow(
-            [
-                "model",
-                "iou_mean",
-                "dice_mean",
-                "iou_air",
-                "iou_log",
-                "iou_leaves",
-                "dice_air",
-                "dice_log",
-                "dice_leaves",
-                "occ_pred",
-                "occ_gt",
-                "occ_err",
-                "aryx_err",
-                "azx_err",
-                "precision_nonair",
-                "recall_nonair",
-                "f1_nonair",
-                "base",
-                "latent_dim",
-                "skip_levels",
-                "use_skip_connections",
-                "total_params",
-                "trainable_params",
-                "model_size_mb",
-                "lr",
-                "batch_size",
-                "epochs",
-                "kl_beta",
-                "checkpoint_epoch",
-                "best_val_loss",
-            ]
-        )
+        writer.writerow(header)
 
         run_header = {
             "data_test_dir": str(test_dir),
@@ -722,12 +1168,15 @@ def main():
             for idx, model_path in enumerate(model_files, start=1):
                 model_name = model_path.name
                 progress.update(
-                    models_task, description=f"[cyan]評估模型 {idx}/{len(model_files)}: {model_name}"
+                    models_task,
+                    description=f"[cyan]評估模型 {idx}/{len(model_files)}: {model_name}",
                 )
 
                 try:
                     test_task = progress.add_task(
-                        "[dim]處理測試檔案...", total=len(test_files), visible=len(test_files) > 10
+                        "[dim]處理測試檔案...",
+                        total=len(test_files),
+                        visible=len(test_files) > 10,
                     )
 
                     result = eval_model(
@@ -742,99 +1191,68 @@ def main():
 
                     progress.remove_task(test_task)
 
-                    iou = result["iou"]
-                    dice = result["dice"]
                     params = result.get("model_params", {})
 
                     console.print(
                         f"[green]✓[/green] [{idx}/{len(model_files)}] {model_name}\n"
-                        f"  [dim]IoU={result['iou_mean']:.4f} Dice={result['dice_mean']:.4f} "
-                        f"OccErr={result['occ_err']:.4f}[/dim]\n"
-                        f"  [dim]Precision={result['precision_nonair']:.4f} "
-                        f"Recall={result['recall_nonair']:.4f} "
-                        f"F1={result['f1_nonair']:.4f} (non-air)[/dim]"
+                        f"  [dim]IoU_mean={result['iou_mean']:.4f} "
+                        f"IoU_log={result['iou_log']:.4f} IoU_leaves={result['iou_leaves']:.4f} "
+                        f"Prec_log={result['precision_log']:.4f} "
+                        f"Overfill={result['log_overfill_ratio']:.3f}[/dim]"
                     )
 
                     compat_notes = result.get("compat_notes") or []
                     if compat_notes:
                         console.print(
-                            f"[yellow]  相容性調整：自動填補 {', '.join(compat_notes)}[/yellow]"
+                            f"[yellow]  相容性調整：{', '.join(compat_notes)}[/yellow]"
                         )
 
-                    if params:
-                        lines = []
-                        arch = []
-                        if params.get("base") is not None:
-                            arch.append(f"base={params['base']}")
-                        if params.get("latent_dim") is not None:
-                            arch.append(f"latent={params['latent_dim']}")
-                        if params.get("skip_levels") is not None:
-                            arch.append(f"skip_levels={params['skip_levels']}")
-                        if arch:
-                            lines.append(f"  [cyan]架構:[/cyan] {', '.join(arch)}")
-                        if params.get("use_skip_connections") is not None:
-                            skip_status = "啟用" if params["use_skip_connections"] else "停用"
-                            lines.append(f"  [cyan]Skip 連接:[/cyan] {skip_status}")
-
-                        if params.get("total_params") is not None:
-                            total = params["total_params"]
-                            trainable = params.get("trainable_params", total)
-                            size_mb = params.get("model_size_mb", 0.0)
-                            lines.append(
-                                f"  [cyan]參數:[/cyan] 總計={total:,} (可訓練={trainable:,}), 大小={size_mb:.2f} MB"
-                            )
-
-                        training = []
-                        if params.get("lr") is not None:
-                            training.append(f"lr={params['lr']}")
-                        if params.get("batch_size") is not None:
-                            training.append(f"bs={params['batch_size']}")
-                        if params.get("epochs") is not None:
-                            training.append(f"epochs={params['epochs']}")
-                        if params.get("kl_beta") is not None:
-                            training.append(f"kl_beta={params['kl_beta']}")
-                        if training:
-                            lines.append(f"  [cyan]訓練:[/cyan] {', '.join(training)}")
-
-                        if params.get("checkpoint_epoch") is not None:
-                            lines.append(f"  [cyan]檢查點:[/cyan] epoch={params['checkpoint_epoch']}")
-                        if params.get("best_val_loss") is not None:
-                            lines.append(
-                                f"  [cyan]最佳驗證損失:[/cyan] {params['best_val_loss']:.4f}"
-                            )
-
-                        weight_stats = params.get("weight_stats", {})
-                        if weight_stats:
-                            ws = []
-                            for key in ["weight_mean", "weight_std", "weight_min", "weight_max"]:
-                                if key in weight_stats:
-                                    ws.append(f"{key.split('_')[1]}={weight_stats[key]:.6f}")
-                            if ws:
-                                lines.append(f"  [cyan]權重統計:[/cyan] {', '.join(ws)}")
-
-                        if lines:
-                            console.print("\n".join(lines))
-
+                    # Write JSON line
                     ft.write(json.dumps(result, ensure_ascii=False) + "\n")
 
                     row = [
                         result["model"],
+                        # IoU
                         result["iou_mean"],
+                        result["iou_nonair"],
+                        result["iou_air"],
+                        result["iou_log"],
+                        result["iou_leaves"],
+                        # Dice
                         result["dice_mean"],
-                        iou[0],
-                        iou[1],
-                        iou[2],
-                        dice[0],
-                        dice[1],
-                        dice[2],
+                        result["dice_nonair"],
+                        result["dice_air"],
+                        result["dice_log"],
+                        result["dice_leaves"],
+                        # Precision
+                        result["precision_mean"],
+                        result["precision_nonair"],
+                        result["precision_air"],
+                        result["precision_log"],
+                        result["precision_leaves"],
+                        # Recall
+                        result["recall_mean"],
+                        result["recall_nonair"],
+                        result["recall_air"],
+                        result["recall_log"],
+                        result["recall_leaves"],
+                        # F1
+                        result["f1_mean"],
+                        result["f1_nonair"],
+                        result["f1_air"],
+                        result["f1_log"],
+                        result["f1_leaves"],
+                        # Occupancy / shape
                         result["occ_pred"],
                         result["occ_gt"],
                         result["occ_err"],
                         result["aryx_err"],
                         result["azx_err"],
-                        result["precision_nonair"],
-                        result["recall_nonair"],
-                        result["f1_nonair"],
+                        # Wood-specific
+                        result["log_overfill_ratio"],
+                        result["log_on_air_ratio"],
+                        result["log_on_leaves_ratio"],
+                        # Meta
                         params.get("base", ""),
                         params.get("latent_dim", ""),
                         params.get("skip_levels", ""),
@@ -848,14 +1266,93 @@ def main():
                         params.get("kl_beta", ""),
                         params.get("checkpoint_epoch", ""),
                         params.get("best_val_loss", ""),
+                        # error
+                        "",
                     ]
                     writer.writerow(row)
 
+                    # Optional pretty print of meta
+                    if params:
+                        lines = []
+                        arch = []
+                        if params.get("base") is not None:
+                            arch.append(f"base={params['base']}")
+                        if params.get("latent_dim") is not None:
+                            arch.append(f"latent={params['latent_dim']}")
+                        if params.get("skip_levels") is not None:
+                            arch.append(f"skip_levels={params['skip_levels']}")
+                        if arch:
+                            lines.append(f"  [cyan]架構:[/cyan] {', '.join(arch)}")
+                        if params.get("use_skip_connections") is not None:
+                            skip_status = (
+                                "啟用" if params["use_skip_connections"] else "停用"
+                            )
+                            lines.append(f"  [cyan]Skip 連接:[/cyan] {skip_status}")
+                        if params.get("total_params") is not None:
+                            total = params["total_params"]
+                            trainable = params.get("trainable_params", total)
+                            size_mb = params.get("model_size_mb", 0.0)
+                            lines.append(
+                                f"  [cyan]參數:[/cyan] 總計={total:,} (可訓練={trainable:,}), 大小={size_mb:.2f} MB"
+                            )
+                        training = []
+                        if params.get("lr") is not None:
+                            training.append(f"lr={params['lr']}")
+                        if params.get("batch_size") is not None:
+                            training.append(f"bs={params['batch_size']}")
+                        if params.get("epochs") is not None:
+                            training.append(f"epochs={params['epochs']}")
+                        if params.get("kl_beta") is not None:
+                            training.append(f"kl_beta={params['kl_beta']}")
+                        if training:
+                            lines.append(f"  [cyan]訓練:[/cyan] {', '.join(training)}")
+                        if params.get("checkpoint_epoch") is not None:
+                            lines.append(
+                                f"  [cyan]檢查點:[/cyan] epoch={params['checkpoint_epoch']}"
+                            )
+                        if params.get("best_val_loss") is not None:
+                            lines.append(
+                                f"  [cyan]最佳驗證損失:[/cyan] {params['best_val_loss']:.4f}"
+                            )
+                        weight_stats = params.get("weight_stats", {})
+                        if weight_stats:
+                            ws = []
+                            for key in [
+                                "weight_mean",
+                                "weight_std",
+                                "weight_min",
+                                "weight_max",
+                            ]:
+                                if key in weight_stats:
+                                    ws.append(
+                                        f"{key.split('_')[1]}={weight_stats[key]:.6f}"
+                                    )
+                            if ws:
+                                lines.append(
+                                    f"  [cyan]權重統計:[/cyan] {', '.join(ws)}"
+                                )
+                        if lines:
+                            console.print("\n".join(lines))
+
                 except Exception as exc:
                     err = str(exc)
-                    console.print(f"[red]✗[/red] [{idx}/{len(model_files)}] {model_name}: [red]{err}[/red]")
-                    ft.write(json.dumps({"model": str(model_path), "error": err}, ensure_ascii=False) + "\n")
-                    writer.writerow([str(model_path)] + [""] * 26 + [err])
+                    console.print(
+                        f"[red]✗[/red] [{idx}/{len(model_files)}] {model_name}: [red]{err}[/red]"
+                    )
+                    ft.write(
+                        json.dumps(
+                            {"model": str(model_path), "error": err},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+
+                    # 填一列空的，最後一格放錯誤訊息
+                    writer.writerow(
+                        [str(model_path)]
+                        + [""] * (len(header) - 2)
+                        + [err]
+                    )
 
                 progress.update(models_task, advance=1)
 
@@ -872,4 +1369,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

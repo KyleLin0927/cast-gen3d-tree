@@ -205,6 +205,205 @@ class UNet3DVAE(nn.Module):
         return logits, mu, logvar
 
 
+class ShallowEncoder3DUNetVAE(nn.Module):
+    """僅下採樣一次的淺層 VAE Encoder（32 -> 16）。"""
+
+    def __init__(self, in_ch=3, base=64, latent_dim=256):
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv3d(in_ch, base, 3, padding=1),
+            ResBlock3D(base),
+        )
+        self.enc2 = nn.Sequential(
+            nn.Conv3d(base, base * 2, 4, stride=2, padding=1),  # 32 -> 16
+            ResBlock3D(base * 2),
+        )
+        self.mu = nn.Conv3d(base * 2, latent_dim, 1)
+        self.logvar = nn.Conv3d(base * 2, latent_dim, 1)
+
+    def forward(self, x, return_skips: bool = True):
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        mu = self.mu(e2)
+        logvar = self.logvar(e2)
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        skips = (e1, e2) if return_skips else None
+        return mu, logvar, skips
+
+
+class ShallowDecoder3DUNetVAE(nn.Module):
+    """淺層 VAE Decoder，16 -> 32，支援 0~2 層 skip。"""
+
+    def __init__(self, out_ch=3, base=64, latent_dim=256, skip_levels: int = 2):
+        super().__init__()
+        if skip_levels < 0 or skip_levels > 2:
+            raise ValueError("skip_levels must be between 0 and 2")
+        self.skip_levels = int(skip_levels)
+        self.use_skip_connections = self.skip_levels > 0
+
+        self.rb_latent = ResBlock3D(latent_dim)
+
+        up_in_channels = latent_dim + (base * 2 if self.skip_levels >= 1 else 0)
+        self.up = nn.ConvTranspose3d(up_in_channels, base * 2, 4, stride=2, padding=1)  # 16 -> 32
+        self.rb_up = ResBlock3D(base * 2)
+
+        out_in_channels = base * 2 + (base if self.skip_levels >= 2 else 0)
+        self.out_block = nn.Sequential(
+            nn.Conv3d(out_in_channels, base, 3, padding=1),
+            ResBlock3D(base),
+        )
+        self.out = nn.Conv3d(base, out_ch, 1)
+
+    def forward(self, z, skips=None):
+        if self.use_skip_connections:
+            if skips is None or len(skips) != 2:
+                raise ValueError("ShallowDecoder 需要 (e1,e2) skip tensors。")
+            e1, e2 = skips
+        else:
+            e1 = e2 = None
+
+        h = self.rb_latent(z)
+
+        if self.skip_levels >= 1 and e2 is not None:
+            h = torch.cat([h, e2], dim=1)
+
+        h = self.up(h)
+        h = self.rb_up(h)
+
+        if self.skip_levels >= 2 and e1 is not None:
+            h = torch.cat([h, e1], dim=1)
+
+        h = self.out_block(h)
+        logits = self.out(h)
+        return logits
+
+
+class ShallowUNet3DVAE(nn.Module):
+    """組合淺層 Encoder/Decoder 的 VAE。"""
+
+    def __init__(self, in_ch=3, out_ch=3, base=64, latent_dim=256, skip_levels: int = 2):
+        super().__init__()
+        if skip_levels < 0 or skip_levels > 2:
+            raise ValueError("skip_levels must be between 0 and 2")
+        self.skip_levels = int(skip_levels)
+        self.use_skip_connections = self.skip_levels > 0
+
+        self.encoder = ShallowEncoder3DUNetVAE(in_ch, base, latent_dim)
+        self.decoder = ShallowDecoder3DUNetVAE(out_ch, base, latent_dim, skip_levels=self.skip_levels)
+
+    def forward(self, x):
+        mu, logvar, skips = self.encoder(x, return_skips=self.use_skip_connections)
+        logits = self.decoder(mu, skips if self.use_skip_connections else None)
+        return logits, mu, logvar
+
+
+class MidEncoder3DUNetVAE(nn.Module):
+    """32→16→8 兩次下採樣的 VAE Encoder。"""
+
+    def __init__(self, in_ch=3, base=64, latent_dim=256):
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv3d(in_ch, base, 3, padding=1),
+            ResBlock3D(base),
+        )
+        self.enc2 = nn.Sequential(
+            nn.Conv3d(base, base * 2, 4, stride=2, padding=1),  # 32 -> 16
+            ResBlock3D(base * 2),
+        )
+        self.enc3 = nn.Sequential(
+            nn.Conv3d(base * 2, base * 4, 4, stride=2, padding=1),  # 16 -> 8
+            ResBlock3D(base * 4),
+        )
+        self.mu = nn.Conv3d(base * 4, latent_dim, 1)
+        self.logvar = nn.Conv3d(base * 4, latent_dim, 1)
+
+    def forward(self, x, return_skips: bool = True):
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        mu = self.mu(e3)
+        logvar = self.logvar(e3)
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        skips = (e1, e2, e3) if return_skips else None
+        return mu, logvar, skips
+
+
+class MidDecoder3DUNetVAE(nn.Module):
+    """8→16→32 的 VAE Decoder，支援 0~3 層 skip。"""
+
+    def __init__(self, out_ch=3, base=64, latent_dim=256, skip_levels: int = 3):
+        super().__init__()
+        if skip_levels < 0 or skip_levels > 3:
+            raise ValueError("skip_levels must be between 0 and 3")
+        self.skip_levels = int(skip_levels)
+        self.use_skip_connections = self.skip_levels > 0
+
+        self.rb_latent = ResBlock3D(latent_dim)
+
+        up1_in_channels = latent_dim + (base * 4 if self.skip_levels >= 1 else 0)
+        self.up1 = nn.ConvTranspose3d(up1_in_channels, base * 4, 4, stride=2, padding=1)
+        self.rb_up1 = ResBlock3D(base * 4)
+
+        up2_in_channels = base * 4 + (base * 2 if self.skip_levels >= 2 else 0)
+        self.up2 = nn.ConvTranspose3d(up2_in_channels, base * 2, 4, stride=2, padding=1)
+        self.rb_up2 = ResBlock3D(base * 2)
+
+        out_in_channels = base * 2 + (base if self.skip_levels >= 3 else 0)
+        self.out_block = nn.Sequential(
+            nn.Conv3d(out_in_channels, base, 3, padding=1),
+            ResBlock3D(base),
+        )
+        self.out = nn.Conv3d(base, out_ch, 1)
+
+    def forward(self, z, skips=None):
+        if self.use_skip_connections:
+            if skips is None or len(skips) != 3:
+                raise ValueError("MidDecoder3DUNetVAE expects (e1,e2,e3) skip tensors.")
+            e1, e2, e3 = skips
+        else:
+            e1 = e2 = e3 = None
+
+        h = self.rb_latent(z)
+
+        if self.skip_levels >= 1 and e3 is not None:
+            h = torch.cat([h, e3], dim=1)
+
+        h = self.up1(h)
+        h = self.rb_up1(h)
+
+        if self.skip_levels >= 2 and e2 is not None:
+            h = torch.cat([h, e2], dim=1)
+
+        h = self.up2(h)
+        h = self.rb_up2(h)
+
+        if self.skip_levels >= 3 and e1 is not None:
+            h = torch.cat([h, e1], dim=1)
+
+        h = self.out_block(h)
+        logits = self.out(h)
+        return logits
+
+
+class MidUNet3DVAE(nn.Module):
+    """32→16→8 瓶頸的 VAE。"""
+
+    def __init__(self, in_ch=3, out_ch=3, base=64, latent_dim=256, skip_levels: int = 3):
+        super().__init__()
+        if skip_levels < 0 or skip_levels > 3:
+            raise ValueError("skip_levels must be between 0 and 3")
+        self.skip_levels = int(skip_levels)
+        self.use_skip_connections = self.skip_levels > 0
+
+        self.encoder = MidEncoder3DUNetVAE(in_ch, base, latent_dim)
+        self.decoder = MidDecoder3DUNetVAE(out_ch, base, latent_dim, skip_levels=self.skip_levels)
+
+    def forward(self, x):
+        mu, logvar, skips = self.encoder(x, return_skips=self.use_skip_connections)
+        logits = self.decoder(mu, skips if self.use_skip_connections else None)
+        return logits, mu, logvar
+
+
 class VectorQuantizer(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int, beta: float = 0.25):
         super().__init__()
@@ -464,6 +663,19 @@ def is_vq_checkpoint(args_dict, state_dict_keys):
 
 
 # --- 工具函數 ---
+def detect_vae_variant(state_dict):
+    if not isinstance(state_dict, dict):
+        return "deep"
+    keys = set(state_dict.keys())
+    has_enc3 = any(k.startswith("encoder.enc3") for k in keys)
+    has_enc4 = any(k.startswith("encoder.enc4") for k in keys)
+    if not has_enc3:
+        return "shallow"
+    if has_enc3 and not has_enc4:
+        return "mid"
+    return "deep"
+
+
 def one_hot(labels, num_classes=3):
     """將標籤轉換為 one-hot 編碼"""
     oh = np.eye(num_classes, dtype=np.float32)[labels]
@@ -484,12 +696,15 @@ def load_model(model_path, device, use_amp=True):
         latent = 256
 
     is_vq = is_vq_checkpoint(args, state_dict.keys())
-    default_skip = 0 if is_vq else 3
-    skip_levels = resolve_skip_levels(args, default=default_skip)
-    if skip_levels is None:
-        skip_levels = default_skip
+    vae_variant = None if is_vq else detect_vae_variant(state_dict)
+    compat_notes = []
 
     if is_vq:
+        variant = "vq"
+        default_skip = 0
+        skip_levels = resolve_skip_levels(args, default=default_skip)
+        if skip_levels is None:
+            skip_levels = default_skip
         num_embeddings = 512
         beta = 0.25
         if isinstance(args, dict):
@@ -508,7 +723,53 @@ def load_model(model_path, device, use_amp=True):
             vq_beta=beta,
             skip_levels=skip_levels,
         ).to(device)
+        adapted_state_dict, _ = upgrade_decoder_state_dict(state_dict, model.state_dict())
+    elif vae_variant == "shallow":
+        variant = "shallow_vae"
+        default_skip = 2
+        skip_levels = resolve_skip_levels(args, default=default_skip)
+        if skip_levels is None:
+            skip_levels = default_skip
+        clamped_skip = int(max(0, min(2, int(skip_levels))))
+        if clamped_skip != skip_levels:
+            compat_notes.append(f"clamped_skip_levels_to_{clamped_skip}")
+        skip_levels = clamped_skip
+        model = ShallowUNet3DVAE(
+            in_ch=3,
+            out_ch=3,
+            base=base,
+            latent_dim=latent,
+            skip_levels=skip_levels,
+        ).to(device)
+        adapted_state_dict = OrderedDict(state_dict)
+    elif vae_variant == "mid":
+        variant = "mid_vae"
+        default_skip = 3
+        skip_levels = resolve_skip_levels(args, default=default_skip)
+        if skip_levels is None:
+            skip_levels = default_skip
+        clamped_skip = int(max(0, min(3, int(skip_levels))))
+        if clamped_skip != skip_levels:
+            compat_notes.append(f"clamped_skip_levels_to_{clamped_skip}")
+        skip_levels = clamped_skip
+        model = MidUNet3DVAE(
+            in_ch=3,
+            out_ch=3,
+            base=base,
+            latent_dim=latent,
+            skip_levels=skip_levels,
+        ).to(device)
+        adapted_state_dict = OrderedDict(state_dict)
     else:
+        variant = "deep_vae"
+        default_skip = 3
+        skip_levels = resolve_skip_levels(args, default=default_skip)
+        if skip_levels is None:
+            skip_levels = default_skip
+        clamped_skip = int(max(0, min(3, int(skip_levels))))
+        if clamped_skip != skip_levels:
+            compat_notes.append(f"clamped_skip_levels_to_{clamped_skip}")
+        skip_levels = clamped_skip
         model = UNet3DVAE(
             in_ch=3,
             out_ch=3,
@@ -516,14 +777,21 @@ def load_model(model_path, device, use_amp=True):
             latent_dim=latent,
             skip_levels=skip_levels,
         ).to(device)
+        model_state = model.state_dict()
+        adapted_state_dict, pad_notes = upgrade_decoder_state_dict(state_dict, model_state)
+        if pad_notes:
+            compat_notes.extend(pad_notes)
 
-    model_state = model.state_dict()
-    adapted_state_dict, _ = upgrade_decoder_state_dict(state_dict, model_state)
     model.load_state_dict(adapted_state_dict, strict=True)
     model.eval()
 
     if not use_amp:
         model = model.float()
+
+    console.print(
+        f"[dim]Detected model variant: {variant}, skip_levels={skip_levels}"
+        + (f" ({', '.join(compat_notes)})" if compat_notes else "")
+    )
 
     return model
 
