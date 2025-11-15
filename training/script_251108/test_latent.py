@@ -42,6 +42,7 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from sklearn.decomposition import PCA
 from sklearn.metrics import pairwise_distances
+from scipy.ndimage import label
 
 from rich.console import Console
 from rich.progress import (
@@ -121,7 +122,7 @@ def collect_latents(vae, loader, device, max_samples=300, progress=None, task=No
         
         # Use AMP if enabled and on CUDA
         if use_amp and device.type == "cuda":
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 # UNet3DVAE uses encoder() method, not encode()
                 mu, logvar, _ = vae.encoder(x, return_skips=False)
                 # Reparameterize to get z - use method if available, otherwise use function
@@ -162,6 +163,50 @@ def save_pca_plot(latents_flat, out_path):
     plt.close()
 
 
+def compute_iou(img1, img2):
+    """Compute Intersection over Union (IoU) between two binary segmentations.
+    
+    For multi-class segmentation, we compute IoU for each non-zero class
+    and return the mean IoU across all classes.
+    """
+    # Convert to binary: non-zero voxels are foreground
+    binary1 = (img1 > 0).astype(np.float32)
+    binary2 = (img2 > 0).astype(np.float32)
+    
+    intersection = np.sum(binary1 * binary2)
+    union = np.sum(np.maximum(binary1, binary2))
+    
+    if union == 0:
+        return 1.0  # Both are empty, perfect match
+    
+    return float(intersection / union)
+
+
+def compute_connected_components(img):
+    """Compute the number of connected components in a 3D image.
+    
+    Uses 6-connectivity (face-connected neighbors) in 3D.
+    Only face-adjacent voxels are considered connected (not edge or corner neighbors).
+    """
+    # Convert to binary: non-zero voxels are foreground
+    binary = (img > 0).astype(np.int32)
+    
+    # Use 6-connectivity (face-connected) in 3D
+    # Structure: center + 6 face neighbors (up, down, left, right, front, back)
+    structure = np.zeros((3, 3, 3), dtype=np.int32)
+    structure[1, 1, 1] = 1  # Center
+    structure[0, 1, 1] = 1  # Up
+    structure[2, 1, 1] = 1  # Down
+    structure[1, 0, 1] = 1  # Left
+    structure[1, 2, 1] = 1  # Right
+    structure[1, 1, 0] = 1  # Front
+    structure[1, 1, 2] = 1  # Back
+    
+    labeled, num_components = label(binary, structure=structure)
+    
+    return int(num_components)
+
+
 def linear_interpolation(vae, z1, z2, out_path, device, steps=10, use_amp=True):
     """
     Enhanced linear interpolation test for tree shape transition.
@@ -176,6 +221,11 @@ def linear_interpolation(vae, z1, z2, out_path, device, steps=10, use_amp=True):
     If collapse:
     - All interpolations become blob
     - Almost no variation
+    
+    Returns metrics including:
+    - Per-step IoU difference (most important for semantic shape continuity)
+    - Connected Component continuity (topology continuity)
+    - Mean Frame Diff % (quick screening metric)
     """
     zs = [(1 - t) * z1 + t * z2 for t in np.linspace(0, 1, steps)]
     
@@ -185,14 +235,52 @@ def linear_interpolation(vae, z1, z2, out_path, device, steps=10, use_amp=True):
         with torch.no_grad():
             z_input = z.unsqueeze(0).to(device)
             if use_amp and device.type == "cuda":
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     logits = vae.decoder(z_input, skips=None)[0].cpu().detach().numpy()
             else:
                 logits = vae.decoder(z_input, skips=None)[0].cpu().detach().numpy()
         decoded_images.append(logits.argmax(0))
     
-    # Calculate variation metrics to detect collapse
-    # If all images are similar (collapse), variation will be low
+    # ============================================================
+    # No.1: Per-step IoU difference (最重要)
+    # ============================================================
+    # Compute IoU between consecutive frames
+    iou_values = []
+    iou_differences = []
+    for i in range(len(decoded_images) - 1):
+        iou = compute_iou(decoded_images[i], decoded_images[i + 1])
+        iou_values.append(iou)
+        # IoU difference: 1 - IoU (higher = more different/broken)
+        iou_diff = 1.0 - iou
+        iou_differences.append(iou_diff)
+    
+    mean_iou = np.mean(iou_values) if iou_values else 0.0
+    mean_iou_diff = np.mean(iou_differences) if iou_differences else 0.0
+    max_iou_diff = np.max(iou_differences) if iou_differences else 0.0
+    std_iou_diff = np.std(iou_differences) if iou_differences else 0.0
+    
+    # ============================================================
+    # No.2: Connected Component Continuity
+    # ============================================================
+    # Compute connected component count for each frame
+    cc_counts = []
+    cc_changes = []
+    for i, img in enumerate(decoded_images):
+        cc_count = compute_connected_components(img)
+        cc_counts.append(cc_count)
+        if i > 0:
+            # Absolute change in CC count (detects sudden splits/merges)
+            cc_change = abs(cc_count - cc_counts[i - 1])
+            cc_changes.append(cc_change)
+    
+    mean_cc_count = np.mean(cc_counts) if cc_counts else 0.0
+    mean_cc_change = np.mean(cc_changes) if cc_changes else 0.0
+    max_cc_change = np.max(cc_changes) if cc_changes else 0
+    std_cc_count = np.std(cc_counts) if cc_counts else 0.0
+    
+    # ============================================================
+    # No.3: Mean Frame Diff (%) (already computed, keep for compatibility)
+    # ============================================================
     # Compute pairwise differences between consecutive frames
     frame_diffs = []
     for i in range(len(decoded_images) - 1):
@@ -201,6 +289,7 @@ def linear_interpolation(vae, z1, z2, out_path, device, steps=10, use_amp=True):
     
     mean_frame_diff = np.mean(frame_diffs) if frame_diffs else 0
     total_voxels = decoded_images[0].size
+    mean_frame_diff_ratio = mean_frame_diff / total_voxels if total_voxels > 0 else 0.0
     
     # Create visualization with max projection along Z
     fig = plt.figure(figsize=(steps * 1.5, 3))
@@ -213,7 +302,7 @@ def linear_interpolation(vae, z1, z2, out_path, device, steps=10, use_amp=True):
         plt.axis("off")
         plt.title(f"t={i/(steps-1):.2f}", fontsize=8)
     
-    plt.suptitle(f"Linear Interpolation (mean frame diff: {mean_frame_diff/total_voxels*100:.2f}%)", 
+    plt.suptitle(f"Linear Interpolation (IoU diff: {mean_iou_diff:.3f}, CC change: {mean_cc_change:.1f}, Frame diff: {mean_frame_diff_ratio*100:.2f}%)", 
                  fontsize=10, y=0.95)
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
@@ -222,13 +311,34 @@ def linear_interpolation(vae, z1, z2, out_path, device, steps=10, use_amp=True):
     # Return collapse indicator
     # If mean frame difference is very small (< 1% of voxels), likely collapse
     collapse_threshold = 0.01  # 1% of voxels
-    is_collapsed = (mean_frame_diff / total_voxels) < collapse_threshold
+    is_collapsed = mean_frame_diff_ratio < collapse_threshold
     
     return {
-        'mean_frame_diff_ratio': float(mean_frame_diff / total_voxels),
-        'is_collapsed': is_collapsed,
+        # No.1: IoU metrics (最重要)
+        'mean_iou': float(mean_iou),
+        'mean_iou_diff': float(mean_iou_diff),  # Per-step IoU difference (most important)
+        'max_iou_diff': float(max_iou_diff),
+        'std_iou_diff': float(std_iou_diff),
+        
+        # No.2: Connected Component metrics
+        'mean_cc_count': float(mean_cc_count),
+        'mean_cc_change': float(mean_cc_change),  # Connected Component continuity
+        'max_cc_change': float(max_cc_change),
+        'std_cc_count': float(std_cc_count),
+        
+        # No.3: Frame Diff metrics (for quick screening)
+        'mean_frame_diff_ratio': float(mean_frame_diff_ratio),  # Mean Frame Diff (%)
         'mean_frame_diff': float(mean_frame_diff),
-        'total_voxels': int(total_voxels)
+        'total_voxels': int(total_voxels),
+        
+        # Legacy collapse indicator
+        'is_collapsed': is_collapsed,
+        
+        # Per-step details (for debugging/analysis)
+        'iou_values': [float(x) for x in iou_values],
+        'iou_differences': [float(x) for x in iou_differences],
+        'cc_counts': [int(x) for x in cc_counts],
+        'cc_changes': [int(x) for x in cc_changes],
     }
 
 
@@ -668,6 +778,11 @@ def create_summary_reports(latent_data_dir, console):
     if merge_kl_stats(latent_data_dir, console):
         console.print(f"[green]✓[/green] Merged KL stats CSV")
     
+    # Merge interpolation stats (IoU, CC, Frame Diff metrics)
+    if merge_csv_files(latent_data_dir, "latent_interpolation_stats.csv", 
+                      "merged_interpolation_stats.csv", console):
+        console.print(f"[green]✓[/green] Merged interpolation stats CSV (IoU, CC, Frame Diff)")
+    
     # Combine PNG images (will auto-split if > 9 images)
     latent_data_path = Path(latent_data_dir)
     
@@ -971,9 +1086,20 @@ def process_single_model(vae_ckpt_path, data_root, out_dir, max_samples, device,
             use_amp=use_amp
         )
         
-        # Save interpolation collapse detection results
+        # Save interpolation collapse detection results to text file
         with open(os.path.join(out_dir, "interpolation_stats.txt"), "w") as f:
             f.write(f"Linear Interpolation Statistics:\n")
+            f.write(f"\n🥇 No.1: Per-step IoU difference (最重要):\n")
+            f.write(f"  Mean IoU: {interp_result['mean_iou']:.6f}\n")
+            f.write(f"  Mean IoU difference: {interp_result['mean_iou_diff']:.6f}\n")
+            f.write(f"  Max IoU difference: {interp_result['max_iou_diff']:.6f}\n")
+            f.write(f"  Std IoU difference: {interp_result['std_iou_diff']:.6f}\n")
+            f.write(f"\n🥈 No.2: Connected Component Continuity:\n")
+            f.write(f"  Mean CC count: {interp_result['mean_cc_count']:.2f}\n")
+            f.write(f"  Mean CC change: {interp_result['mean_cc_change']:.2f}\n")
+            f.write(f"  Max CC change: {interp_result['max_cc_change']}\n")
+            f.write(f"  Std CC count: {interp_result['std_cc_count']:.2f}\n")
+            f.write(f"\n🥉 No.3: Mean Frame Diff (%):\n")
             f.write(f"  Mean frame difference ratio: {interp_result['mean_frame_diff_ratio']:.6f} ({interp_result['mean_frame_diff_ratio']*100:.2f}%)\n")
             f.write(f"  Mean frame difference: {interp_result['mean_frame_diff']:.0f} voxels\n")
             f.write(f"  Total voxels: {interp_result['total_voxels']}\n")
@@ -986,9 +1112,47 @@ def process_single_model(vae_ckpt_path, data_root, out_dir, max_samples, device,
             else:
                 f.write(f"\n✓ Interpolation shows variation - latent space appears healthy.\n")
         
-        # Print warning to console if collapsed
+        # Save key metrics to CSV file
+        interpolation_csv_data = {
+            # No.1: IoU metrics (最重要)
+            'mean_iou': [interp_result['mean_iou']],
+            'mean_iou_diff': [interp_result['mean_iou_diff']],  # Per-step IoU difference (most important)
+            'max_iou_diff': [interp_result['max_iou_diff']],
+            'std_iou_diff': [interp_result['std_iou_diff']],
+            
+            # No.2: Connected Component metrics
+            'mean_cc_count': [interp_result['mean_cc_count']],
+            'mean_cc_change': [interp_result['mean_cc_change']],  # Connected Component continuity
+            'max_cc_change': [interp_result['max_cc_change']],
+            'std_cc_count': [interp_result['std_cc_count']],
+            
+            # No.3: Frame Diff metrics (for quick screening)
+            'mean_frame_diff_ratio': [interp_result['mean_frame_diff_ratio']],  # Mean Frame Diff (%)
+            'mean_frame_diff': [interp_result['mean_frame_diff']],
+            'total_voxels': [interp_result['total_voxels']],
+            
+            # Legacy collapse indicator
+            'is_collapsed': [interp_result['is_collapsed']],
+        }
+        
+        if pd is not None:
+            df_interp = pd.DataFrame(interpolation_csv_data)
+            df_interp.to_csv(os.path.join(out_dir, "latent_interpolation_stats.csv"), index=False)
+        else:
+            # Fallback: save as text CSV
+            csv_path = os.path.join(out_dir, "latent_interpolation_stats.csv")
+            with open(csv_path, 'w') as f:
+                # Write header
+                f.write(",".join(interpolation_csv_data.keys()) + "\n")
+                # Write values
+                f.write(",".join([str(v[0]) for v in interpolation_csv_data.values()]) + "\n")
+        
+        # Print warnings to console
         if interp_result['is_collapsed']:
             console.print(f"[yellow]⚠[/yellow] Interpolation collapse detected: frame_diff_ratio={interp_result['mean_frame_diff_ratio']*100:.2f}% < 1%")
+        
+        # Print key metrics
+        console.print(f"[dim]  IoU diff: {interp_result['mean_iou_diff']:.4f}, CC change: {interp_result['mean_cc_change']:.2f}, Frame diff: {interp_result['mean_frame_diff_ratio']*100:.2f}%[/dim]")
 
     # -------------------------
     # 6. Decoder(random noise)
@@ -997,7 +1161,7 @@ def process_single_model(vae_ckpt_path, data_root, out_dir, max_samples, device,
         z_rand = torch.randn_like(z1).unsqueeze(0).to(device)
         with torch.no_grad():
             if use_amp and device.type == "cuda":
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     logits = vae.decoder(z_rand, skips=None)[0].cpu().detach().numpy()
             else:
                 logits = vae.decoder(z_rand, skips=None)[0].cpu().detach().numpy()
@@ -1017,14 +1181,14 @@ def main(args):
     
     # Display AMP status
     use_amp = not args.no_amp
-    amp_status = "启用" if use_amp else "禁用"
+    amp_status = "啟用" if use_amp else "停用"
     amp_warning = ""
     if not use_amp:
-        amp_warning = "\n[dim]AMP 已禁用: 使用 float32 以获得最高精度[/dim]"
+        amp_warning = "\n[dim]AMP 已停用: 使用 float32 以獲得最高精度[/dim]"
     elif device.type == "cuda":
-        amp_warning = "\n[dim]AMP 已启用: 使用 float16 加速推理（CUDA）[/dim]"
+        amp_warning = "\n[dim]AMP 已啟用: 使用 float16 加速推理（CUDA）[/dim]"
     else:
-        amp_warning = "\n[dim]AMP 仅在 CUDA 设备上有效[/dim]"
+        amp_warning = "\n[dim]AMP 僅在 CUDA 設備上有效[/dim]"
     
     console.print(Panel.fit(
         f"[bold cyan]VAE Latent Diagnostics Tool[/bold cyan]\n"
