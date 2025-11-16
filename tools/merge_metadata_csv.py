@@ -13,7 +13,6 @@ import argparse
 import csv
 from collections import defaultdict
 from pathlib import Path
-from datetime import datetime
 
 from rich.console import Console
 from rich.panel import Panel
@@ -80,8 +79,8 @@ def main():
     )
     parser.add_argument(
         "--output",
-        default=None,
-        help="輸出 CSV 檔案名稱（預設：merged_metadata_YYYY-MM-DD_HH-MM-SS.csv）",
+        default="metadata_summary.csv",
+        help="輸出 CSV 檔案名稱（預設：metadata_summary.csv）",
     )
     args = parser.parse_args()
 
@@ -183,11 +182,7 @@ def main():
         raise SystemExit(1)
 
     # 確定輸出檔案名稱
-    if args.output:
-        output_csv = models_dir / args.output
-    else:
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_csv = models_dir / f"merged_metadata_{ts}.csv"
+    output_csv = models_dir / args.output
 
     # 合併所有 metadata
     # 使用第一個找到的 CSV 的 header
