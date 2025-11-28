@@ -18,13 +18,28 @@
    - --strip-only-entities           ：只清除「實體」
    - --strip-only-tile-entities      ：只清除「方塊實體」
    三者互斥（不可同時使用）
+   - 注意：如果原始文件缺少 Entities/TileEntities 鍵（表示沒有實體數據），
+     會自動跳過實體清除步驟，因為沒有實體需要處理
 8) 跳過超尺寸：
    - --skip-if-oversize 當任一 Region 大於 32x32x32 且需要裁切時，整檔跳過不輸出
 9) 遞迴搜尋所有子資料夾，並保持輸出資料夾結構與輸入資料夾結構相同
+10) 錯誤處理：
+    - --verbose-errors：顯示詳細的錯誤堆棧跟踪信息（用於調試）
+    - 默認只顯示簡單錯誤信息（文件名: 錯誤消息）
+
+重要說明：
+- 本腳本「絕對不會修改原始文件」，所有操作都是只讀
+- 如果遇到缺少 Entities/TileEntities 鍵的文件：
+  * 會在內存中修復 NBT 數據（使用臨時文件）
+  * 加載修復後的數據進行處理
+  * 處理完成後刪除臨時文件
+  * 原始文件保持不變
+- 所有輸出都寫入到 --out 指定的輸出資料夾
 """
 
 import argparse
 import re
+import traceback
 from pathlib import Path
 from typing import Iterable, Tuple
 
@@ -380,6 +395,61 @@ def clear_all_entities(schem: Schematic, mode: str) -> int:
     return total
 
 
+# ========================= NBT 修復 =========================
+def safe_load_schematic(file_path: Path) -> tuple[Schematic, bool]:
+    """
+    安全地加載 Schematic，如果遇到缺失 Entities/TileEntities 鍵的錯誤，會在內存中修復（不保存文件）。
+    返回 (Schematic, has_entities)
+    - has_entities: False 表示原始文件缺少 Entities/TileEntities 鍵（沒有實體數據）
+    """
+    try:
+        # 先嘗試正常加載
+        schem = Schematic.load(str(file_path))
+        return schem, True  # 正常加載，假設有實體數據
+    except KeyError as e:
+        # 如果是 Entities 或 TileEntities 相關的 KeyError，在內存中修復
+        if "Entities" in str(e) or "TileEntities" in str(e):
+            try:
+                import nbtlib
+                from nbtlib import File
+                import tempfile
+                
+                # 讀取 NBT 文件（.litematic 文件是 gzipped 的）
+                nbt_file = File.load(str(file_path), gzipped=True)
+                
+                # 檢查並修復每個 Region（在內存中）
+                if "Regions" in nbt_file:
+                    for region_name, region_data in nbt_file["Regions"].items():
+                        if "Entities" not in region_data:
+                            region_data["Entities"] = nbtlib.List([])
+                        if "TileEntities" not in region_data:
+                            region_data["TileEntities"] = nbtlib.List([])
+                    
+                    # 保存到臨時文件（不修改原始文件）
+                    with tempfile.NamedTemporaryFile(suffix=".litematic", delete=False) as tmp_file:
+                        tmp_path = Path(tmp_file.name)
+                    
+                    try:
+                        nbt_file.save(str(tmp_path), gzipped=True)
+                        # 從臨時文件加載 Schematic
+                        schem = Schematic.load(str(tmp_path))
+                        # 刪除臨時文件
+                        tmp_path.unlink()
+                        # 返回 Schematic 和標記（False 表示原始文件沒有實體數據）
+                        return schem, False
+                    except Exception:
+                        # 如果失敗，清理臨時文件
+                        if tmp_path.exists():
+                            tmp_path.unlink()
+                        raise
+            except Exception as fix_err:
+                # 如果修復失敗，重新拋出原始錯誤
+                raise e from fix_err
+        
+        # 如果不是 Entities/TileEntities 相關的錯誤，直接拋出
+        raise
+
+
 # ========================= 超尺寸檢查 =========================
 def is_oversize(schem: Schematic, target=(32, 32, 32)) -> bool:
     tx, ty, tz = target
@@ -403,6 +473,7 @@ def process_one_file(
     skip_if_oversize: bool = False,
     src_root: Path | None = None,  # 新增：來源根目錄，用於計算相對路徑
     dst_root: Path | None = None,  # 新增：輸出根目錄，用於鏡像結構
+    verbose_errors: bool = False,  # 是否顯示詳細錯誤信息
 ) -> tuple[str, str]:
     """
     回傳 (status, 訊息/路徑)
@@ -410,7 +481,7 @@ def process_one_file(
     若提供 src_root 與 dst_root，會保留相對路徑結構；否則直接輸出到 out_dir
     """
     try:
-        schem = Schematic.load(str(src))
+        schem, has_entities = safe_load_schematic(src)
 
         # 若設定跳過超尺寸，且這次又會裁切（沒有 keep_original_regions），就直接跳過不輸出
         if skip_if_oversize and not keep_original_regions and is_oversize(schem, TARGET_SIZE):
@@ -426,10 +497,12 @@ def process_one_file(
                 old_reg = schem.regions[name]
                 schem.regions[name] = crop_or_pad_to_32(old_reg)
 
-        # 清除實體（若指定）
+        # 清除實體（若指定且文件有實體數據）
         removed = 0
         if strip_mode != "none":
-            removed = clear_all_entities(schem, strip_mode)
+            if has_entities:
+                removed = clear_all_entities(schem, strip_mode)
+            # 如果 has_entities 為 False，表示原始文件沒有實體數據，跳過實體清除步驟
 
         # 計算輸出路徑（保留相對路徑結構）
         if src_root is not None and dst_root is not None:
@@ -449,7 +522,15 @@ def process_one_file(
         return "ok", str(out_path)
 
     except Exception as e:
-        return "err", f"{src.name}: {e}"
+        if verbose_errors:
+            # 显示详细的错误信息，包括异常类型和完整堆栈跟踪
+            exc_type = type(e).__name__
+            exc_msg = str(e)
+            tb_full = traceback.format_exc()
+            return "err", f"{src.name}: [{exc_type}] {exc_msg}\n{tb_full}"
+        else:
+            # 保持原来的简单错误信息格式
+            return "err", f"{src.name}: {e}"
 
 
 def iter_litematics(indir: Path) -> Iterable[Path]:
@@ -494,6 +575,13 @@ def main():
         "--skip-if-oversize",
         action="store_true",
         help="若任一 Region 超過 32x32x32 且會裁切，則整檔跳過不輸出",
+    )
+
+    # 詳細錯誤信息
+    ap.add_argument(
+        "--verbose-errors",
+        action="store_true",
+        help="顯示詳細的錯誤堆棧跟踪信息（用於調試）",
     )
 
     args = ap.parse_args()
@@ -571,6 +659,7 @@ def main():
                 skip_if_oversize=args.skip_if_oversize,
                 src_root=indir,  # 傳入來源根目錄
                 dst_root=outdir,  # 傳入輸出根目錄
+                verbose_errors=args.verbose_errors,  # 傳入詳細錯誤選項
             )
             if status == "ok":
                 ok += 1
@@ -592,7 +681,13 @@ def main():
     if fail_logs:
         rprint("\n[bold red]失敗清單[/bold red]")
         for s in fail_logs:
-            rprint(f"[red]失敗[/red] {s}")
+            # 如果错误信息包含换行符，分别显示
+            if "\n" in s:
+                lines = s.split("\n", 1)
+                rprint(f"[red]失敗[/red] {lines[0]}")
+                rprint(f"[dim]{lines[1]}[/dim]")
+            else:
+                rprint(f"[red]失敗[/red] {s}")
 
     rprint(f"\n[bold green]成功[/bold green]: {ok}  |  [bold yellow]跳過[/bold yellow]: {skipped}  |  [bold red]失敗[/bold red]: {fail}")
 
