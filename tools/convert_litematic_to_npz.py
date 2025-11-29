@@ -9,8 +9,7 @@ batch_litematic_to_npz.py
 參數：
   --input:  輸入路徑（自動檢測：如果是 .zip 檔案則從 zip 讀取，否則視為資料夾）
   --output: 輸出路徑（如果以 .zip 結尾則輸出為 zip 檔案，否則為資料夾）
-            - 如果輸出為 zip，zip 文件名（不含擴展名）會作為解壓縮後的第一層資料夾名稱
-            - 例如：output.zip → 解壓後第一層為 output/ 資料夾
+            - 輸出 zip 內部結構與輸入結構相同，不會添加額外的外層資料夾
 
 需求：
   pip install litemapy rich numpy
@@ -226,11 +225,9 @@ def main():
     # 處理輸出：根據路徑是否以 .zip 結尾判斷
     output_path_str = args.output
     use_output_zip = output_path_str.lower().endswith('.zip')
-    output_zip_base_name = None
     
     if use_output_zip:
         output_path = Path(output_path_str).expanduser().resolve()
-        output_zip_base_name = output_path.stem  # 不含擴展名的文件名，作為解壓縮後的第一層資料夾名稱
     else:
         output_path = Path(output_path_str).expanduser().resolve()
 
@@ -351,13 +348,8 @@ def main():
         console.print(f"[dim]正在將結果寫入 zip 檔案...[/dim]")
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for rel_path_str, npz_data in output_results.items():
-                # 使用輸出 zip 文件名（不含擴展名）作為最外層資料夾名稱
-                if output_zip_base_name:
-                    # 確保路徑使用正斜杠，並添加最外層資料夾
-                    zip_internal_path = f"{output_zip_base_name}/{rel_path_str}"
-                else:
-                    zip_internal_path = rel_path_str
-                zip_file.writestr(zip_internal_path, npz_data)
+                # 直接使用輸入的結構，不添加額外的外層資料夾
+                zip_file.writestr(rel_path_str, npz_data)
         console.print(f"[dim]已寫入 {len(output_results)} 個檔案到 zip[/dim]")
 
     # 輸出結果摘要
