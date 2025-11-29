@@ -164,6 +164,9 @@ class TransformerPrior(nn.Module):
         self.token_dim = token_dim
         self.max_seq = max_seq
 
+        # Learnable BOS (Beginning of Sequence) token for consistent train/inference
+        self.bos = nn.Parameter(torch.randn(1, 1, token_dim))
+
         # Project latent token dim -> model hidden dim
         self.input_proj = nn.Linear(token_dim, hidden_dim)
 
@@ -189,6 +192,7 @@ class TransformerPrior(nn.Module):
     def forward(self, x):
         """
         Forward pass through the prior to predict next-token Gaussian parameters.
+        Uses causal mask to ensure autoregressive property (no future information).
         
         Parameters
         ----------
@@ -204,11 +208,23 @@ class TransformerPrior(nn.Module):
         B, S, D = x.shape
         assert S <= self.max_seq, "Input sequence longer than max_seq"
 
+        # Input projection + positional embedding
         h = self.input_proj(x) + self.pos_emb[:, :S, :]
-        h = self.transformer(h)
-        out = self.output_proj(h)  # [B,S,2*D]
+
+        # =============== ADD CAUSAL MASK HERE ===============
+        # mask shape must be [S, S] even when batch_first=True
+        # mask[i,j] = -inf 代表 token_i 不可以看到 token_j
+        mask = torch.triu(
+            torch.full((S, S), float('-inf'), device=x.device),
+            diagonal=1
+        )
+        # =====================================================
+
+        # Transformer encoder (now behaves like GPT decoder)
+        h = self.transformer(h, mask=mask)  # <--- apply causal mask
+
+        out = self.output_proj(h)
         mu, logvar = out[..., :D], out[..., D:]
-        # Clamp logvar for numerical stability
         logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         return mu, logvar   # next-token Gaussian params
 
@@ -218,43 +234,40 @@ class TransformerPrior(nn.Module):
 
 def train_one_epoch(model, loader, opt, device):
     """
-    VAE-style prior training:
+    Autoregressive Transformer prior training:
       - model predicts (mu, logvar)
       - sample z_pred = mu + std * eps
-      - normalize by global train stats and compute MSE
-      - add KL(N(mu,std) || N(mean,std)) scaled by kl_beta
+      - compute MSE on raw latent (no normalization, no KL to avoid collapse)
+      - Pure autoregressive learning like GPT/LLaMA
+      - Uses learnable BOS token for consistent train/inference
     """
     model.train()
     total_loss = 0.0
     count = 0
 
     mse = nn.MSELoss()
-    mean = train_one_epoch.latent_mean.to(device=device, dtype=torch.float32)  # [D]
-    std = train_one_epoch.latent_std.to(device=device, dtype=torch.float32)    # [D]
-    kl_beta = train_one_epoch.kl_beta
 
     for z in loader:
         z = z.to(device)    # [B,512,latent_dim]
+        B = z.size(0)
 
-        x = z[:, :-1, :]    # input
-        y = z[:, 1:, :]     # target next-token
+        # Prepend BOS token: [BOS, z[0], z[1], ..., z[510]]
+        bos_expanded = model.bos.expand(B, -1, -1)  # [B,1,D]
+        x = torch.cat([bos_expanded, z[:, :-1, :]], dim=1)  # [B,512,D]
+        y_target = z[:, 1:, :]  # target: [z[1], z[2], ..., z[511]]  # [B,511,D]
 
-        mu, logvar = model(x)     # [B,511,D] each
-        std_pred = torch.exp(0.5 * logvar)
+        mu, logvar = model(x)     # [B,512,D] each
+        # Use predictions from position 1 onwards (skip BOS position, which predicts z[0])
+        mu_pred = mu[:, 1:, :]    # [B,511,D]
+        logvar_pred = logvar[:, 1:, :]  # [B,511,D]
+        
+        std_pred = torch.exp(0.5 * logvar_pred)
         eps = torch.randn_like(std_pred)
-        z_pred = mu + std_pred * eps
+        z_pred = mu_pred + std_pred * eps  # [B,511,D]
 
-        # normalize
-        y_norm = (y - mean) / (std + 1e-8)
-        z_pred_norm = (z_pred - mean) / (std + 1e-8)
-        mse_loss = mse(z_pred_norm, y_norm)
-
-        var_p = std_pred.pow(2) + 1e-8
-        var_q = (std + 1e-8).pow(2)
-        kl = 0.5 * (torch.log(var_q / var_p) + (var_p + (mu - mean) ** 2) / var_q - 1.0)
-        kl_loss = kl.mean()
-
-        loss = mse_loss + kl_beta * kl_loss
+        # Pure MSE loss on raw latent (no normalization, no KL)
+        loss = mse(z_pred, y_target)
+        
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -267,36 +280,31 @@ def train_one_epoch(model, loader, opt, device):
 @torch.no_grad()
 def eval_one_epoch(model, loader, device):
     """
-    Deterministic eval using mu (no sampling) + KL to empirical Gaussian.
+    Deterministic eval using mu (no sampling).
+    Uses raw latent without normalization, pure MSE loss.
+    Uses learnable BOS token for consistent train/inference.
     """
     model.eval()
     total_loss = 0.0
     count = 0
 
     mse = nn.MSELoss()
-    mean = train_one_epoch.latent_mean.to(device=device, dtype=torch.float32)
-    std = train_one_epoch.latent_std.to(device=device, dtype=torch.float32)
-    kl_beta = train_one_epoch.kl_beta
 
     for z in loader:
-        z = z.to(device)
+        z = z.to(device)  # [B,512,latent_dim]
+        B = z.size(0)
 
-        x = z[:, :-1, :]
-        y = z[:, 1:, :]
+        # Prepend BOS token: [BOS, z[0], z[1], ..., z[510]]
+        bos_expanded = model.bos.expand(B, -1, -1)  # [B,1,D]
+        x = torch.cat([bos_expanded, z[:, :-1, :]], dim=1)  # [B,512,D]
+        y_target = z[:, 1:, :]  # target: [z[1], z[2], ..., z[511]]  # [B,511,D]
 
-        mu, logvar = model(x)
-        std_pred = torch.exp(0.5 * logvar)
+        mu, logvar = model(x)  # [B,512,D] each
+        # Use predictions from position 1 onwards (skip BOS position)
+        mu_pred = mu[:, 1:, :]  # [B,511,D]
 
-        y_norm = (y - mean) / (std + 1e-8)
-        mu_norm = (mu - mean) / (std + 1e-8)
-        mse_loss = mse(mu_norm, y_norm)
-
-        var_p = std_pred.pow(2) + 1e-8
-        var_q = (std + 1e-8).pow(2)
-        kl = 0.5 * (torch.log(var_q / var_p) + (var_p + (mu - mean) ** 2) / var_q - 1.0)
-        kl_loss = kl.mean()
-
-        loss = mse_loss + kl_beta * kl_loss
+        # Pure MSE loss on raw latent (no normalization, no KL)
+        loss = mse(mu_pred, y_target)
 
         total_loss += loss.item() * z.size(0)
         count += z.size(0)
@@ -311,7 +319,7 @@ def eval_one_epoch(model, loader, device):
 def sample_latent(model, token_dim=256, seq_len=512, device="cpu", mode="mean"):
     """
     Sample one latent sequence:
-        Start with z0 = 0
+        Start with BOS token (learnable embedding)
         Predict next tokens autoregressively.
     
     Parameters
@@ -334,18 +342,28 @@ def sample_latent(model, token_dim=256, seq_len=512, device="cpu", mode="mean"):
     """
     model.eval()
 
+    # Start with BOS token, then sample seq_len tokens
+    bos = model.bos.to(device)  # [1,1,D]
     z = torch.zeros(1, seq_len, token_dim, device=device)
+    
+    # Current sequence: [BOS]
+    current_seq = bos  # [1,1,D]
 
-    for i in range(1, seq_len):
-        mu, logvar = model(z[:, :i, :])       # [1,i,D]
-        mu_t = mu[:, -1, :]
+    for i in range(seq_len):
+        mu, logvar = model(current_seq)  # [1, S, D] where S is current sequence length
+        mu_t = mu[:, -1, :]  # [1, D] - prediction for next token (z[i])
+        
         if mode == "sample":
             std_t = torch.exp(0.5 * logvar[:, -1, :])
             eps = torch.randn_like(std_t)
             next_token = mu_t + std_t * eps
         else:
             next_token = mu_t
-        z[:, i, :] = next_token
+        
+        z[:, i, :] = next_token  # Store sampled token
+        
+        # Append to sequence for next prediction: [BOS, z[0], z[1], ..., z[i]]
+        current_seq = torch.cat([current_seq, next_token.unsqueeze(1)], dim=1)  # [1, i+2, D]
 
     return z[0].cpu().numpy()
 
@@ -673,10 +691,8 @@ def main():
         var = torch.clamp(var, min=1e-8)
         train_mean_t = mean.to(dtype=torch.float32)
         train_std_t = torch.sqrt(var).to(dtype=torch.float32)
-    # attach to train/eval functions
-    train_one_epoch.latent_mean = train_mean_t
-    train_one_epoch.latent_std = train_std_t
-    train_one_epoch.kl_beta = args.kl_beta
+    # Note: train_one_epoch no longer uses latent_mean/std or kl_beta (pure MSE loss)
+    # These are still computed for analytics/diagnostics only
 
     # Prepare metadata paths
     history_csv = os.path.join(exp_dir, f"training_history_{args.exp_name}.csv")
@@ -705,9 +721,9 @@ def main():
         "layers": args.layers,
         "heads": args.heads,
         "dropout": args.dropout,
-        "loss_function": "MSE(z_pred_norm, y_norm) + kl_beta * KL(N(mu,std)||N(z_mean,z_std))",
-        "loss_formula": "z_pred = mu + std*eps; z_norm=(z-z_mean)/z_std; std=exp(0.5*logvar)",
-        "kl_beta": args.kl_beta,
+        "loss_function": "MSE(z_pred, y) - pure autoregressive loss (no normalization, no KL)",
+        "loss_formula": "z_pred = mu + std*eps; MSE computed on raw latent; std=exp(0.5*logvar); No KL loss to avoid collapse to global mean",
+        "kl_beta": "N/A (KL loss removed)",
         "training_started": start_time_dt.strftime("%Y-%m-%d %H:%M:%S"),
         "best_checkpoint": best_path,
         "sample_latent_file": os.path.join(exp_dir, "sample_latent.npy"),
@@ -782,44 +798,38 @@ def main():
             mse = nn.MSELoss()
             for z in train_loader:
                 z = z.to(device, non_blocking=True)
-                x = z[:, :-1, :]
-                y = z[:, 1:, :]
+                B = z.size(0)
+                
+                # Prepend BOS token: [BOS, z[0], z[1], ..., z[510]]
+                bos_expanded = model.bos.expand(B, -1, -1)  # [B,1,D]
+                x = torch.cat([bos_expanded, z[:, :-1, :]], dim=1)  # [B,512,D]
+                y_target = z[:, 1:, :]  # target: [z[1], z[2], ..., z[511]]  # [B,511,D]
 
                 opt.zero_grad(set_to_none=True)
                 if use_amp and scaler is not None:
                     with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                        mu, logvar = model(x)
-                        std_pred = torch.exp(0.5 * logvar)
+                        mu, logvar = model(x)  # [B,512,D] each
+                        # Use predictions from position 1 onwards (skip BOS position)
+                        mu_pred = mu[:, 1:, :]  # [B,511,D]
+                        logvar_pred = logvar[:, 1:, :]  # [B,511,D]
+                        std_pred = torch.exp(0.5 * logvar_pred)
                         eps = torch.randn_like(std_pred)
-                        z_pred = mu + std_pred * eps
-                        mean = train_one_epoch.latent_mean.to(device=device, dtype=torch.float32)
-                        std = train_one_epoch.latent_std.to(device=device, dtype=torch.float32)
-                        y_norm = (y - mean) / (std + 1e-8)
-                        z_pred_norm = (z_pred - mean) / (std + 1e-8)
-                        mse_loss = mse(z_pred_norm, y_norm)
-                        var_p = std_pred.pow(2) + 1e-8
-                        var_q = (std + 1e-8).pow(2)
-                        kl = 0.5 * (torch.log(var_q / var_p) + (var_p + (mu - mean) ** 2) / var_q - 1.0)
-                        kl_loss = kl.mean()
-                        loss = mse_loss + args.kl_beta * kl_loss
+                        z_pred = mu_pred + std_pred * eps
+                        # Pure MSE loss on raw latent (no normalization, no KL)
+                        loss = mse(z_pred, y_target)
                     scaler.scale(loss).backward()
                     scaler.step(opt)
                     scaler.update()
                 else:
-                    mu, logvar = model(x)
-                    std_pred = torch.exp(0.5 * logvar)
+                    mu, logvar = model(x)  # [B,512,D] each
+                    # Use predictions from position 1 onwards (skip BOS position)
+                    mu_pred = mu[:, 1:, :]  # [B,511,D]
+                    logvar_pred = logvar[:, 1:, :]  # [B,511,D]
+                    std_pred = torch.exp(0.5 * logvar_pred)
                     eps = torch.randn_like(std_pred)
-                    z_pred = mu + std_pred * eps
-                    mean = train_one_epoch.latent_mean.to(device=device, dtype=torch.float32)
-                    std = train_one_epoch.latent_std.to(device=device, dtype=torch.float32)
-                    y_norm = (y - mean) / (std + 1e-8)
-                    z_pred_norm = (z_pred - mean) / (std + 1e-8)
-                    mse_loss = mse(z_pred_norm, y_norm)
-                    var_p = std_pred.pow(2) + 1e-8
-                    var_q = (std + 1e-8).pow(2)
-                    kl = 0.5 * (torch.log(var_q / var_p) + (var_p + (mu - mean) ** 2) / var_q - 1.0)
-                    kl_loss = kl.mean()
-                    loss = mse_loss + args.kl_beta * kl_loss
+                    z_pred = mu_pred + std_pred * eps
+                    # Pure MSE loss on raw latent (no normalization, no KL)
+                    loss = mse(z_pred, y_target)
                     loss.backward()
                     opt.step()
 
