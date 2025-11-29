@@ -244,6 +244,9 @@ def process_split(split_name, in_dir, out_dir, model, latent_dim, device, cfg):
 
     ds = LabelFolder(in_dir)
     dl = DataLoader(ds, batch_size=1, shuffle=False)
+    n_inputs = len(ds)
+    n_outputs = 0
+    used_combos = set()
 
     with Progress(
         SpinnerColumn(),
@@ -301,8 +304,17 @@ def process_split(split_name, in_dir, out_dir, model, latent_dim, device, cfg):
 
                 save_latent(z, save_path)
 
+                n_outputs += 1
+                used_combos.add(combo)
+
             progress.update(task, advance=1)
     console.print(f"[green]✓[/green] Finished split {split_name}")
+    return {
+        "split": split_name,
+        "inputs": n_inputs,
+        "outputs": n_outputs,
+        "unique_combo_count": len(used_combos),
+    }
 
 
 # ---------------------------
@@ -366,8 +378,9 @@ def main():
     # -----------------------
     # Process three splits
     # -----------------------
+    split_stats = []
     for split in ["train", "val", "test"]:
-        process_split(
+        stats = process_split(
             split,
             os.path.join(cfg.data_dir, split),
             cfg.out_dir,
@@ -376,8 +389,70 @@ def main():
             device,
             cfg
         )
+        split_stats.append(stats)
 
-    print("\nAll latent data generated successfully!")
+    console.print("\n[bold green]All latent data generated successfully![/bold green]")
+    # -----------------------
+    # Write conversion metadata CSV
+    # -----------------------
+    out_csv = os.path.join(cfg.out_dir, "conversion_metadata.csv")
+    from datetime import datetime
+    import csv
+    started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    device_str = str(device)
+    # Try extract model args from checkpoint again
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        ckpt_args = ckpt.get("args", {})
+        base = ckpt_args.get("base", "unknown")
+        skip_levels = ckpt_args.get("skip_levels", 0 if ckpt_args.get("no_skip_connections", False) else ckpt_args.get("skip_levels", "unknown"))
+        model_source = os.path.abspath(cfg.model_script)
+    except Exception:
+        base = "unknown"
+        skip_levels = "unknown"
+        model_source = os.path.abspath(cfg.model_script)
+
+    total_inputs = sum(s["inputs"] for s in split_stats)
+    total_outputs = sum(s["outputs"] for s in split_stats)
+
+    rows = []
+    # Global metadata
+    rows.append(("timestamp", started_at))
+    rows.append(("data_dir", os.path.abspath(cfg.data_dir)))
+    rows.append(("out_dir", os.path.abspath(cfg.out_dir)))
+    rows.append(("vae_ckpt_resolved", os.path.abspath(ckpt_path)))
+    rows.append(("model_script", model_source))
+    rows.append(("device", device_str))
+    rows.append(("latent_dim", latent_dim))
+    rows.append(("base", base))
+    rows.append(("skip_levels", skip_levels))
+    # Aug flags
+    rows.append(("aug_rot_x", str(bool(cfg.aug_rot_x)).upper()))
+    rows.append(("aug_rot_y", str(bool(cfg.aug_rot_y)).upper()))
+    rows.append(("aug_rot_z", str(bool(cfg.aug_rot_z)).upper()))
+    rows.append(("aug_flip_x", str(bool(cfg.aug_flip_x)).upper()))
+    rows.append(("aug_flip_y", str(bool(cfg.aug_flip_y)).upper()))
+    rows.append(("aug_flip_z", str(bool(cfg.aug_flip_z)).upper()))
+    # Totals
+    rows.append(("total_inputs", total_inputs))
+    rows.append(("total_outputs", total_outputs))
+
+    # Per-split stats
+    for s in split_stats:
+        prefix = s["split"]
+        rows.append((f"{prefix}_inputs", s["inputs"]))
+        rows.append((f"{prefix}_outputs", s["outputs"]))
+        rows.append((f"{prefix}_unique_combo_count", s["unique_combo_count"]))
+
+    try:
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["parameter", "value"])
+            for k, v in rows:
+                writer.writerow([k, v])
+        console.print(Panel.fit(f"[green]✓[/green] Saved conversion metadata to [cyan]{out_csv}[/cyan]", border_style="green"))
+    except Exception as e:
+        console.print(Panel.fit(f"[bold red]Failed to write conversion metadata:[/bold red] {e}", border_style="red"))
 
 
 if __name__ == "__main__":
