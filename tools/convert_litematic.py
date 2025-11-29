@@ -501,7 +501,7 @@ def process_one_file(
         removed = 0
         if strip_mode != "none":
             if has_entities:
-                removed = clear_all_entities(schem, strip_mode)
+            removed = clear_all_entities(schem, strip_mode)
             # 如果 has_entities 為 False，表示原始文件沒有實體數據，跳過實體清除步驟
 
         # 計算輸出路徑（保留相對路徑結構）
@@ -530,7 +530,7 @@ def process_one_file(
             return "err", f"{src.name}: [{exc_type}] {exc_msg}\n{tb_full}"
         else:
             # 保持原来的简单错误信息格式
-            return "err", f"{src.name}: {e}"
+        return "err", f"{src.name}: {e}"
 
 
 def iter_litematics(indir: Path) -> Iterable[Path]:
@@ -687,7 +687,7 @@ def main():
                 rprint(f"[red]失敗[/red] {lines[0]}")
                 rprint(f"[dim]{lines[1]}[/dim]")
             else:
-                rprint(f"[red]失敗[/red] {s}")
+            rprint(f"[red]失敗[/red] {s}")
 
     rprint(f"\n[bold green]成功[/bold green]: {ok}  |  [bold yellow]跳過[/bold yellow]: {skipped}  |  [bold red]失敗[/bold red]: {fail}")
 
