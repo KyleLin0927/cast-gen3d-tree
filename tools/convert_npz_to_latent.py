@@ -1,7 +1,10 @@
 import os
+import io
 import argparse
 import importlib.util
 from glob import glob
+import zipfile
+
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -83,8 +86,13 @@ def apply_augmentations(voxel, cfg):
 
 # ---------------------------
 # Dataset Loader (.npz labels -> onehot[3,32,32,32])
+# 支援資料夾與 zip 兩種來源
 # ---------------------------
 class LabelFolder(torch.utils.data.Dataset):
+    """
+    從實體資料夾載入 .npz 檔。
+    """
+
     def __init__(self, folder):
         self.paths = []
         if not os.path.isdir(folder):
@@ -108,6 +116,92 @@ class LabelFolder(torch.utils.data.Dataset):
         # one-hot -> [3,32,32,32], float32
         onehot = F.one_hot(labels.long(), num_classes=3).permute(3, 0, 1, 2).float()
         return onehot, os.path.basename(path)
+
+
+class ZipLabelFolder(torch.utils.data.Dataset):
+    """
+    從 zip 檔內的 train/val/test 子路徑載入 .npz 檔。
+    不會事先解壓整個壓縮檔，只在需要時讀取檔案內容。
+    """
+
+    def __init__(self, zip_file: zipfile.ZipFile, split_name: str, base_prefix: str = ""):
+        """
+        zip_file: 已開啟的 ZipFile 物件（會在 main 中只開一次）
+        split_name: "train" / "val" / "test"
+        base_prefix: 若 zip 解壓後會多一層資料夾，例如 dataset_root/train/...，
+                     則傳入 "dataset_root/"；若沒有額外層級則為空字串。
+        """
+        self.zip_file = zip_file
+        self.split_name = split_name
+
+        prefix = f"{base_prefix}{split_name}/"
+        self.paths = [
+            name
+            for name in zip_file.namelist()
+            if name.startswith(prefix) and name.endswith(".npz")
+        ]
+        self.paths.sort()
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        path_in_zip = self.paths[idx]
+        # 直接從 zip 讀 bytes，再用 BytesIO 包裝給 np.load，避免非 seekable 問題
+        with self.zip_file.open(path_in_zip, "r") as f:
+            data_bytes = f.read()
+        with np.load(io.BytesIO(data_bytes), allow_pickle=False) as data:
+            key = "arr_0" if "arr_0" in data else list(data.files)[0]
+            labels = data[key]
+
+        labels = torch.from_numpy(labels.astype(np.int64))  # [32,32,32]
+        if labels.shape != (32, 32, 32):
+            raise ValueError(
+                f"Expected (32,32,32), got {labels.shape} from {path_in_zip}"
+            )
+        onehot = F.one_hot(labels.long(), num_classes=3).permute(3, 0, 1, 2).float()
+        # 輸出檔名仍然只用 basename，行為與資料夾模式一致
+        return onehot, os.path.basename(path_in_zip)
+
+
+def _detect_zip_base_prefix(zf: zipfile.ZipFile) -> str:
+    """
+    嘗試自動偵測 zip 內部是否有一層共同根目錄，例如:
+        dataset_root/train/...
+        dataset_root/val/...
+        dataset_root/test/...
+
+    若存在上述結構，回傳 "dataset_root/" 作為 base_prefix；
+    若 train/val/test 直接在根目錄下，則回傳空字串 ""。
+    """
+    names = zf.namelist()
+
+    # 先檢查 train/val/test 是否直接在根目錄下
+    has_root_train = any(name.startswith("train/") for name in names)
+    has_root_val = any(name.startswith("val/") for name in names)
+    has_root_test = any(name.startswith("test/") for name in names)
+    if has_root_train and has_root_val and has_root_test:
+        return ""
+
+    # 否則嘗試找出共同的前綴資料夾
+    candidate_prefixes = set()
+    for name in names:
+        idx = name.find("train/")
+        if idx > 0:
+            candidate_prefixes.add(name[:idx])
+
+    for prefix in sorted(candidate_prefixes):
+        has_train = any(n.startswith(f"{prefix}train/") for n in names)
+        has_val = any(n.startswith(f"{prefix}val/") for n in names)
+        has_test = any(n.startswith(f"{prefix}test/") for n in names)
+        if has_train and has_val and has_test:
+            return prefix
+
+    # 若找不到，就當作結構不符合預期
+    raise FileNotFoundError(
+        "Could not find train/val/test structure inside zip file. "
+        "Expected either train/val/test at root, or <root_dir>/train|val|test."
+    )
 
 
 # ---------------------------
@@ -238,13 +332,12 @@ def _build_model_from_checkpoint(ckpt_path: str, device: torch.device, model_scr
 # ---------------------------
 # Main conversion process
 # ---------------------------
-def process_split(split_name, in_dir, out_dir, model, latent_dim, device, cfg):
+def process_split(split_name, dataset, out_dir, model, latent_dim, device, cfg):
     console = Console()
     console.print(f"\n[bold cyan]Processing split:[/bold cyan] {split_name}")
 
-    ds = LabelFolder(in_dir)
-    dl = DataLoader(ds, batch_size=1, shuffle=False)
-    n_inputs = len(ds)
+    dl = DataLoader(dataset, batch_size=1, shuffle=False)
+    n_inputs = len(dataset)
     n_outputs = 0
     used_combos = set()
 
@@ -323,7 +416,12 @@ def process_split(split_name, in_dir, out_dir, model, latent_dim, device, cfg):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--data_dir", required=True)
+    parser.add_argument(
+        "--data_dir",
+        required=True,
+        help="Root directory containing train/val/test subfolders with .npz files, "
+        "or a .zip file whose internal structure is train/val/test/*.npz",
+    )
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--vae_ckpt", required=True)
     parser.add_argument("--cpu", action="store_true")
@@ -362,12 +460,56 @@ def main():
             raise SystemExit(1)
 
     # -----------------------
+    # 檢查 data_dir 型態（資料夾或 zip）
+    # -----------------------
+    is_zip = os.path.isfile(cfg.data_dir) and cfg.data_dir.lower().endswith(".zip")
+    zip_file = None
+    zip_base_prefix = ""
+
+    if is_zip:
+        # 僅開啟一次 zip，以避免重複 IO 開銷
+        if not zipfile.is_zipfile(cfg.data_dir):
+            console.print(
+                Panel.fit(
+                    f"[bold red]--data_dir is not a valid zip file:[/bold red] {cfg.data_dir}",
+                    border_style="red",
+                )
+            )
+            raise SystemExit(1)
+        zip_file = zipfile.ZipFile(cfg.data_dir, "r")
+        try:
+            zip_base_prefix = _detect_zip_base_prefix(zip_file)
+        except FileNotFoundError as e:
+            console.print(
+                Panel.fit(
+                    f"[bold red]{str(e)}[/bold red]\n[yellow]{cfg.data_dir}[/yellow]",
+                    border_style="red",
+                )
+            )
+            zip_file.close()
+            raise SystemExit(1)
+    else:
+        # 確認 train/val/test 目錄存在
+        for split in ["train", "val", "test"]:
+            split_dir = os.path.join(cfg.data_dir, split)
+            if not os.path.isdir(split_dir):
+                console.print(
+                    Panel.fit(
+                        f"[bold red]Data split directory not found:[/bold red] {split_dir}",
+                        border_style="red",
+                    )
+                )
+                raise SystemExit(1)
+
+    # -----------------------
     # Load VAE
     # -----------------------
     console.print("[bold]Loading VAE...[/bold]")
     device = _resolve_device(force_cpu=cfg.cpu)
     ckpt_path = _resolve_checkpoint_path(cfg.vae_ckpt)
-    model, latent_dim = _build_model_from_checkpoint(ckpt_path, device, cfg.model_script)
+    model, latent_dim = _build_model_from_checkpoint(
+        ckpt_path, device, cfg.model_script
+    )
 
     # -----------------------
     # Create output folders
@@ -379,17 +521,26 @@ def main():
     # Process three splits
     # -----------------------
     split_stats = []
-    for split in ["train", "val", "test"]:
-        stats = process_split(
-            split,
-            os.path.join(cfg.data_dir, split),
-            cfg.out_dir,
-            model,
-            latent_dim,
-            device,
-            cfg
-        )
-        split_stats.append(stats)
+    try:
+        for split in ["train", "val", "test"]:
+            if is_zip:
+                dataset = ZipLabelFolder(zip_file, split, base_prefix=zip_base_prefix)
+            else:
+                dataset = LabelFolder(os.path.join(cfg.data_dir, split))
+
+            stats = process_split(
+                split,
+                dataset,
+                cfg.out_dir,
+                model,
+                latent_dim,
+                device,
+                cfg,
+            )
+            split_stats.append(stats)
+    finally:
+        if zip_file is not None:
+            zip_file.close()
 
     console.print("\n[bold green]All latent data generated successfully![/bold green]")
     # -----------------------
