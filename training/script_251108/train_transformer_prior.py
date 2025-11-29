@@ -57,6 +57,7 @@ from rich.progress import (
 )
 
 import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
 
 # ------------------------------------------------
 # Utility
@@ -347,6 +348,42 @@ def sample_latent(model, token_dim=256, seq_len=512, device="cpu", mode="mean"):
         z[:, i, :] = next_token
 
     return z[0].cpu().numpy()
+
+def compute_decoder_occupancy(labels, air_class=0):
+    """
+    Compute decoder occupancy metrics from decoded voxel labels.
+    
+    Parameters
+    ----------
+    labels : numpy.ndarray
+        Array of shape [32,32,32] containing class labels after argmax.
+    air_class : int, default=0
+        Class ID representing "air" voxels (typically 0).
+    
+    Returns
+    -------
+    non_air_ratio : float
+        Ratio of non-air voxels to total voxels.
+    bbox_volume_ratio : float
+        Ratio of bounding box volume (containing all non-air voxels) to total volume.
+    """
+    mask = (labels != air_class)
+    total_voxels = mask.size
+    non_air = mask.sum()
+    non_air_ratio = float(non_air) / float(total_voxels + 1e-8)
+
+    if non_air == 0:
+        return non_air_ratio, 0.0
+
+    # bounding box
+    idx = np.where(mask)
+    zmin, zmax = idx[0].min(), idx[0].max()
+    ymin, ymax = idx[1].min(), idx[1].max()
+    xmin, xmax = idx[2].min(), idx[2].max()
+    bbox_vol = (zmax - zmin + 1) * (ymax - ymin + 1) * (xmax - xmin + 1)
+    bbox_volume_ratio = float(bbox_vol) / float(total_voxels + 1e-8)
+
+    return non_air_ratio, bbox_volume_ratio
 
 # ------------------------------------------------
 # Main
@@ -871,7 +908,7 @@ def main():
                 plt.savefig(os.path.join(ep_dir, "self_similarity.png"), dpi=140)
                 plt.close()
 
-                # (2b) 若提供 VAE decoder：將 latent 轉回體素，輸出 3 視角投影
+                # (2b) 若提供 VAE decoder：將 latent 轉回體素，輸出 3 視角投影 + 佔空比
                 if vae_decoder is not None:
                     with torch.no_grad():
                         # z_sample: [512, D] -> [1, D, 8, 8, 8]
@@ -879,9 +916,21 @@ def main():
                         z_reshaped = torch.from_numpy(z_sample).to(device=device, dtype=torch.float32)
                         z_reshaped = z_reshaped.view(1, 8, 8, 8, D).permute(0, 4, 1, 2, 3).contiguous()
                         logits = vae_decoder(z_reshaped, skips=None)[0].detach().cpu().numpy()  # [C,32,32,32]
-                        # argmax labels
                         labels = np.argmax(logits, axis=0).astype(np.uint8)  # [32,32,32]
-                        # projections
+
+                        # ====== 新增：佔空比計算 ======
+                        non_air_ratio, bbox_ratio = compute_decoder_occupancy(labels, air_class=0)
+
+                        with open(os.path.join(ep_dir, "decoder_occupancy.txt"), "w") as f_occ:
+                            f_occ.write("Decoder occupancy diagnostics (generated latent)\n")
+                            f_occ.write(f"  non_air_ratio        = {non_air_ratio:.6f}\n")
+                            f_occ.write(f"  bbox_volume_ratio    = {bbox_ratio:.6f}\n")
+                            f_occ.write("\n建議參考：\n")
+                            f_occ.write("  • 若 non_air_ratio 非常接近 0 → 幾乎全空氣，代表 Transformer latent 掉出 manifold。\n")
+                            f_occ.write("  • 可以跟 VAE 在真實資料上的平均 non_air_ratio 比較（約 ~0.02 左右）。\n")
+                            f_occ.write("  • bbox_volume_ratio 很小 → 只剩一小撮點，疑似 collapsed blob。\n")
+
+                        # ====== 原本的 3 視角投影 ======
                         max_z = labels.max(axis=0)
                         max_y = labels.max(axis=1)
                         max_x = labels.max(axis=2)
@@ -1005,6 +1054,64 @@ def main():
                 console.print(f"[dim]Analytics saved to {ep_dir}[/dim]")
                 current_kl = kl_pq
                 current_mmd = mmd_val
+
+                # ====== 新增：Real vs Generated latent PCA ======
+                try:
+                    # 取相同數量的 token 來做 PCA，避免不平衡
+                    n_real = train_tokens_sample.shape[0]
+                    n_gen = gen_tokens.shape[0]
+                    n = min(n_real, n_gen, 4096)  # 最多 4096 個點
+                    real_for_pca = train_tokens_sample[:n]
+                    gen_for_pca = gen_tokens[:n]
+
+                    X = np.concatenate([real_for_pca, gen_for_pca], axis=0)  # [2n, D]
+                    labels_pca = np.array([0] * n + [1] * n)  # 0=real, 1=gen
+
+                    pca = PCA(n_components=2)
+                    X2 = pca.fit_transform(X)  # [2n, 2]
+
+                    # 繪圖
+                    plt.figure(figsize=(6, 6))
+                    plt.scatter(
+                        X2[labels_pca == 0, 0],
+                        X2[labels_pca == 0, 1],
+                        s=4,
+                        alpha=0.5,
+                        label="real"
+                    )
+                    plt.scatter(
+                        X2[labels_pca == 1, 0],
+                        X2[labels_pca == 1, 1],
+                        s=4,
+                        alpha=0.5,
+                        label="generated"
+                    )
+                    plt.legend()
+                    plt.title("Real vs Generated Latent (PCA)")
+                    plt.xlabel("PC1")
+                    plt.ylabel("PC2")
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(ep_dir, "latent_pca_real_vs_gen.png"), dpi=140)
+                    plt.close()
+
+                    # 也順便存一些簡單數值指標
+                    mean_real = real_for_pca.mean(axis=0)
+                    mean_gen = gen_for_pca.mean(axis=0)
+                    std_real = real_for_pca.std(axis=0)
+                    std_gen = gen_for_pca.std(axis=0)
+
+                    mean_l2_pca = float(np.linalg.norm(mean_real - mean_gen))
+                    std_l2_pca = float(np.linalg.norm(std_real - std_gen))
+
+                    with open(os.path.join(ep_dir, "latent_pca_stats.csv"), "w", newline="") as f_pca:
+                        w_pca = csv.writer(f_pca)
+                        w_pca.writerow(["metric", "value"])
+                        w_pca.writerow(["mean_l2_real_gen", f"{mean_l2_pca:.6f}"])
+                        w_pca.writerow(["std_l2_real_gen", f"{std_l2_pca:.6f}"])
+                        w_pca.writerow(["n_points_per_class", n])
+
+                except Exception as e:
+                    console.print(f"[yellow]PCA diagnostics failed:[/yellow] {e}")
 
             # Console line with KL beside val when available
             best_marker = " | ★ Best!" if is_best else ""
