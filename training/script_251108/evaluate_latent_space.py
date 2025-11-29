@@ -42,6 +42,7 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from sklearn.decomposition import PCA
 from sklearn.metrics import pairwise_distances
+from sklearn.neighbors import NearestNeighbors
 from scipy.ndimage import label
 
 from rich.console import Console
@@ -239,7 +240,7 @@ def linear_interpolation(vae, z1, z2, out_path, device, steps=10, use_amp=True):
                     logits = vae.decoder(z_input, skips=None)[0].cpu().detach().numpy()
             else:
                 logits = vae.decoder(z_input, skips=None)[0].cpu().detach().numpy()
-        decoded_images.append(logits.argmax(0))
+        decoded_images.append(logits.argmax(axis=0))
     
     # ============================================================
     # No.1: Per-step IoU difference (最重要)
@@ -340,6 +341,259 @@ def linear_interpolation(vae, z1, z2, out_path, device, steps=10, use_amp=True):
         'cc_counts': [int(x) for x in cc_counts],
         'cc_changes': [int(x) for x in cc_changes],
     }
+
+
+@torch.no_grad()
+def thickness_test(vae, z, device, eps_list=[0.01, 0.05, 0.1], use_amp=True):
+    """
+    Test manifold thickness by adding small Gaussian noise to latent vectors.
+    
+    Tests decoder tolerance to small offsets. If decoder(z + ε) becomes blob or black,
+    it indicates the manifold is extremely thin, and Transformer will fall out.
+    
+    Args:
+        vae: VAE model
+        z: Reference latent vector [C, H, W, D]
+        device: torch device
+        eps_list: List of noise scales to test
+        use_amp: Whether to use Automatic Mixed Precision
+    
+    Returns:
+        results: List of dicts with 'eps' and 'iou' keys
+        projections: List of tuples (eps, projection_image)
+    """
+    results = []
+    projections = []
+    
+    # Get original image for IoU comparison
+    z_orig = z.unsqueeze(0).to(device)
+    if use_amp and device.type == "cuda":
+        with torch.amp.autocast('cuda'):
+            logits_orig = vae.decoder(z_orig, skips=None)[0].cpu().numpy()
+    else:
+        logits_orig = vae.decoder(z_orig, skips=None)[0].cpu().numpy()
+    original_img = logits_orig.argmax(axis=0)
+    
+    for eps in eps_list:
+        noise = torch.randn_like(z) * eps
+        z_noisy = (z + noise).unsqueeze(0).to(device)
+        
+        if use_amp and device.type == "cuda":
+            with torch.amp.autocast('cuda'):
+                logits = vae.decoder(z_noisy, skips=None)[0].cpu().numpy()
+        else:
+            logits = vae.decoder(z_noisy, skips=None)[0].cpu().numpy()
+        
+        img = logits.argmax(axis=0)
+        proj = img.max(axis=0)
+        
+        # Compute IoU vs original
+        iou = compute_iou(original_img, img)
+        
+        results.append({"eps": eps, "iou": float(iou)})
+        projections.append((eps, proj))
+    
+    return results, projections
+
+
+@torch.no_grad()
+def per_dim_sensitivity(vae, z, device, delta=0.05, max_dims=64, use_amp=True):
+    """
+    Probe each latent dimension by adding +delta and measuring IoU.
+    
+    Quantifies the importance of each latent channel/dimension to the decoder.
+    Identifies which dimensions are too fragile (fatal axes that cause black/blob output).
+    
+    Args:
+        vae: VAE model
+        z: Reference latent vector [C, H, W, D]
+        device: torch device
+        delta: Amount to add to each dimension
+        max_dims: Maximum number of dimensions to test (to reduce computation)
+        use_amp: Whether to use Automatic Mixed Precision
+    
+    Returns:
+        iou_list: Array of IoU values for each tested dimension
+    """
+    z_flat = z.view(-1)
+    dim_count = min(len(z_flat), max_dims)
+    
+    # Get original image for IoU comparison
+    z_orig = z.unsqueeze(0).to(device)
+    if use_amp and device.type == "cuda":
+        with torch.amp.autocast('cuda'):
+            logits_orig = vae.decoder(z_orig, skips=None)[0].cpu().numpy()
+    else:
+        logits_orig = vae.decoder(z_orig, skips=None)[0].cpu().numpy()
+    img_orig = logits_orig.argmax(axis=0)
+    
+    iou_list = []
+    for i in range(dim_count):
+        z_new = z_flat.clone()
+        z_new[i] += delta
+        z_new = z_new.view_as(z).unsqueeze(0).to(device)
+        
+        if use_amp and device.type == "cuda":
+            with torch.amp.autocast('cuda'):
+                logits = vae.decoder(z_new, skips=None)[0].cpu().numpy()
+        else:
+            logits = vae.decoder(z_new, skips=None)[0].cpu().numpy()
+        
+        img_new = logits.argmax(axis=0)
+        iou = compute_iou(img_orig, img_new)
+        
+        iou_list.append(iou)
+    
+    return np.array(iou_list)
+
+
+def estimate_intrinsic_dimension(z_flat):
+    """
+    Estimate intrinsic dimension using 2-NN estimator.
+    
+    Quantifies the manifold's intrinsic dimensionality. This is a commonly used
+    method in research to estimate the effective dimensionality of data.
+    
+    Args:
+        z_flat: [N, D] latent vectors (flattened)
+    
+    Returns:
+        id_estimate: Estimated intrinsic dimension
+    """
+    nbrs = NearestNeighbors(n_neighbors=3).fit(z_flat)
+    distances, _ = nbrs.kneighbors(z_flat)
+    
+    d1 = distances[:, 1]
+    d2 = distances[:, 2]
+    
+    ratio = d2 / (d1 + 1e-8)
+    log_ratio = np.log(ratio)
+    id_estimate = 1.0 / (np.mean(log_ratio) + 1e-8)
+    
+    return id_estimate
+
+
+@torch.no_grad()
+def latent_shuffle_test(vae, z_batch, device, use_amp=True):
+    """
+    Test whether decoder actually depends on the latent.
+    
+    Shuffle latent vectors across the batch and decode again.
+    
+    If decoder(latent_shuffled) ≈ decoder(latent_original):
+        → latent ineffective (collapse)
+    
+    Args:
+        vae: VAE model
+        z_batch: Batch of latent vectors [N, C, H, W, D]
+        device: torch device
+        use_amp: Whether to use Automatic Mixed Precision
+    
+    Returns:
+        Dictionary with mean_iou, min_iou, max_iou, and ious list
+    """
+    N = z_batch.shape[0]
+    
+    # Decode each sample individually (decoder may not support batch)
+    y_orig_list = []
+    y_shuf_list = []
+    
+    # Shuffle latent across batch
+    perm = torch.randperm(N)
+    z_shuffle = z_batch[perm]
+    
+    # Decode original and shuffled latents one by one
+    for i in range(N):
+        # Original
+        z_single = z_batch[i:i+1].to(device)  # Keep batch dimension [1, C, H, W, D]
+        decoder_output = vae.decoder(z_single, skips=None)
+        if isinstance(decoder_output, (tuple, list)):
+            logits_orig = decoder_output[0]
+        else:
+            logits_orig = decoder_output
+        
+        if use_amp and device.type == "cuda":
+            logits_orig = logits_orig.cpu().numpy()
+        else:
+            logits_orig = logits_orig.cpu().numpy()
+        
+        # logits_orig shape: [1, 3, H, W, D] or [3, H, W, D]
+        if logits_orig.ndim == 4:
+            # [3, H, W, D] -> argmax on axis=0
+            y_orig_single = np.argmax(logits_orig, axis=0)  # [H, W, D]
+        else:
+            # [1, 3, H, W, D] -> argmax on axis=1, then squeeze
+            y_orig_single = np.argmax(logits_orig, axis=1)[0]  # [H, W, D]
+        y_orig_list.append(y_orig_single)
+        
+        # Shuffled
+        z_shuf_single = z_shuffle[i:i+1].to(device)  # Keep batch dimension [1, C, H, W, D]
+        decoder_output_shuf = vae.decoder(z_shuf_single, skips=None)
+        if isinstance(decoder_output_shuf, (tuple, list)):
+            logits_shuf = decoder_output_shuf[0]
+        else:
+            logits_shuf = decoder_output_shuf
+        
+        if use_amp and device.type == "cuda":
+            logits_shuf = logits_shuf.cpu().numpy()
+        else:
+            logits_shuf = logits_shuf.cpu().numpy()
+        
+        # logits_shuf shape: [1, 3, H, W, D] or [3, H, W, D]
+        if logits_shuf.ndim == 4:
+            # [3, H, W, D] -> argmax on axis=0
+            y_shuf_single = np.argmax(logits_shuf, axis=0)  # [H, W, D]
+        else:
+            # [1, 3, H, W, D] -> argmax on axis=1, then squeeze
+            y_shuf_single = np.argmax(logits_shuf, axis=1)[0]  # [H, W, D]
+        y_shuf_list.append(y_shuf_single)
+    
+    # Compute IoU for each sample
+    ious = []
+    for i in range(N):
+        iou = compute_iou(y_orig_list[i], y_shuf_list[i])
+        ious.append(iou)
+    
+    return {
+        "mean_iou": float(np.mean(ious)),
+        "min_iou": float(np.min(ious)),
+        "max_iou": float(np.max(ious)),
+        "ious": ious,
+    }
+
+
+def latent_gradient_norm_test(vae, z_single, device):
+    """
+    Compute gradient norm ∂output/∂latent.
+    
+    If gradient is nearly zero → latent has no influence on output.
+    This is the most accurate metric for semantic sensitivity.
+    
+    Args:
+        vae: VAE model
+        z_single: Single latent vector [C, H, W, D]
+        device: torch device
+    
+    Returns:
+        Gradient norm (mean absolute value of gradients)
+    """
+    z = z_single.unsqueeze(0).to(device)
+    z.requires_grad_(True)
+    
+    # Clear any previous gradients
+    if z.grad is not None:
+        z.grad.zero_()
+    
+    # decoder returns (logits, ...), we need the first element
+    logits = vae.decoder(z, skips=None)[0]
+    y = logits.sum()  # simple scalar
+    
+    y.backward()
+    
+    grad = z.grad.detach().cpu().numpy()
+    grad_norm = np.abs(grad).mean()
+    
+    return float(grad_norm)
 
 
 def detect_checkpoint_type(state_dict):
@@ -761,6 +1015,53 @@ def merge_kl_stats(latent_data_dir, console):
     return True
 
 
+def merge_intrinsic_dim_stats(latent_data_dir, console):
+    """Merge all intrinsic dimension text files into a single CSV."""
+    if pd is None:
+        console.print(f"[yellow]⚠[/yellow] pandas not available, skipping intrinsic dimension stats merge")
+        return False
+    
+    latent_data_path = Path(latent_data_dir)
+    if not latent_data_path.exists():
+        return False
+    
+    id_data = []
+    
+    # Find all intrinsic_dim.txt files
+    for model_dir in sorted(latent_data_path.iterdir()):
+        if not model_dir.is_dir():
+            continue
+        
+        id_path = model_dir / "intrinsic_dim.txt"
+        if id_path.exists():
+            try:
+                with open(id_path, 'r') as f:
+                    content = f.read().strip()
+                    # Extract intrinsic dimension value (format: intrinsic_dimension = 0.123)
+                    if '=' in content:
+                        value_str = content.split('=')[1].strip()
+                        try:
+                            id_value = float(value_str)
+                            id_data.append({
+                                'model_name': model_dir.name,
+                                'intrinsic_dimension': id_value
+                            })
+                        except ValueError:
+                            pass
+            except Exception as e:
+                console.print(f"[yellow]⚠[/yellow] Failed to read {id_path}: {e}")
+                continue
+    
+    if not id_data:
+        return False
+    
+    # Create DataFrame and save
+    df = pd.DataFrame(id_data)
+    output_path = latent_data_path / "merged_intrinsic_dim.csv"
+    df.to_csv(output_path, index=False)
+    return True
+
+
 def create_summary_reports(latent_data_dir, console):
     """Create merged summary reports from all model results."""
     console.print(f"[cyan]Creating summary reports...[/cyan]")
@@ -782,6 +1083,15 @@ def create_summary_reports(latent_data_dir, console):
     if merge_csv_files(latent_data_dir, "latent_interpolation_stats.csv", 
                       "merged_interpolation_stats.csv", console):
         console.print(f"[green]✓[/green] Merged interpolation stats CSV (IoU, CC, Frame Diff)")
+    
+    # Merge dimension sensitivity CSV
+    if merge_csv_files(latent_data_dir, "dimension_sensitivity.csv", 
+                      "merged_dimension_sensitivity.csv", console):
+        console.print(f"[green]✓[/green] Merged dimension sensitivity CSV")
+    
+    # Merge intrinsic dimension stats
+    if merge_intrinsic_dim_stats(latent_data_dir, console):
+        console.print(f"[green]✓[/green] Merged intrinsic dimension stats CSV")
     
     # Combine PNG images (will auto-split if > 9 images)
     latent_data_path = Path(latent_data_dir)
@@ -818,6 +1128,28 @@ def create_summary_reports(latent_data_dir, console):
             console.print(f"[green]✓[/green] Combined decoder noise images ({noise_count} models) → {num_files} file(s)")
         else:
             console.print(f"[green]✓[/green] Combined decoder noise images ({noise_count} models)")
+    
+    # Count images for thickness projections
+    thickness_count = sum(1 for d in latent_data_path.iterdir() 
+                          if d.is_dir() and (d / "thickness_projections.png").exists())
+    if combine_png_images(latent_data_dir, "thickness_projections.png", 
+                         "combined_thickness_projections.png", console, max_cols=3):
+        if thickness_count > 9:
+            num_files = (thickness_count + 8) // 9
+            console.print(f"[green]✓[/green] Combined thickness projection images ({thickness_count} models) → {num_files} file(s)")
+        else:
+            console.print(f"[green]✓[/green] Combined thickness projection images ({thickness_count} models)")
+    
+    # Count images for dimension sensitivity
+    dim_sens_count = sum(1 for d in latent_data_path.iterdir() 
+                         if d.is_dir() and (d / "dimension_sensitivity.png").exists())
+    if combine_png_images(latent_data_dir, "dimension_sensitivity.png", 
+                         "combined_dimension_sensitivity.png", console, max_cols=4):
+        if dim_sens_count > 9:
+            num_files = (dim_sens_count + 8) // 9
+            console.print(f"[green]✓[/green] Combined dimension sensitivity images ({dim_sens_count} models) → {num_files} file(s)")
+        else:
+            console.print(f"[green]✓[/green] Combined dimension sensitivity images ({dim_sens_count} models)")
     
     console.print(f"[green]✓[/green] Summary reports created in [dim]{latent_data_dir}[/dim]")
 
@@ -969,6 +1301,28 @@ def process_single_model(vae_ckpt_path, data_root, out_dir, max_samples, device,
     
     console.print(f"[green]✓[/green] Collected {N} latent vectors")
 
+    # -------------------------
+    # Latent Shuffle Test
+    # -------------------------
+    with console.status("[cyan]Running latent shuffle test...[/cyan]"):
+        shuffle_stats = latent_shuffle_test(vae, z, device, use_amp=use_amp)
+        
+        with open(os.path.join(out_dir, "latent_shuffle_stats.txt"), "w") as f:
+            f.write("Latent Shuffle Test:\n")
+            f.write(f"  mean IoU: {shuffle_stats['mean_iou']:.6f}\n")
+            f.write(f"  min IoU: {shuffle_stats['min_iou']:.6f}\n")
+            f.write(f"  max IoU: {shuffle_stats['max_iou']:.6f}\n")
+            f.write("\n")
+            
+            if shuffle_stats["mean_iou"] > 0.9:
+                f.write("  → ✗ Latent ineffective (decoder ignores latent)\n")
+            elif shuffle_stats["mean_iou"] < 0.3:
+                f.write("  → ✓ Latent highly semantic (healthy)\n")
+            else:
+                f.write("  → ⚠ Partially semantic\n")
+        
+        console.print(f"[dim]  Shuffle test mean IoU={shuffle_stats['mean_iou']:.4f}[/dim]")
+
     # Flatten for statistics
     z_flat = flatten_latent(z.detach().numpy())
 
@@ -1084,6 +1438,133 @@ def process_single_model(vae_ckpt_path, data_root, out_dir, max_samples, device,
             f.write(f"mean_KL_per_element = {KL:.6f}\n")
 
     # -------------------------
+    # (A) Small-noise Thickness Test
+    # -------------------------
+    with console.status("[cyan]Running manifold thickness test (small-noise)...[/cyan]"):
+        z_ref = z[0].cpu()  # reference latent
+        
+        thickness_results, thickness_projections = thickness_test(
+            vae, z_ref, device, eps_list=[0.01, 0.05, 0.1], use_amp=use_amp
+        )
+        
+        # Save results to text
+        with open(os.path.join(out_dir, "thickness_stats.txt"), "w") as f:
+            f.write("Small-noise Thickness Test:\n\n")
+            f.write("Health Assessment:\n")
+            f.write("  IoU > 0.7: Thick manifold (decoder robust, Transformer easy to train)\n")
+            f.write("  IoU 0.3~0.7: Medium thickness (Transformer needs noise-aware training)\n")
+            f.write("  IoU < 0.3: Thin manifold (decoder sensitive, Transformer will fall out)\n\n")
+            for r in thickness_results:
+                f.write(f"  eps={r['eps']:.3f}, IoU={r['iou']:.6f}\n")
+                # Add health assessment
+                if r['iou'] > 0.7:
+                    health = "✓ Thick (healthy)"
+                elif r['iou'] >= 0.3:
+                    health = "⚠ Medium (needs attention)"
+                else:
+                    health = "✗ Thin (collapsed)"
+                f.write(f"    → {health}\n")
+        
+        # Save projections image
+        fig = plt.figure(figsize=(len(thickness_projections) * 4, 4))
+        for idx, (eps, proj) in enumerate(thickness_projections):
+            plt.subplot(1, len(thickness_projections), idx + 1)
+            plt.imshow(proj, cmap='viridis')
+            plt.title(f"eps={eps}")
+            plt.axis('off')
+        
+        plt.suptitle("Manifold Thickness Test (Small-noise)", fontsize=12)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "thickness_projections.png"), dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        # Print warnings to console
+        min_iou = min(r['iou'] for r in thickness_results)
+        if min_iou < 0.3:
+            console.print(f"[yellow]⚠[/yellow] Thin manifold detected: min IoU={min_iou:.4f} < 0.3")
+        elif min_iou < 0.7:
+            console.print(f"[dim]  Medium thickness: min IoU={min_iou:.4f}[/dim]")
+        else:
+            console.print(f"[dim]  Thick manifold: min IoU={min_iou:.4f}[/dim]")
+
+    # -------------------------
+    # Gradient Norm Test
+    # -------------------------
+    with console.status("[cyan]Computing latent gradient norm...[/cyan]"):
+        z_ref = z[0].cpu()
+        grad_norm = latent_gradient_norm_test(vae, z_ref, device)
+        
+        with open(os.path.join(out_dir, "latent_grad_norm.txt"), "w") as f:
+            f.write(f"latent_grad_norm = {grad_norm:.8f}\n")
+            f.write("\n")
+            
+            if grad_norm < 1e-5:
+                f.write("→ ✗ Latent has no influence on decoder (collapse)\n")
+            elif grad_norm < 1e-3:
+                f.write("→ ⚠ Weak influence\n")
+            else:
+                f.write("→ ✓ Healthy latent sensitivity\n")
+        
+        console.print(f"[dim]  Latent gradient norm={grad_norm:.6e}[/dim]")
+
+    # -------------------------
+    # (B) Per-dimension sensitivity heatmap
+    # -------------------------
+    with console.status("[cyan]Running per-dimension sensitivity test...[/cyan]"):
+        dim_iou = per_dim_sensitivity(vae, z_ref, device, delta=0.05, max_dims=64, use_amp=use_amp)
+        
+        plt.figure(figsize=(10, 4))
+        plt.plot(dim_iou)
+        plt.title("Per-Dimension Sensitivity (IoU after +0.05)")
+        plt.xlabel("Dimension Index")
+        plt.ylabel("IoU vs Original")
+        plt.grid(True)
+        plt.axhline(y=0.7, color='g', linestyle='--', alpha=0.5, label='Healthy threshold (0.7)')
+        plt.axhline(y=0.3, color='r', linestyle='--', alpha=0.5, label='Collapse threshold (0.3)')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "dimension_sensitivity.png"), dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        np.savetxt(os.path.join(out_dir, "dimension_sensitivity.csv"), dim_iou, fmt="%.6f")
+        
+        # Save statistics
+        mean_dim_iou = float(np.mean(dim_iou))
+        min_dim_iou = float(np.min(dim_iou))
+        num_fragile_dims = int(np.sum(dim_iou < 0.3))
+        num_healthy_dims = int(np.sum(dim_iou > 0.7))
+        
+        with open(os.path.join(out_dir, "dimension_sensitivity_stats.txt"), "w") as f:
+            f.write("Per-Dimension Sensitivity Statistics:\n\n")
+            f.write(f"  Mean IoU across dimensions: {mean_dim_iou:.6f}\n")
+            f.write(f"  Min IoU: {min_dim_iou:.6f}\n")
+            f.write(f"  Healthy dimensions (IoU > 0.7): {num_healthy_dims}/{len(dim_iou)}\n")
+            f.write(f"  Fragile dimensions (IoU < 0.3): {num_fragile_dims}/{len(dim_iou)}\n")
+            f.write(f"\nHealth Assessment:\n")
+            if mean_dim_iou > 0.7:
+                f.write("  ✓ Most dimensions are healthy (IoU > 0.7)\n")
+            elif mean_dim_iou < 0.3:
+                f.write("  ✗ Most dimensions are fragile (IoU < 0.3) - manifold is very thin\n")
+            else:
+                f.write("  ⚠ Mixed health - some dimensions are fragile\n")
+        
+        # Print summary to console
+        console.print(f"[dim]  Dimension sensitivity: mean IoU={mean_dim_iou:.4f}, fragile dims={num_fragile_dims}/{len(dim_iou)}[/dim]")
+
+    # -------------------------
+    # (C) Intrinsic dimension estimation
+    # -------------------------
+    with console.status("[cyan]Estimating intrinsic dimension...[/cyan]"):
+        id_est = estimate_intrinsic_dimension(z_flat)
+        
+        with open(os.path.join(out_dir, "intrinsic_dim.txt"), "w") as f:
+            f.write(f"intrinsic_dimension = {id_est:.3f}\n")
+            f.write(f"\nNote: This estimates the effective dimensionality of the latent manifold.\n")
+            f.write(f"Lower values suggest the data lies on a lower-dimensional manifold.\n")
+        
+        console.print(f"[dim]  Intrinsic dimension: {id_est:.3f}[/dim]")
+
+    # -------------------------
     # 5. Enhanced interpolation test (tree shape transition)
     # -------------------------
     with console.status("[cyan]Generating interpolation visualization...[/cyan]"):
@@ -1180,7 +1661,7 @@ def process_single_model(vae_ckpt_path, data_root, out_dir, max_samples, device,
                     logits = vae.decoder(z_rand, skips=None)[0].cpu().detach().numpy()
             else:
                 logits = vae.decoder(z_rand, skips=None)[0].cpu().detach().numpy()
-        proj = logits.argmax(0).max(axis=0)
+        proj = logits.argmax(axis=0).max(axis=0)
 
         plt.imshow(proj)
         plt.title("Decoder(random noise) projection")

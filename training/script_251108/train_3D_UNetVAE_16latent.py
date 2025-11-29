@@ -23,7 +23,6 @@ import math
 import random
 import time
 import csv
-import signal
 import zipfile
 import tempfile
 from datetime import datetime
@@ -732,16 +731,138 @@ def train(args, resume_checkpoint=None):
             f"[cyan]Continuing training from epoch {start_epoch} to {args.epochs}[/cyan]\n"
         )
 
-    # Ctrl+C handling
-    interrupted = {"flag": False, "epoch": None}
+    # Prepare metadata paths
+    csv1_path = os.path.join(exp_dir, f"training_history_{args.exp_name}.csv")
+    csv2_path = os.path.join(exp_dir, f"experiment_metadata_{args.exp_name}.csv")
+    csv3_path = os.path.join(exp_dir, f"experiment_metadata_flat_{args.exp_name}.csv")
 
-    def signal_handler(signum, frame):
+    # Helper function for boolean to string
+    def bool_to_str(v):
+        return "TRUE" if v else "FALSE"
+
+    # Prepare loss function descriptions
+    ce_desc = (
+        f"CrossEntropyLoss(weight=[{class_weights_base[0]:.2f},"
+        f" {class_weights_base[1]:.2f}, {class_weights_base[2]:.2f}])"
+        if class_weights_base is not None
+        else "CrossEntropyLoss(weight=None)"
+    )
+    loss_formula = (
+        f"Loss = {ce_desc} + {args.kl_beta} * KL_Divergence(mu, logvar)"
+    )
+    current_script = (
+        Path(__file__).name if "__file__" in globals() else "interactive_session"
+    )
+
+    # Create initial metadata (all fields that can be determined before training)
+    # Note: start_epoch is set correctly after resume check above
+    initial_metadata = {
+        "exp_name": args.exp_name,
+        "resumed_from": args.resume if args.resume else "None",
+        "start_epoch": start_epoch,
+        "end_epoch": args.epochs,
+        "training_start_time": train_start_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "best_model_path": best_checkpoint_path,
+        "last_checkpoint_path": last_checkpoint_path,
+        "samples_directory": samples_dir,
+        "data_root": args.data_root,
+        "out_dir": args.out_dir,
+        "exp_dir": exp_dir,
+        "script_name": current_script,
+        "n_train_files": n_train,
+        "n_val_files": n_val,
+        "n_test_files": n_test,
+        "n_total_files": n_train + n_val + n_test,
+        "train_dataset_size": len(train_ds),
+        "val_dataset_size": len(val_ds),
+        "test_dataset_size": len(test_ds),
+        "class_weights": args.class_weights,
+        "kl_beta": args.kl_beta,
+        "loss_kl_weight": args.kl_beta,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "workers": args.workers,
+        "seed": args.seed,
+        "force_cpu": bool_to_str(args.cpu),
+        "device": str(device),
+        "amp_enabled": bool_to_str(use_amp),
+        "no_amp": bool_to_str(args.no_amp),
+        "preload": bool_to_str(args.preload),
+        "base": args.base,
+        "latent_dim": args.latent_dim,
+        "latent_spatial_size": "16x16x16",
+        "latent_spatial_size_d": 16,
+        "latent_total_elements": args.latent_dim * 16 * 16 * 16,
+        "model_total_params": total_params,
+        "model_trainable_params": trainable_params,
+        "model_non_trainable_params": non_trainable_params,
+        "use_skip_connections": bool_to_str(skip_levels_effective > 0),
+        "skip_levels": skip_levels_effective,
+        "aug_mode": args.aug_mode,
+        "aug_rot_x": bool_to_str(args.aug_rot_x),
+        "aug_rot_y": bool_to_str(args.aug_rot_y),
+        "aug_rot_z": bool_to_str(args.aug_rot_z),
+        "aug_flip_x": bool_to_str(args.aug_flip_x),
+        "aug_flip_y": bool_to_str(args.aug_flip_y),
+        "aug_flip_z": bool_to_str(args.aug_flip_z),
+        "aug_perturb": bool_to_str(args.aug_perturb),
+        "perturb_prob": args.perturb_prob,
+        "sample_every": args.sample_every,
+        "n_samples": args.n_samples,
+        "save_every": args.save_every,
+        "loss_function": loss_formula,
+        "loss_reconstruction": ce_desc,
+        "loss_kl_divergence": "KL(q(z|x) || N(0,I)) (spatial)",
+    }
+
+    # Save initial metadata (key-value format)
+    with open(csv2_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["parameter", "value"])
+        for k, v in initial_metadata.items():
+            writer.writerow([k, v])
+    console.print(
+        f"[green]✓[/green] Created initial metadata file: [cyan]{csv2_path}[/cyan]"
+    )
+
+    # Save initial metadata (flat format) - only initial fields
+    with open(csv3_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=initial_metadata.keys())
+        writer.writeheader()
+        writer.writerow(initial_metadata)
+    console.print(
+        f"[green]✓[/green] Created initial metadata (flat) file: [cyan]{csv3_path}[/cyan]"
+    )
+
+    # Create training_history.csv with header (append mode if resuming to preserve existing history)
+    if resume_checkpoint and os.path.exists(csv1_path):
+        # If resuming and file exists, check if we need to append or if it's already complete
         console.print(
-            "\n[yellow]⚠ Ctrl+C detected! Saving checkpoint before exit...[/yellow]"
+            f"[cyan]Training history file exists, will append new epochs: [cyan]{csv1_path}[/cyan]"
         )
-        interrupted["flag"] = True
-
-    signal.signal(signal.SIGINT, signal_handler)
+    else:
+        # Create new file with header
+        with open(csv1_path, "w", newline="") as f:
+            fieldnames = [
+                "epoch",
+                "train_loss",
+                "val_loss",
+                "epoch_time_secs",
+                "cumulative_time_secs",
+                "is_best",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            # If resuming and file doesn't exist, restore previous history from checkpoint
+            if resume_checkpoint and training_history:
+                writer.writerows(training_history)
+                console.print(
+                    f"[cyan]Restored {len(training_history)} previous epochs from checkpoint[/cyan]"
+                )
+        console.print(
+            f"[green]✓[/green] Created training history file: [cyan]{csv1_path}[/cyan]"
+        )
 
     def save_checkpoint(epoch, is_best=False, is_last=False):
         checkpoint = {
@@ -801,9 +922,6 @@ def train(args, resume_checkpoint=None):
                 logits_stats_collected = False
 
             for batch_idx, (onehot, labels) in enumerate(train_loader):
-                if interrupted["flag"]:
-                    break
-
                 onehot = onehot.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
 
@@ -892,76 +1010,44 @@ def train(args, resume_checkpoint=None):
                 description=f"[yellow]Epoch {epoch}/{args.epochs} - Validation",
             )
 
-            if interrupted["flag"]:
-                progress.remove_task(epoch_task)
-                val_loss = float("inf")
-            else:
-                model.eval()
-                running = 0.0
-                with torch.no_grad():
-                    for onehot, labels in val_loader:
-                        if interrupted["flag"]:
-                            break
-                        onehot = onehot.to(device)
-                        labels = labels.to(device)
-                        logits, mu, logvar = model(onehot)
-                        weight_tensor = get_weight_tensor(logits)
-                        ce = F.cross_entropy(
-                            logits,
-                            labels.long(),
-                            weight=weight_tensor,
-                        )
-                        kl = kl_divergence(mu, logvar)
-                        loss = ce + args.kl_beta * kl
-                        running += loss.item() * labels.size(0)
-                        progress.update(epoch_task, advance=1)
-                val_loss = running / len(val_loader.dataset)
-                progress.remove_task(epoch_task)
-
-            # Interrupted: save & exit
-            if interrupted["flag"]:
-                interrupted["epoch"] = epoch
-                save_epoch = epoch - 1
-                console.print(
-                    f"\n[yellow]⚠ Interrupted during epoch {epoch}[/yellow]"
-                )
-                console.print(
-                    f"[cyan]Saving checkpoint at last complete epoch {save_epoch}[/cyan]"
-                )
-                cp = {
-                    "epoch": save_epoch,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "best_val": best_val,
-                    "training_history": training_history,
-                    "cumulative_time_secs": cumulative_time_offset
-                    + (time.time() - global_t0),
-                    "args": vars(args),
-                    "rng_state": torch.get_rng_state(),
-                    "numpy_rng_state": np.random.get_state(),
-                    "python_rng_state": random.getstate(),
-                }
-                if torch.cuda.is_available():
-                    cp["cuda_rng_state"] = torch.cuda.get_rng_state_all()
-                if scaler is not None:
-                    cp["scaler"] = scaler.state_dict()
-                torch.save(cp, last_checkpoint_path)
-                raise KeyboardInterrupt("Training interrupted by user")
+            model.eval()
+            running = 0.0
+            with torch.no_grad():
+                for onehot, labels in val_loader:
+                    onehot = onehot.to(device)
+                    labels = labels.to(device)
+                    logits, mu, logvar = model(onehot)
+                    weight_tensor = get_weight_tensor(logits)
+                    ce = F.cross_entropy(
+                        logits,
+                        labels.long(),
+                        weight=weight_tensor,
+                    )
+                    kl = kl_divergence(mu, logvar)
+                    loss = ce + args.kl_beta * kl
+                    running += loss.item() * labels.size(0)
+                    progress.update(epoch_task, advance=1)
+            val_loss = running / len(val_loader.dataset)
+            progress.remove_task(epoch_task)
 
             epoch_secs = time.time() - epoch_t0
             cum_secs = cumulative_time_offset + (time.time() - global_t0)
             is_best = val_loss < best_val
 
-            training_history.append(
-                {
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "epoch_time_secs": epoch_secs,
-                    "cumulative_time_secs": cum_secs,
-                    "is_best": "TRUE" if is_best else "FALSE",
-                }
-            )
+            history_row = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "epoch_time_secs": epoch_secs,
+                "cumulative_time_secs": cum_secs,
+                "is_best": "TRUE" if is_best else "FALSE",
+            }
+            training_history.append(history_row)
+
+            # Immediately append to training_history.csv
+            with open(csv1_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=history_row.keys())
+                writer.writerow(history_row)
 
             if is_best:
                 best_val = val_loss
@@ -1115,59 +1201,14 @@ def train(args, resume_checkpoint=None):
     )
     console.print("\n", final_table, "\n")
 
-    # CSV: training history
-    csv1_path = os.path.join(
-        exp_dir, f"training_history_{args.exp_name}.csv"
-    )
-    with open(csv1_path, "w", newline="") as f:
-        fieldnames = [
-            "epoch",
-            "train_loss",
-            "val_loss",
-            "epoch_time_secs",
-            "cumulative_time_secs",
-            "is_best",
-        ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(training_history)
+    # Training history CSV is already being written incrementally during training
     console.print(
-        f"[green]✓[/green] Saved training history to [cyan]{csv1_path}[/cyan]"
+        f"[green]✓[/green] Training history saved incrementally to [cyan]{csv1_path}[/cyan]"
     )
 
-    # CSV: metadata
-    def bool_to_str(v):
-        return "TRUE" if v else "FALSE"
-
-    csv2_path = os.path.join(
-        exp_dir, f"experiment_metadata_{args.exp_name}.csv"
-    )
-    ce_desc = (
-        f"CrossEntropyLoss(weight=[{class_weights_base[0]:.2f},"
-        f" {class_weights_base[1]:.2f}, {class_weights_base[2]:.2f}])"
-        if class_weights_base is not None
-        else "CrossEntropyLoss(weight=None)"
-    )
-    loss_formula = (
-        f"Loss = {ce_desc} + {args.kl_beta} * KL_Divergence(mu, logvar)"
-    )
-
-    current_script = (
-        Path(__file__).name if "__file__" in globals() else "interactive_session"
-    )
-
-    metadata = {
-        "exp_name": args.exp_name,
-        "resumed_from": args.resume if args.resume else "None",
-        "start_epoch": start_epoch,
-        "end_epoch": args.epochs,
-        "training_start_time": train_start_time.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-        "training_end_time": train_end_time.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-        "best_model_path": best_checkpoint_path,
+    # Append final metadata fields to metadata files (append to end to maintain field order)
+    final_metadata = {
+        "training_end_time": train_end_time.strftime("%Y-%m-%d %H:%M:%S"),
         "last_checkpoint_path": "deleted_after_completion"
         if last_checkpoint_removed
         else (
@@ -1175,80 +1216,43 @@ def train(args, resume_checkpoint=None):
             if os.path.exists(last_checkpoint_path)
             else "not_available"
         ),
-        "samples_directory": samples_dir,
-        "data_root": args.data_root,
-        "out_dir": args.out_dir,
-        "exp_dir": exp_dir,
-        "script_name": current_script,
-        "n_train_files": n_train,
-        "n_val_files": n_val,
-        "n_test_files": n_test,
-        "n_total_files": n_train + n_val + n_test,
-        "train_dataset_size": len(train_ds),
-        "val_dataset_size": len(val_ds),
-        "test_dataset_size": len(test_ds),
-        "class_weights": args.class_weights,
-        "kl_beta": args.kl_beta,
-        "loss_kl_weight": args.kl_beta,
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "lr": args.lr,
-        "workers": args.workers,
-        "seed": args.seed,
-        "force_cpu": bool_to_str(args.cpu),
-        "device": str(device),
-        "amp_enabled": bool_to_str(use_amp),
-        "no_amp": bool_to_str(args.no_amp),
-        "preload": bool_to_str(args.preload),
-        "base": args.base,
-        "latent_dim": args.latent_dim,
-        "latent_spatial_size": "16x16x16",
-        "latent_spatial_size_d": 16,
-        "latent_total_elements": args.latent_dim * 16 * 16 * 16,
-        "model_total_params": total_params,
-        "model_trainable_params": trainable_params,
-        "model_non_trainable_params": non_trainable_params,
-        "use_skip_connections": bool_to_str(skip_levels_effective > 0),
-        "skip_levels": skip_levels_effective,
-        "aug_mode": args.aug_mode,
-        "aug_rot_x": bool_to_str(args.aug_rot_x),
-        "aug_rot_y": bool_to_str(args.aug_rot_y),
-        "aug_rot_z": bool_to_str(args.aug_rot_z),
-        "aug_flip_x": bool_to_str(args.aug_flip_x),
-        "aug_flip_y": bool_to_str(args.aug_flip_y),
-        "aug_flip_z": bool_to_str(args.aug_flip_z),
-        "aug_perturb": bool_to_str(args.aug_perturb),
-        "perturb_prob": args.perturb_prob,
-        "sample_every": args.sample_every,
-        "n_samples": args.n_samples,
-        "save_every": args.save_every,
         "best_val_loss": best_val,
         "final_test_loss": test_loss,
         "total_training_time_secs": total_secs,
         "total_training_time_formatted": fmt_secs(total_secs),
-        "loss_function": loss_formula,
-        "loss_reconstruction": ce_desc,
-        "loss_kl_divergence": "KL(q(z|x) || N(0,I)) (spatial)",
     }
 
-    with open(csv2_path, "w", newline="") as f:
+    # Append to key-value format metadata
+    with open(csv2_path, "a", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["parameter", "value"])
-        for k, v in metadata.items():
+        for k, v in final_metadata.items():
             writer.writerow([k, v])
     console.print(
-        f"[green]✓[/green] Saved experiment metadata to [cyan]{csv2_path}[/cyan]"
+        f"[green]✓[/green] Updated experiment metadata with final fields: [cyan]{csv2_path}[/cyan]"
     )
 
-    csv3_path = os.path.join(
-        exp_dir, f"experiment_metadata_flat_{args.exp_name}.csv"
-    )
+    # For flat format, we need to read existing, merge, and rewrite
+    # But to maintain compatibility, we'll append new columns
+    # Read existing flat metadata
+    existing_flat_metadata = {}
+    if os.path.exists(csv3_path):
+        with open(csv3_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames:
+                row = next(reader, None)
+                if row:
+                    existing_flat_metadata = row
+
+    # Merge with final metadata
+    all_flat_metadata = {**existing_flat_metadata, **final_metadata}
+    
+    # Rewrite flat format with all fields
     with open(csv3_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=metadata.keys())
+        writer = csv.DictWriter(f, fieldnames=all_flat_metadata.keys())
         writer.writeheader()
-        writer.writerow(metadata)
+        writer.writerow(all_flat_metadata)
     console.print(
-        f"[green]✓[/green] Saved experiment metadata (flat) to [cyan]{csv3_path}[/cyan]"
+        f"[green]✓[/green] Updated experiment metadata (flat) with final fields: [cyan]{csv3_path}[/cyan]"
     )
 
     console.print(
