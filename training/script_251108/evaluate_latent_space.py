@@ -951,7 +951,22 @@ def process_single_model(vae_ckpt_path, data_root, out_dir, max_samples, device,
     z, mu, logvar = collect_latents(vae, loader, device, max_samples=max_samples, use_amp=use_amp)
     N, C, H, W, D = z.shape
 
-    os.makedirs(out_dir, exist_ok=True)
+    # Validate and create output directory
+    out_dir_path = Path(out_dir)
+    if out_dir_path.exists() and out_dir_path.is_file():
+        raise ValueError(
+            f"Output directory path points to an existing file: {out_dir}\n"
+            f"Please specify a directory path, not a file path."
+        )
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        raise OSError(
+            f"Failed to create output directory: {out_dir}\n"
+            f"Error: {e}\n"
+            f"Please ensure the path is valid and you have write permissions."
+        )
+    
     console.print(f"[green]✓[/green] Collected {N} latent vectors")
 
     # Flatten for statistics
@@ -1243,7 +1258,18 @@ def main(args):
             # Generate output directory
             if args.out_dir:
                 # If out_dir is specified, use it (for backward compatibility)
-                out_dir = args.out_dir
+                out_dir_path = Path(args.out_dir)
+                # Check if out_dir is a file path (e.g., ends with .pt)
+                if out_dir_path.exists() and out_dir_path.is_file():
+                    # If it's a file, create a directory with the same name (without extension)
+                    out_dir = str(out_dir_path.parent / out_dir_path.stem)
+                    console.print(f"[yellow]⚠[/yellow] --out_dir points to a file, using directory: [cyan]{out_dir}[/cyan]")
+                elif out_dir_path.suffix in ['.pt', '.pth', '.ckpt']:
+                    # If it has a checkpoint extension but doesn't exist, treat as directory name
+                    out_dir = str(out_dir_path.parent / out_dir_path.stem)
+                    console.print(f"[yellow]⚠[/yellow] --out_dir has file extension, using directory: [cyan]{out_dir}[/cyan]")
+                else:
+                    out_dir = args.out_dir
             else:
                 # Auto-generate output directory next to model
                 out_dir = get_output_dir(model_path)
