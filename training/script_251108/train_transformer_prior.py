@@ -571,29 +571,62 @@ def main():
     print(f"Train={len(train_files)}, Val={len(val_files)}, Test={len(test_files)}")
 
     # ------------------------------------------------
-    # 自動推斷 latent_dim（若使用者未提供）
+    # 自動推斷 latent_dim 和 latent grid 大小（若使用者未提供）
     # ------------------------------------------------
+    seq_len = None
+    latent_grid_size = None
     if args.latent_dim is None:
         if len(train_files) == 0:
             raise ValueError("未提供 --latent_dim，且 train/ 資料夾為空，無法推斷 latent_dim。")
-        # 從 train/ 的第一個檔案推斷維度；要求形狀為 [512, D]
+        # 從 train/ 的第一個檔案推斷維度
         probe = np.load(train_files[0], mmap_mode="r")
         if probe.ndim != 2:
             raise ValueError(f"檔案形狀不正確（期望 2 維）：{train_files[0]} 取得 {probe.shape}")
-        if probe.shape[0] != 512:
-            raise ValueError(f"序列長度不為 512：{train_files[0]} 取得 {probe.shape}")
+        seq_len = int(probe.shape[0])
         args.latent_dim = int(probe.shape[1])
         print(f"[Info] 自動推斷 latent_dim = {args.latent_dim} 來自 {os.path.basename(train_files[0])}")
+        print(f"[Info] 序列長度 = {seq_len}")
+        
+        # 推斷 latent grid 大小（假設是立方體：grid_size^3 = seq_len）
+        grid_size_candidate = round(seq_len ** (1.0 / 3.0))
+        if grid_size_candidate ** 3 == seq_len:
+            latent_grid_size = grid_size_candidate
+            print(f"[Info] 自動推斷 latent_grid_size = {latent_grid_size} (因為 {latent_grid_size}^3 = {seq_len})")
+        else:
+            # 如果不是完美的立方數，嘗試其他常見配置
+            print(f"[Warning] 序列長度 {seq_len} 不是完美立方數（{grid_size_candidate}^3 = {grid_size_candidate**3} ≠ {seq_len}）")
+            print(f"[Warning] 無法自動推斷 latent grid 大小，將設為未知")
+            latent_grid_size = None
+        
         # 基本一致性檢查：各 split 的第一個檔案（若存在）需有相同維度
         for split_name, files in [("train", train_files), ("val", val_files), ("test", test_files)]:
             if len(files) == 0:
                 continue
             probe2 = np.load(files[0], mmap_mode="r")
-            if probe2.ndim != 2 or probe2.shape[0] != 512 or probe2.shape[1] != args.latent_dim:
+            if probe2.ndim != 2 or probe2.shape[0] != seq_len or probe2.shape[1] != args.latent_dim:
                 raise ValueError(
-                    f"{split_name}/ 形狀不一致或不為 [512, {args.latent_dim}]：" +
+                    f"{split_name}/ 形狀不一致或不為 [{seq_len}, {args.latent_dim}]：" +
                     f"{files[0]} 取得 {probe2.shape}"
                 )
+    else:
+        # 如果 latent_dim 已提供，仍需要檢查序列長度來推斷 grid 大小
+        if len(train_files) > 0:
+            probe = np.load(train_files[0], mmap_mode="r")
+            if probe.ndim == 2:
+                seq_len = int(probe.shape[0])
+                grid_size_candidate = round(seq_len ** (1.0 / 3.0))
+                if grid_size_candidate ** 3 == seq_len:
+                    latent_grid_size = grid_size_candidate
+                    print(f"[Info] 自動推斷 latent_grid_size = {latent_grid_size} (因為 {latent_grid_size}^3 = {seq_len})")
+                else:
+                    latent_grid_size = None
+                    print(f"[Warning] 序列長度 {seq_len} 不是完美立方數，無法自動推斷 latent grid 大小")
+            else:
+                seq_len = 512  # 預設值
+                latent_grid_size = 8  # 預設值
+        else:
+            seq_len = 512  # 預設值
+            latent_grid_size = 8  # 預設值
 
     # 預先載入全部訓練/驗證/測試資料到記憶體以提高效能
     train_ds = LatentDataset(train_files, preload=args.preload, console=console)
@@ -611,14 +644,15 @@ def main():
         test_ds, batch_size=args.batch, shuffle=False, num_workers=args.workers, pin_memory=pin_memory
     )
 
-    # Build model
+    # Build model (use inferred sequence length or default to 512)
+    max_seq_len = seq_len if seq_len is not None else 512
     model = TransformerPrior(
         token_dim=args.latent_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.layers,
         num_heads=args.heads,
         dropout=args.dropout,
-        max_seq=512,
+        max_seq=max_seq_len,
     ).to(device)
 
     opt = AdamW(model.parameters(), lr=args.lr)
@@ -631,6 +665,7 @@ def main():
     best_path = os.path.join(exp_dir, "best_prior.pt")
     analytics_dir = os.path.join(exp_dir, "analytics")
     os.makedirs(analytics_dir, exist_ok=True)
+    analytics_summary_csv = os.path.join(exp_dir, f"analytics_summary_{args.exp_name}.csv")
 
     # 可選：載入 VAE decoder 以產生投影圖
     def _load_vae_decoder(ckpt_path: str, model_def_path: str | None, latent_dim: int, device):
@@ -697,6 +732,7 @@ def main():
     # Prepare metadata paths
     history_csv = os.path.join(exp_dir, f"training_history_{args.exp_name}.csv")
     metadata_csv = os.path.join(exp_dir, f"experiment_metadata_{args.exp_name}.csv")
+    metadata_flat_csv = os.path.join(exp_dir, f"experiment_metadata_flat_{args.exp_name}.csv")
 
     # Count model parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -740,6 +776,10 @@ def main():
         "sample_mode": args.sample_mode,
         "analytics_every": args.analytics_every,
         "vae_ckpt": args.vae_ckpt if args.vae_ckpt else "None",
+        "latent_sequence_length": seq_len if seq_len is not None else "unknown",
+        "latent_grid_size": f"{latent_grid_size}x{latent_grid_size}x{latent_grid_size}" if latent_grid_size is not None else "unknown",
+        "latent_grid_size_d": latent_grid_size if latent_grid_size is not None else "unknown",
+        "latent_total_tokens": seq_len if seq_len is not None else "unknown",
     }
 
     # Save initial metadata (key-value format)
@@ -750,6 +790,15 @@ def main():
             writer.writerow([k, v])
     console.print(
         f"[green]✓[/green] Created initial metadata file: [cyan]{metadata_csv}[/cyan]"
+    )
+
+    # Save initial metadata (flat format - single row with all fields as columns)
+    with open(metadata_flat_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=initial_metadata.keys())
+        writer.writeheader()
+        writer.writerow(initial_metadata)
+    console.print(
+        f"[green]✓[/green] Created initial metadata (flat) file: [cyan]{metadata_flat_csv}[/cyan]"
     )
 
     # Create training_history.csv with header
@@ -906,7 +955,7 @@ def main():
                     plt.close()
 
                 # (2) Self-Similarity Heatmap from one sampled latent
-                z_sample = sample_latent(model, token_dim=args.latent_dim, seq_len=512, device=device)
+                z_sample = sample_latent(model, token_dim=args.latent_dim, seq_len=max_seq_len, device=device)
                 z_norm = z_sample / (np.linalg.norm(z_sample, axis=1, keepdims=True) + 1e-8)
                 sim = np.clip(z_norm @ z_norm.T, -1.0, 1.0)  # cosine similarity
                 np.save(os.path.join(ep_dir, "self_similarity.npy"), sim)
@@ -921,10 +970,11 @@ def main():
                 # (2b) 若提供 VAE decoder：將 latent 轉回體素，輸出 3 視角投影 + 佔空比
                 if vae_decoder is not None:
                     with torch.no_grad():
-                        # z_sample: [512, D] -> [1, D, 8, 8, 8]
+                        # z_sample: [seq_len, D] -> [1, D, grid_size, grid_size, grid_size]
                         D = z_sample.shape[1]
+                        grid_size_to_use = latent_grid_size if latent_grid_size is not None else 8
                         z_reshaped = torch.from_numpy(z_sample).to(device=device, dtype=torch.float32)
-                        z_reshaped = z_reshaped.view(1, 8, 8, 8, D).permute(0, 4, 1, 2, 3).contiguous()
+                        z_reshaped = z_reshaped.view(1, grid_size_to_use, grid_size_to_use, grid_size_to_use, D).permute(0, 4, 1, 2, 3).contiguous()
                         logits = vae_decoder(z_reshaped, skips=None)[0].detach().cpu().numpy()  # [C,32,32,32]
                         labels = np.argmax(logits, axis=0).astype(np.uint8)  # [32,32,32]
 
@@ -1026,7 +1076,7 @@ def main():
                 K = 4
                 gen_list = []
                 for _ in range(K):
-                    s = sample_latent(model, token_dim=args.latent_dim, seq_len=512, device=device, mode=args.sample_mode)  # [512,D]
+                    s = sample_latent(model, token_dim=args.latent_dim, seq_len=max_seq_len, device=device, mode=args.sample_mode)  # [seq_len,D]
                     gen_list.append(s)
                 gen_tokens = np.concatenate(gen_list, axis=0)  # [K*512, D]
                 gen_mean = gen_tokens.mean(axis=0)
@@ -1123,6 +1173,96 @@ def main():
                 except Exception as e:
                     console.print(f"[yellow]PCA diagnostics failed:[/yellow] {e}")
 
+                # ====== 追加到匯總 CSV ======
+                try:
+                    import re
+                    row = {"epoch": epoch}
+                    
+                    # 解析 decoder_occupancy.txt (如果存在)
+                    occ_file = os.path.join(ep_dir, "decoder_occupancy.txt")
+                    if os.path.exists(occ_file):
+                        try:
+                            with open(occ_file, "r") as f:
+                                content = f.read()
+                                non_air_match = re.search(r"non_air_ratio\s*=\s*([\d.]+)", content)
+                                bbox_match = re.search(r"bbox_volume_ratio\s*=\s*([\d.]+)", content)
+                                if non_air_match:
+                                    row["non_air_ratio"] = float(non_air_match.group(1))
+                                if bbox_match:
+                                    row["bbox_volume_ratio"] = float(bbox_match.group(1))
+                        except Exception as e:
+                            console.print(f"[yellow]Warning:[/yellow] Failed to parse decoder_occupancy.txt: {e}")
+                    
+                    # 讀取 distribution_drift_metrics.csv
+                    drift_file = os.path.join(ep_dir, "distribution_drift_metrics.csv")
+                    if os.path.exists(drift_file):
+                        try:
+                            with open(drift_file, "r", newline="") as f:
+                                reader = csv.DictReader(f)
+                                for r in reader:
+                                    metric = r.get("metric", "").strip()
+                                    value = r.get("value", "").strip()
+                                    if metric == "kl_diag_gaussian_train||gen":
+                                        row["kl_diag_gaussian_train_gen"] = float(value) if value else ""
+                                    elif metric == "mmd_rbf":
+                                        row["mmd_rbf"] = float(value) if value else ""
+                                    elif metric == "mean_l2":
+                                        row["mean_l2"] = float(value) if value else ""
+                                    elif metric == "std_l2":
+                                        row["std_l2"] = float(value) if value else ""
+                        except Exception as e:
+                            console.print(f"[yellow]Warning:[/yellow] Failed to parse distribution_drift_metrics.csv: {e}")
+                    
+                    # 讀取 latent_pca_stats.csv
+                    pca_file = os.path.join(ep_dir, "latent_pca_stats.csv")
+                    if os.path.exists(pca_file):
+                        try:
+                            with open(pca_file, "r", newline="") as f:
+                                reader = csv.DictReader(f)
+                                for r in reader:
+                                    metric = r.get("metric", "").strip()
+                                    value = r.get("value", "").strip()
+                                    if metric == "mean_l2_real_gen":
+                                        row["pca_mean_l2_real_gen"] = float(value) if value else ""
+                                    elif metric == "std_l2_real_gen":
+                                        row["pca_std_l2_real_gen"] = float(value) if value else ""
+                                    elif metric == "n_points_per_class":
+                                        row["pca_n_points_per_class"] = int(value) if value else ""
+                        except Exception as e:
+                            console.print(f"[yellow]Warning:[/yellow] Failed to parse latent_pca_stats.csv: {e}")
+                    
+                    # 處理匯總 CSV：讀取現有數據，合併新欄位，追加新行
+                    file_exists = os.path.exists(analytics_summary_csv)
+                    existing_rows = []
+                    existing_fields = []
+                    
+                    if file_exists:
+                        # 讀取現有數據和欄位
+                        with open(analytics_summary_csv, "r", newline="") as f:
+                            reader = csv.DictReader(f)
+                            existing_fields = list(reader.fieldnames) if reader.fieldnames else []
+                            existing_rows = list(reader)
+                    
+                    # 確定所有欄位（epoch 在前，其他按字母順序）
+                    all_fields = set(existing_fields) if existing_fields else set()
+                    all_fields.update(row.keys())
+                    all_fields_sorted = ["epoch"] + sorted([f for f in all_fields if f != "epoch"])
+                    
+                    # 重寫整個文件（包含新行）
+                    with open(analytics_summary_csv, "w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=all_fields_sorted)
+                        writer.writeheader()
+                        # 寫入現有行（補充缺失欄位為空字符串）
+                        for er in existing_rows:
+                            complete_row = {field: er.get(field, "") for field in all_fields_sorted}
+                            writer.writerow(complete_row)
+                        # 追加新行（補充缺失欄位為空字符串）
+                        complete_row = {field: row.get(field, "") for field in all_fields_sorted}
+                        writer.writerow(complete_row)
+                    
+                except Exception as e:
+                    console.print(f"[yellow]Warning:[/yellow] Failed to append to analytics summary CSV: {e}")
+
             # Console line with KL beside val when available
             best_marker = " | ★ Best!" if is_best else ""
             kl_str = f" | KL={current_kl:.6f}" if current_kl is not None else ""
@@ -1180,8 +1320,30 @@ def main():
         f"[green]✓[/green] Updated experiment metadata with final fields: [cyan]{metadata_csv}[/cyan]"
     )
 
+    # For flat format, read existing metadata, merge with final fields, and rewrite
+    existing_flat_metadata = {}
+    if os.path.exists(metadata_flat_csv):
+        with open(metadata_flat_csv, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames:
+                row = next(reader, None)
+                if row:
+                    existing_flat_metadata = row
+
+    # Merge with final metadata
+    all_flat_metadata = {**existing_flat_metadata, **final_metadata}
+    
+    # Rewrite flat format with all fields
+    with open(metadata_flat_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=all_flat_metadata.keys())
+        writer.writeheader()
+        writer.writerow(all_flat_metadata)
+    console.print(
+        f"[green]✓[/green] Updated experiment metadata (flat) with final fields: [cyan]{metadata_flat_csv}[/cyan]"
+    )
+
     # Sample a latent
-    sample = sample_latent(model, token_dim=args.latent_dim, seq_len=512, device=device, mode=args.sample_mode)
+    sample = sample_latent(model, token_dim=args.latent_dim, seq_len=max_seq_len, device=device, mode=args.sample_mode)
     np.save(os.path.join(exp_dir, "sample_latent.npy"), sample)
     print(f"Saved sample latent to {os.path.join(exp_dir, 'sample_latent.npy')}.")
 
