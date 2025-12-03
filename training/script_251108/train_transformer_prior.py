@@ -55,9 +55,13 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from rich.panel import Panel
 
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
+from sklearn.metrics import pairwise_distances
+from scipy.spatial.distance import pdist
+from scipy.stats import entropy
 
 # ------------------------------------------------
 # Utility
@@ -403,6 +407,105 @@ def compute_decoder_occupancy(labels, air_class=0):
 
     return non_air_ratio, bbox_volume_ratio
 
+def latent_coverage_ratio(real_latent, gen_latent, percentile=20):
+    """
+    Compute coverage ratio: how many real latents are covered by generated latents.
+    
+    Parameters
+    ----------
+    real_latent : np.ndarray
+        Array of shape [N, D] containing real latent tokens.
+    gen_latent : np.ndarray
+        Array of shape [M, D] containing generated latent tokens.
+    percentile : int, default=20
+        Percentile to use for radius determination from real distribution.
+    
+    Returns
+    -------
+    coverage : float
+        Ratio of real latents covered by generated latents.
+    radius : float
+        Radius used for coverage calculation.
+    """
+    # (1) Determine radius r from REAL distribution
+    real_dist = pairwise_distances(real_latent)
+    # Only take off-diagonal (exclude self-distances) - use upper triangle indices
+    triu_indices = np.triu_indices_from(real_dist, k=1)
+    real_dist_off_diag = real_dist[triu_indices]
+    r = np.percentile(real_dist_off_diag, percentile)
+
+    # (2) Compute coverage
+    dist_rg = pairwise_distances(real_latent, gen_latent)
+    min_dist = dist_rg.min(axis=1)
+    covered = (min_dist < r).mean()
+
+    return covered, r
+
+def js_divergence(p, q, eps=1e-12):
+    """Jensen-Shannon divergence between two probability distributions."""
+    p = p / (p.sum() + eps)
+    q = q / (q.sum() + eps)
+    m = 0.5 * (p + q)
+    return 0.5 * entropy(p, m) + 0.5 * entropy(q, m)
+
+def pairwise_distance_js(real_latent, gen_latent, bins=50):
+    """
+    Compute JS divergence between pairwise distance distributions of real and generated latents.
+    
+    Parameters
+    ----------
+    real_latent : np.ndarray
+        Array of shape [N, D] containing real latent tokens.
+    gen_latent : np.ndarray
+        Array of shape [M, D] containing generated latent tokens.
+    bins : int, default=50
+        Number of bins for histogram.
+    
+    Returns
+    -------
+    js : float
+        Jensen-Shannon divergence between pairwise distance distributions.
+    """
+    # 1. Pairwise distances
+    d_real = pdist(real_latent)
+    d_gen = pdist(gen_latent)
+
+    # 2. Histogram (normalize)
+    hist_real, edges = np.histogram(d_real, bins=bins, density=True)
+    hist_gen, _ = np.histogram(d_gen, bins=bins, density=True)
+
+    # 3. JS divergence
+    js = js_divergence(hist_real, hist_gen)
+
+    return js
+
+def novelty_score(real_latent, gen_latent):
+    """
+    Compute novelty score: how far generated latents are from nearest real latents.
+    
+    Parameters
+    ----------
+    real_latent : np.ndarray
+        Array of shape [N, D] containing real latent tokens.
+    gen_latent : np.ndarray
+        Array of shape [M, D] containing generated latent tokens.
+    
+    Returns
+    -------
+    dict
+        Dictionary containing novelty_mean, novelty_std, novelty_min, novelty_max.
+    """
+    # Distance from each generated latent to nearest real latent
+    dist_rg = pairwise_distances(gen_latent, real_latent)
+    min_dist = dist_rg.min(axis=1)
+
+    return {
+        "novelty_mean": float(min_dist.mean()),
+        "novelty_std": float(min_dist.std()),
+        "novelty_min": float(min_dist.min()),
+        "novelty_max": float(min_dist.max()),
+    }
+
 # ------------------------------------------------
 # Main
 # ------------------------------------------------
@@ -660,12 +763,31 @@ def main():
 
     # 建立 out_dir/exp_name 實驗資料夾
     exp_dir = os.path.join(args.out_dir, args.exp_name)
+    
+    # 檢查實驗目錄是否存在且不為空，避免覆蓋現有資料
+    if os.path.exists(exp_dir) and os.listdir(exp_dir):
+        console.print(
+            Panel.fit(
+                "[bold red]ERROR: Experiment Directory Not Empty[/bold red]\n\n"
+                f"[yellow]{exp_dir}[/yellow]\n"
+                "Use another --exp_name, clean directory, or delete the existing directory.",
+                border_style="red",
+            )
+        )
+        raise SystemExit(1)
+    
     os.makedirs(exp_dir, exist_ok=True)
     best_val = 1e10
     best_path = os.path.join(exp_dir, "best_prior.pt")
     analytics_dir = os.path.join(exp_dir, "analytics")
     os.makedirs(analytics_dir, exist_ok=True)
     analytics_summary_csv = os.path.join(exp_dir, f"analytics_summary_{args.exp_name}.csv")
+    
+    # Create samples directory (only if VAE decoder is available)
+    samples_dir = None
+    if args.vae_ckpt:
+        samples_dir = os.path.join(exp_dir, "samples")
+        os.makedirs(samples_dir, exist_ok=True)
 
     # 可選：載入 VAE decoder 以產生投影圖
     def _load_vae_decoder(ckpt_path: str, model_def_path: str | None, latent_dim: int, device):
@@ -967,6 +1089,68 @@ def main():
                 plt.savefig(os.path.join(ep_dir, "self_similarity.png"), dpi=140)
                 plt.close()
 
+                # (2a) Sample Variance & Multi-Sample PCA
+                K = 5
+                multi_samples = []
+                multi_samples_flat = []
+                for _ in range(K):
+                    s = sample_latent(model, token_dim=args.latent_dim, seq_len=max_seq_len, device=device, mode=args.sample_mode)
+                    multi_samples.append(s)  # keep original shape [seq_len, D]
+                    multi_samples_flat.append(s.reshape(-1))  # flatten to 1D for variance calculation
+                
+                multi_samples_stacked = np.stack(multi_samples_flat)  # shape [K, seq_len*D]
+                
+                # [S1] Sample Variance: pairwise L2 distances
+                dists = []
+                for i in range(K):
+                    for j in range(i + 1, K):
+                        d = np.linalg.norm(multi_samples_stacked[i] - multi_samples_stacked[j])
+                        dists.append(d)
+                sample_variance = np.mean(dists) if len(dists) > 0 else 0.0
+                
+                # Save sample variance metric
+                with open(os.path.join(ep_dir, "sample_variance.txt"), "w") as f:
+                    f.write("Sample Variance Diagnostics\n")
+                    f.write(f"  sample_variance (mean pairwise L2) = {sample_variance:.6f}\n")
+                    f.write(f"  n_samples = {K}\n")
+                    f.write("\n建議參考：\n")
+                    f.write("  • 若 sample_variance < 1e-3 → collapse（所有樣本幾乎相同）\n")
+                    f.write("  • 若 sample_variance 明顯大於 0 → 有多樣性\n")
+                
+                # [S2] Multi-Sample PCA: visualize all K samples in PCA space
+                Z_flat = np.concatenate(multi_samples, axis=0)  # [K*seq_len, D]
+                pca_multi = PCA(n_components=2)
+                Z_pca = pca_multi.fit_transform(Z_flat)  # [K*seq_len, 2]
+                
+                # Plot: color by which sample (K different colors)
+                plt.figure(figsize=(8, 6))
+                colors = plt.cm.tab10(np.linspace(0, 1, K))
+                for k in range(K):
+                    start_idx = k * max_seq_len
+                    end_idx = (k + 1) * max_seq_len
+                    plt.scatter(
+                        Z_pca[start_idx:end_idx, 0],
+                        Z_pca[start_idx:end_idx, 1],
+                        s=2,
+                        alpha=0.5,
+                        label=f"Sample {k+1}",
+                        color=colors[k],
+                    )
+                plt.legend()
+                plt.title(f"Multi-Sample PCA (K={K} samples)")
+                plt.xlabel("PC1")
+                plt.ylabel("PC2")
+                plt.tight_layout()
+                plt.savefig(os.path.join(ep_dir, "multi_sample_pca.png"), dpi=140)
+                plt.close()
+                
+                # Save sample variance to CSV for easy tracking
+                with open(os.path.join(ep_dir, "sample_variance.csv"), "w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["metric", "value"])
+                    w.writerow(["sample_variance", f"{sample_variance:.6f}"])
+                    w.writerow(["n_samples", K])
+
                 # (2b) 若提供 VAE decoder：將 latent 轉回體素，輸出 3 視角投影 + 佔空比
                 if vae_decoder is not None:
                     with torch.no_grad():
@@ -1002,6 +1186,52 @@ def main():
                         fig.tight_layout()
                         plt.savefig(os.path.join(ep_dir, "vae_projection.png"), dpi=140)
                         plt.close(fig)
+
+                # (2c) 若提供 VAE decoder：生成 3 個樣本並保存到 samples 目錄
+                if vae_decoder is not None and samples_dir is not None:
+                    n_samples = 3
+                    grid_size_to_use = latent_grid_size if latent_grid_size is not None else 8
+                    for sample_idx in range(n_samples):
+                        with torch.no_grad():
+                            # Sample a new latent sequence
+                            z_sample_new = sample_latent(
+                                model, 
+                                token_dim=args.latent_dim, 
+                                seq_len=max_seq_len, 
+                                device=device, 
+                                mode=args.sample_mode
+                            )  # [seq_len, D]
+                            
+                            # Decode latent to voxel
+                            D = z_sample_new.shape[1]
+                            z_reshaped = torch.from_numpy(z_sample_new).to(device=device, dtype=torch.float32)
+                            z_reshaped = z_reshaped.view(
+                                1, grid_size_to_use, grid_size_to_use, grid_size_to_use, D
+                            ).permute(0, 4, 1, 2, 3).contiguous()
+                            logits = vae_decoder(z_reshaped, skips=None)[0].detach().cpu().numpy()  # [C,32,32,32]
+                            labels = np.argmax(logits, axis=0).astype(np.uint8)  # [32,32,32]
+                            
+                            # Save voxel as .npz file (sample_idx starts from 0, but filename uses 1-based indexing)
+                            sample_npz_name = f"sample_e{epoch}_{sample_idx + 1}_{args.exp_name}.npz"
+                            sample_npz_path = os.path.join(samples_dir, sample_npz_name)
+                            np.savez_compressed(sample_npz_path, labels)
+                            
+                            # Create 3-view projection
+                            max_z = labels.max(axis=0)
+                            max_y = labels.max(axis=1)
+                            max_x = labels.max(axis=2)
+                            fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+                            axes[0].imshow(max_z); axes[0].set_title("MaxProj Z (Y,X)")
+                            axes[1].imshow(max_y); axes[1].set_title("MaxProj Y (Z,X)")
+                            axes[2].imshow(max_x); axes[2].set_title("MaxProj X (Z,Y)")
+                            for ax in axes: ax.axis("off")
+                            fig.tight_layout()
+                            
+                            # Save PNG file (sample_idx starts from 0, but filename uses 1-based indexing)
+                            sample_png_name = f"sample_e{epoch}_{sample_idx + 1}_{args.exp_name}.png"
+                            sample_png_path = os.path.join(samples_dir, sample_png_name)
+                            plt.savefig(sample_png_path, dpi=140)
+                            plt.close(fig)
 
                 # (3) Distribution Drift: KL (diag-Gaussian), MMD (RBF), mean/std compare
                 def diagonal_gaussian_kl(mu_p, std_p, mu_q, std_q, eps=1e-8):
@@ -1170,6 +1400,35 @@ def main():
                         w_pca.writerow(["std_l2_real_gen", f"{std_l2_pca:.6f}"])
                         w_pca.writerow(["n_points_per_class", n])
 
+                    # ====== 新增：Latent Coverage Ratio, Pairwise Distance JS Divergence, Novelty Score ======
+                    # Use the same samples as PCA for consistency
+                    # Ensure we have enough samples (at least 10 for meaningful statistics)
+                    min_samples = 10
+                    if len(real_for_pca) < min_samples or len(gen_for_pca) < min_samples:
+                        console.print(f"[yellow]Warning:[/yellow] Insufficient samples for advanced metrics (real: {len(real_for_pca)}, gen: {len(gen_for_pca)}), skipping")
+                    else:
+                        # (1) Latent Coverage Ratio
+                        coverage, coverage_radius = latent_coverage_ratio(real_for_pca, gen_for_pca, percentile=20)
+                        
+                        # (2) Pairwise Distance JS Divergence
+                        js_div = pairwise_distance_js(real_for_pca, gen_for_pca, bins=50)
+                        
+                        # (3) Novelty Score
+                        novelty_dict = novelty_score(real_for_pca, gen_for_pca)
+                        
+                        # Save to CSV
+                        advanced_metrics_csv = os.path.join(ep_dir, "advanced_latent_metrics.csv")
+                        with open(advanced_metrics_csv, "w", newline="") as f:
+                            w = csv.writer(f)
+                            w.writerow(["metric", "value"])
+                            w.writerow(["coverage_ratio", f"{coverage:.6f}"])
+                            w.writerow(["coverage_radius", f"{coverage_radius:.6f}"])
+                            w.writerow(["pairwise_distance_js_divergence", f"{js_div:.6f}"])
+                            w.writerow(["novelty_mean", f"{novelty_dict['novelty_mean']:.6f}"])
+                            w.writerow(["novelty_std", f"{novelty_dict['novelty_std']:.6f}"])
+                            w.writerow(["novelty_min", f"{novelty_dict['novelty_min']:.6f}"])
+                            w.writerow(["novelty_max", f"{novelty_dict['novelty_max']:.6f}"])
+
                 except Exception as e:
                     console.print(f"[yellow]PCA diagnostics failed:[/yellow] {e}")
 
@@ -1230,6 +1489,48 @@ def main():
                                         row["pca_n_points_per_class"] = int(value) if value else ""
                         except Exception as e:
                             console.print(f"[yellow]Warning:[/yellow] Failed to parse latent_pca_stats.csv: {e}")
+                    
+                    # 讀取 advanced_latent_metrics.csv
+                    advanced_metrics_file = os.path.join(ep_dir, "advanced_latent_metrics.csv")
+                    if os.path.exists(advanced_metrics_file):
+                        try:
+                            with open(advanced_metrics_file, "r", newline="") as f:
+                                reader = csv.DictReader(f)
+                                for r in reader:
+                                    metric = r.get("metric", "").strip()
+                                    value = r.get("value", "").strip()
+                                    if metric == "coverage_ratio":
+                                        row["coverage_ratio"] = float(value) if value else ""
+                                    elif metric == "coverage_radius":
+                                        row["coverage_radius"] = float(value) if value else ""
+                                    elif metric == "pairwise_distance_js_divergence":
+                                        row["pairwise_distance_js_divergence"] = float(value) if value else ""
+                                    elif metric == "novelty_mean":
+                                        row["novelty_mean"] = float(value) if value else ""
+                                    elif metric == "novelty_std":
+                                        row["novelty_std"] = float(value) if value else ""
+                                    elif metric == "novelty_min":
+                                        row["novelty_min"] = float(value) if value else ""
+                                    elif metric == "novelty_max":
+                                        row["novelty_max"] = float(value) if value else ""
+                        except Exception as e:
+                            console.print(f"[yellow]Warning:[/yellow] Failed to parse advanced_latent_metrics.csv: {e}")
+                    
+                    # 讀取 sample_variance.csv
+                    sample_variance_file = os.path.join(ep_dir, "sample_variance.csv")
+                    if os.path.exists(sample_variance_file):
+                        try:
+                            with open(sample_variance_file, "r", newline="") as f:
+                                reader = csv.DictReader(f)
+                                for r in reader:
+                                    metric = r.get("metric", "").strip()
+                                    value = r.get("value", "").strip()
+                                    if metric == "sample_variance":
+                                        row["sample_variance"] = float(value) if value else ""
+                                    elif metric == "n_samples":
+                                        row["sample_variance_n_samples"] = int(value) if value else ""
+                        except Exception as e:
+                            console.print(f"[yellow]Warning:[/yellow] Failed to parse sample_variance.csv: {e}")
                     
                     # 處理匯總 CSV：讀取現有數據，合併新欄位，追加新行
                     file_exists = os.path.exists(analytics_summary_csv)
