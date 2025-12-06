@@ -23,6 +23,9 @@ For IoU / Dice / Precision / Recall / F1,統一輸出:
 import argparse
 import csv
 import json
+import os
+import zipfile
+import tempfile
 from collections import OrderedDict
 from pathlib import Path
 from datetime import datetime
@@ -427,6 +430,170 @@ class MidUNet3DVAE(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# VQ-VAE model definitions (8x8x8 discrete latent)
+# ---------------------------------------------------------------------------
+
+
+class VectorQuantizer(nn.Module):
+    """
+    Standard VQ-VAE codebook (non-EMA, straight-through).
+
+    z_e: encoder output, shape [B, C, D, H, W]
+    回傳:
+      z_q: quantized latent, same shape as z_e
+      loss: codebook + commitment loss
+      perplexity: scalar
+      indices: [B, D, H, W] (int64)
+    """
+
+    def __init__(self, num_embeddings: int = 512, embedding_dim: int = 64, commitment_cost: float = 0.25):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.commitment_cost = commitment_cost
+
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.embedding.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
+
+    def forward(self, z: torch.Tensor):
+        # z: [B, C, D, H, W]
+        B, C, D, H, W = z.shape
+        assert C == self.embedding_dim, f"z channels ({C}) must equal embedding_dim ({self.embedding_dim})"
+
+        # [B, C, D, H, W] -> [B, D, H, W, C] -> [B*D*H*W, C]
+        z_perm = z.permute(0, 2, 3, 4, 1).contiguous()
+        flat_z = z_perm.view(-1, C)  # [N, C]
+
+        # Compute distances to embedding vectors
+        # ||z||^2 - 2 z·e + ||e||^2
+        emb_weight = self.embedding.weight  # [K, C]
+        emb_norm_sq = emb_weight.pow(2).sum(dim=1)  # [K]
+        z_norm_sq = flat_z.pow(2).sum(dim=1, keepdim=True)  # [N, 1]
+
+        distances = (
+            z_norm_sq
+            - 2 * flat_z @ emb_weight.t()
+            + emb_norm_sq.unsqueeze(0)  # [1, K]
+        )  # [N, K]
+
+        # 對每一個位置找最近的 embedding index
+        encoding_indices = torch.argmin(distances, dim=1)  # [N]
+        z_q = self.embedding(encoding_indices).view(B, D, H, W, C)
+        z_q = z_q.permute(0, 4, 1, 2, 3).contiguous()  # [B, C, D, H, W]
+
+        # VQ Loss: ||sg[z_e] - e||^2 + beta * ||z_e - sg[e]||^2
+        z_q_detached = z_q.detach()
+        z_detached = z.detach()
+
+        codebook_loss = F.mse_loss(z_q_detached, z)
+        commitment_loss = F.mse_loss(z_q, z_detached)
+        loss = codebook_loss + self.commitment_cost * commitment_loss
+
+        # Straight-through
+        z_q = z + (z_q - z).detach()
+
+        # perplexity
+        encodings_one_hot = F.one_hot(encoding_indices, self.num_embeddings).float()
+        avg_probs = encodings_one_hot.mean(dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+
+        # reshape indices to spatial map [B, D, H, W]
+        indices = encoding_indices.view(B, D, H, W)
+
+        return z_q, loss, perplexity, indices
+
+
+class Encoder3DVQVAE(nn.Module):
+    """
+    32 -> 16 -> 8, 然後 1x1 conv -> latent_dim channels
+    沒有 skip connection.
+    """
+
+    def __init__(self, in_ch=3, base=64, latent_dim=64):
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv3d(in_ch, base, 3, padding=1),
+            ResBlock3D(base),
+        )
+        self.enc2 = nn.Sequential(
+            nn.Conv3d(base, base * 2, 4, stride=2, padding=1),  # 32 -> 16
+            ResBlock3D(base * 2),
+        )
+        self.enc3 = nn.Sequential(
+            nn.Conv3d(base * 2, base * 4, 4, stride=2, padding=1),  # 16 -> 8
+            ResBlock3D(base * 4),
+        )
+        self.to_latent = nn.Conv3d(base * 4, latent_dim, 1)
+
+    def forward(self, x):
+        h = self.enc1(x)   # [B, base, 32,32,32]
+        h = self.enc2(h)   # [B, base*2, 16,16,16]
+        h = self.enc3(h)   # [B, base*4,  8, 8, 8]
+        z_e = self.to_latent(h)  # [B, latent_dim, 8,8,8]
+        return z_e
+
+
+class Decoder3DVQVAE(nn.Module):
+    """
+    8 -> 16 -> 32, 無 skip connections.
+    輸出 logits: [B, out_ch, 32, 32, 32]
+    """
+
+    def __init__(self, out_ch=3, base=64, latent_dim=64):
+        super().__init__()
+        self.up1 = nn.ConvTranspose3d(latent_dim, base * 4, 4, stride=2, padding=1)  # 8 -> 16
+        self.rb1 = ResBlock3D(base * 4)
+        self.up2 = nn.ConvTranspose3d(base * 4, base * 2, 4, stride=2, padding=1)    # 16 -> 32
+        self.rb2 = ResBlock3D(base * 2)
+        self.out_block = nn.Sequential(
+            nn.Conv3d(base * 2, base, 3, padding=1),
+            ResBlock3D(base),
+        )
+        self.out = nn.Conv3d(base, out_ch, 1)
+
+    def forward(self, z_q):
+        h = self.up1(z_q)
+        h = self.rb1(h)
+        h = self.up2(h)
+        h = self.rb2(h)
+        h = self.out_block(h)
+        logits = self.out(h)
+        return logits  # [B, out_ch, 32,32,32]
+
+
+class VQVAE3D(nn.Module):
+    def __init__(
+        self,
+        in_ch=3,
+        out_ch=3,
+        base=64,
+        latent_dim=64,
+        codebook_size=512,
+        commitment_cost=0.25,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.encoder = Encoder3DVQVAE(in_ch=in_ch, base=base, latent_dim=latent_dim)
+        self.vq = VectorQuantizer(num_embeddings=codebook_size, embedding_dim=latent_dim,
+                                  commitment_cost=commitment_cost)
+        self.decoder = Decoder3DVQVAE(out_ch=out_ch, base=base, latent_dim=latent_dim)
+
+    def forward(self, x):
+        """
+        x: [B, 3, 32,32,32]
+        回傳:
+          logits: [B,3,32,32,32]
+          vq_loss: scalar
+          perplexity: scalar
+          indices: [B,8,8,8]
+        """
+        z_e = self.encoder(x)                           # [B, C, 8,8,8]
+        z_q, vq_loss, perplexity, indices = self.vq(z_e)
+        logits = self.decoder(z_q)
+        return logits, vq_loss, perplexity, indices
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint compatibility helpers
 # ---------------------------------------------------------------------------
 
@@ -629,7 +796,7 @@ def resolve_skip_levels(args, default: int = 3) -> int:
     return default
 
 
-def extract_model_params(model, ckpt, include_weight_stats=False):
+def extract_model_params(model, ckpt, include_weight_stats=False, model_variant=None):
     params = {}
 
     if isinstance(ckpt, dict) and "args" in ckpt:
@@ -643,14 +810,21 @@ def extract_model_params(model, ckpt, include_weight_stats=False):
         params["checkpoint_epoch"] = ckpt.get("epoch")
         params["best_val_loss"] = ckpt.get("best_val")
         params["exp_name"] = args.get("exp_name")
-        skip_levels = resolve_skip_levels(args)
-        if skip_levels is not None:
-            params["skip_levels"] = skip_levels
-        use_skip = args.get("use_skip_connections")
-        if use_skip is not None:
-            params["use_skip_connections"] = parse_bool(use_skip)
-        elif skip_levels is not None:
-            params["use_skip_connections"] = skip_levels > 0
+        
+        # VQ-VAE models don't have skip connections
+        if model_variant == "vqvae" or model_variant == "vqvae_8x8x8":
+            params["skip_levels"] = 0
+            params["use_skip_connections"] = False
+        else:
+            # For VAE models, resolve skip levels from args
+            skip_levels = resolve_skip_levels(args)
+            if skip_levels is not None:
+                params["skip_levels"] = skip_levels
+            use_skip = args.get("use_skip_connections")
+            if use_skip is not None:
+                params["use_skip_connections"] = parse_bool(use_skip)
+            elif skip_levels is not None:
+                params["use_skip_connections"] = skip_levels > 0
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -669,6 +843,13 @@ def detect_vae_variant(state_dict):
     if not isinstance(state_dict, dict):
         return "deep"
     keys = set(state_dict.keys())
+    
+    # Check if it's a VQ-VAE model (has vq.embedding)
+    has_vq = any(k.startswith("vq.embedding") for k in keys)
+    if has_vq:
+        return "vqvae"
+    
+    # VAE variants
     has_enc3 = any(k.startswith("encoder.enc3") for k in keys)
     has_enc4 = any(k.startswith("encoder.enc4") for k in keys)
     if not has_enc3:
@@ -699,11 +880,9 @@ def eval_model(
         state_dict = ckpt["model"]
         args = ckpt.get("args", {}) or {}
         base = int(args.get("base", 64))
-        latent = int(args.get("latent_dim", 256))
     else:
         state_dict = ckpt
         base = 64
-        latent = 256
 
     vae_variant = detect_vae_variant(state_dict)
     compat_adjustments = []
@@ -715,7 +894,26 @@ def eval_model(
         skip_levels = default_skip
 
     # Build model
-    if vae_variant == "shallow":
+    if vae_variant == "vqvae":
+        # VQ-VAE model
+        codebook_size = int(args.get("codebook_size", 512))
+        commitment_cost = float(args.get("commitment_cost", 0.25))
+        # VQ-VAE typically uses smaller latent_dim (default 64)
+        latent = int(args.get("latent_dim", 64))
+        model = VQVAE3D(
+            in_ch=3,
+            out_ch=3,
+            base=base,
+            latent_dim=latent,
+            codebook_size=codebook_size,
+            commitment_cost=commitment_cost,
+        ).to(device)
+        adapted_state_dict = OrderedDict(state_dict)
+        model_variant = "vqvae_8x8x8"
+    
+    elif vae_variant == "shallow":
+        # VAE models use default latent_dim=256
+        latent = int(args.get("latent_dim", 256))
         clamped_skip = int(max(0, min(2, int(skip_levels))))
         if clamped_skip != skip_levels:
             compat_adjustments.append(
@@ -733,6 +931,8 @@ def eval_model(
         model_variant = "vae_shallow16"
 
     elif vae_variant == "mid":
+        # VAE models use default latent_dim=256
+        latent = int(args.get("latent_dim", 256))
         clamped_skip = int(max(0, min(3, int(skip_levels))))
         if clamped_skip != skip_levels:
             compat_adjustments.append(
@@ -750,6 +950,8 @@ def eval_model(
         model_variant = "vae_mid8"
 
     else:
+        # VAE models use default latent_dim=256
+        latent = int(args.get("latent_dim", 256))
         clamped_skip = int(max(0, min(3, int(skip_levels))))
         if clamped_skip != skip_levels:
             compat_adjustments.append(
@@ -778,7 +980,7 @@ def eval_model(
     if not use_amp:
         model = model.float()
 
-    model_params = extract_model_params(model, ckpt, include_weight_stats=include_weight_stats)
+    model_params = extract_model_params(model, ckpt, include_weight_stats=include_weight_stats, model_variant=model_variant)
     model_params["detected_variant"] = model_variant
 
     # Aggregators
@@ -812,9 +1014,15 @@ def eval_model(
 
         if use_amp and device.type == "cuda":
             with torch.cuda.amp.autocast():
-                logits, _, _ = model(x)
+                output = model(x)
         else:
-            logits, _, _ = model(x)
+            output = model(x)
+        
+        # Handle different return values: VAE returns (logits, mu, logvar), VQ-VAE returns (logits, vq_loss, perplexity, indices)
+        if len(output) == 4:
+            logits, _, _, _ = output  # VQ-VAE: (logits, vq_loss, perplexity, indices)
+        else:
+            logits, _, _ = output  # VAE: (logits, mu, logvar)
 
         pred = torch.argmax(F.softmax(logits[0], dim=0), dim=0).cpu().numpy().astype(
             np.uint8
@@ -961,6 +1169,61 @@ def eval_model(
 
 
 # ---------------------------------------------------------------------------
+# Zip file extraction helper
+# ---------------------------------------------------------------------------
+
+
+def extract_zip_to_temp(zip_path: str, console=None) -> tuple[str, tempfile.TemporaryDirectory]:
+    """Extract zip file to a temporary directory and verify train/val/test."""
+    if not os.path.exists(zip_path):
+        raise FileNotFoundError(f"Zip file not found: {zip_path}")
+    if not zipfile.is_zipfile(zip_path):
+        raise ValueError(f"Not a valid zip file: {zip_path}")
+
+    temp_dir = tempfile.TemporaryDirectory(prefix="eval_models_zip_")
+    extract_dir = temp_dir.name
+
+    if console:
+        console.print(f"[cyan]Extracting zip file: {zip_path}[/cyan]")
+        console.print(f"[dim]Temporary extraction directory: {extract_dir}[/dim]")
+
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(extract_dir)
+        if console:
+            console.print(f"[green]✓[/green] Extracted {len(zip_ref.namelist())} items from zip")
+
+    train_dir = os.path.join(extract_dir, "train")
+    val_dir = os.path.join(extract_dir, "val")
+    test_dir = os.path.join(extract_dir, "test")
+
+    if not os.path.exists(train_dir):
+        found_dirs = []
+        for root, dirs, files in os.walk(extract_dir):
+            if os.path.basename(root) in ["train", "val", "test"]:
+                found_dirs.append(root)
+        if not found_dirs:
+            raise ValueError("Zip file must contain train/val/test subdirectories.")
+        if len(found_dirs) >= 3:
+            common_parent = os.path.commonpath(found_dirs)
+            extract_dir = common_parent
+            train_dir = os.path.join(extract_dir, "train")
+            val_dir = os.path.join(extract_dir, "val")
+            test_dir = os.path.join(extract_dir, "test")
+
+    if not os.path.exists(train_dir):
+        raise ValueError(f"train/ not found (checked {train_dir})")
+    if not os.path.exists(val_dir):
+        raise ValueError(f"val/ not found (checked {val_dir})")
+    if not os.path.exists(test_dir):
+        raise ValueError(f"test/ not found (checked {test_dir})")
+
+    if console:
+        console.print(f"[green]✓[/green] Verified train/val/test structure in extracted directory")
+
+    return extract_dir, temp_dir
+
+
+# ---------------------------------------------------------------------------
 # Main CLI
 # ---------------------------------------------------------------------------
 
@@ -968,7 +1231,9 @@ def eval_model(
 def main():
     console = Console()
     parser = argparse.ArgumentParser(description="Evaluate 3D U-Net VAE checkpoints.")
-    parser.add_argument("--data_dir", required=True, help="Directory with .npz test volumes.")
+    data_group = parser.add_mutually_exclusive_group(required=True)
+    data_group.add_argument("--data_dir", help="Directory with .npz test volumes.")
+    data_group.add_argument("--data_zip", help="Zip file containing train/val/test directories with .npz files.")
     parser.add_argument("--models_dir", required=True, help="Directory containing checkpoints (.pt/.pth).")
     parser.add_argument("--out_dir", required=True, help="Directory to save evaluation outputs.")
     parser.add_argument("--device", default="cuda", help="Device to use (cuda or cpu).")
@@ -986,19 +1251,36 @@ def main():
     )
     args = parser.parse_args()
 
-    test_dir = Path(args.data_dir).expanduser().resolve()
-    if not test_dir.exists() or not test_dir.is_dir():
-        console.print(
-            Panel.fit(
-                f"[bold red]錯誤：測試資料目錄不存在或不是目錄[/bold red]\n"
-                f"路徑: [yellow]{test_dir}[/yellow]",
-                border_style="red",
+    # Handle data source (directory or zip file)
+    temp_dir_holder = []
+    if args.data_zip:
+        # Extract zip file to temporary directory
+        zip_path = Path(args.data_zip).expanduser().resolve()
+        extract_dir, temp_dir = extract_zip_to_temp(str(zip_path), console=console)
+        test_dir = Path(extract_dir) / "test"
+        temp_dir_holder.append(temp_dir)
+    else:
+        # Use provided directory
+        test_dir = Path(args.data_dir).expanduser().resolve()
+        if not test_dir.exists() or not test_dir.is_dir():
+            console.print(
+                Panel.fit(
+                    f"[bold red]錯誤：測試資料目錄不存在或不是目錄[/bold red]\n"
+                    f"路徑: [yellow]{test_dir}[/yellow]",
+                    border_style="red",
+                )
             )
-        )
-        raise SystemExit(1)
+            raise SystemExit(1)
 
     test_files = sorted(test_dir.glob("*.npz"))
     if not test_files:
+        # Clean up temp directory before exiting
+        if temp_dir_holder:
+            for temp_dir in temp_dir_holder:
+                try:
+                    temp_dir.cleanup()
+                except Exception:
+                    pass
         console.print(
             Panel.fit(
                 f"[bold red]錯誤：測試目錄中沒有 .npz 檔案[/bold red]\n"
@@ -1137,7 +1419,9 @@ def main():
         writer.writerow(header)
 
         run_header = {
+            "data_source": "zip" if args.data_zip else "directory",
             "data_test_dir": str(test_dir),
+            "data_zip_path": str(args.data_zip) if args.data_zip else None,
             "models_root": str(models_dir),
             "num_test_files": len(test_files),
             "num_models": len(model_files),
@@ -1365,6 +1649,15 @@ def main():
             border_style="green",
         )
     )
+    
+    # Clean up temporary directory if zip file was used
+    if temp_dir_holder:
+        for temp_dir in temp_dir_holder:
+            try:
+                temp_dir.cleanup()
+                console.print(f"[dim]Cleaned up temporary directory[/dim]")
+            except Exception as e:
+                console.print(f"[yellow]Warning: Failed to clean up temporary directory: {e}[/yellow]")
 
 
 if __name__ == "__main__":
