@@ -690,10 +690,10 @@ def main():
     if model_type == "vqvae":
         rows.append(("codebook_size", codebook_size))
         rows.append(("commitment_cost", commitment_cost))
-        rows.append(("output_format", "[512] (discrete codebook indices)"))
+        rows.append(("latent_shape_format", "[512] (discrete codebook indices)"))
     else:
         rows.append(("skip_levels", skip_levels))
-        rows.append(("output_format", f"[512, {latent_dim}] (continuous latent vectors)"))
+        rows.append(("latent_shape_format", f"[512, {latent_dim}] (continuous latent vectors)"))
     # Aug flags
     rows.append(("aug_rot_x", str(bool(cfg.aug_rot_x)).upper()))
     rows.append(("aug_rot_y", str(bool(cfg.aug_rot_y)).upper()))
