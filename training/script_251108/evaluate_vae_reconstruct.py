@@ -1331,8 +1331,8 @@ def main():
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    out_txt = out_dir / f"eval_unet_{ts}.txt"
-    out_csv = out_dir / f"eval_unet_{ts}.csv"
+    out_txt = out_dir / f"eval_{ts}.txt"
+    out_csv = out_dir / f"eval_{ts}.csv"
 
     amp_status = "禁用" if not use_amp else "啟用"
     filter_info = (
