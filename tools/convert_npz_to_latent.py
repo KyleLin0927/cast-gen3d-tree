@@ -4,6 +4,8 @@ import argparse
 import importlib.util
 from glob import glob
 import zipfile
+import tempfile
+import shutil
 
 import torch
 import numpy as np
@@ -26,12 +28,14 @@ from rich.progress import (
 # 注意：
 # - --model_script 必填：需提供定義 UNet3DVAE 或 VQVAE3D 的訓練腳本路徑
 # - --vae_ckpt 可為單一 .pt 檔或包含 best_*.pt/last_*.pt 的資料夾
-# - --out_dir 必須為資料夾（非 .pt 路徑）
+# - --out_dir 可為資料夾或 .zip 檔案路徑（若為 .zip，會將結果打包成壓縮檔）
 #
 # 參數說明 (Arguments)
 # - --data_dir       輸入資料根目錄；需含 train/、val/、test/ 三個子資料夾，內放 .npz 標籤，
-#                    shape=(32,32,32)、值為 0/1/2
-# - --out_dir        輸出資料夾；會建立 train/、val/、test/，每筆輸出 latent .npy
+#                    shape=(32,32,32)、值為 0/1/2；或為 .zip 檔案（內部結構為 train/val/test/*.npz）
+# - --out_dir        輸出路徑：
+#                    - 若為資料夾：會建立 train/、val/、test/，每筆輸出 latent .npy
+#                    - 若以 .zip 結尾：會將整個目錄結構打包成 zip 檔案
 # - --vae_ckpt       VAE checkpoint（檔或資料夾）；資料夾時優先取 best_*.pt，其次 last_*.pt
 # - --model_script   定義 UNet3DVAE 或 VQVAE3D 的 Python 腳本路徑（必填），用於重建模型結構
 # - --cpu            強制使用 CPU（預設自動選擇 CUDA → MPS → CPU）
@@ -41,6 +45,8 @@ from rich.progress import (
 # 輸出格式
 # - UNet3DVAE: 使用 mu 作為 latent，將 [latent_dim, 8, 8, 8] 攤平成 [512, latent_dim]，儲存為 .npy 檔。
 # - VQVAE3D: 使用 codebook indices，將 [8, 8, 8] 攤平成 [512]，儲存為 .npy 檔。
+# - 若 --out_dir 以 .zip 結尾，會將 train/val/test 目錄結構打包成 zip 檔案。
+# - conversion_metadata.csv 會放在 zip 檔案外（與 zip 同目錄）或輸出資料夾內。
 # ----------------------------------------------------------------------------- 
 
 # ---------------------------
@@ -477,22 +483,40 @@ def main():
     cfg = parser.parse_args()
 
     # -----------------------
-    # Validate out_dir (must be a directory path)
+    # Validate out_dir (can be directory or .zip file)
     # -----------------------
     console = Console()
     if cfg.out_dir.endswith(".pt"):
-        console.print(Panel.fit("[bold red]--out_dir must be a directory, not a .pt file path.[/bold red]", border_style="red"))
+        console.print(Panel.fit("[bold red]--out_dir must be a directory or .zip file, not a .pt file path.[/bold red]", border_style="red"))
         raise SystemExit(1)
-    # Stop if target directory exists and is non-empty
-    if os.path.isdir(cfg.out_dir):
-        try:
-            has_entries = any(os.scandir(cfg.out_dir))
-        except PermissionError:
-            console.print(Panel.fit(f"[bold red]Cannot access out_dir:[/bold red] {cfg.out_dir}", border_style="red"))
+    
+    # Check if output is zip file
+    use_output_zip = cfg.out_dir.lower().endswith(".zip")
+    temp_dir = None
+    actual_out_dir = cfg.out_dir
+    
+    if use_output_zip:
+        # Output is zip file
+        output_zip_path = os.path.abspath(cfg.out_dir)
+        if os.path.exists(output_zip_path):
+            console.print(Panel.fit(f"[bold red]Output zip file already exists:[/bold red]\n[yellow]{output_zip_path}[/yellow]\nRefusing to proceed to avoid overwriting.", border_style="red"))
             raise SystemExit(1)
-        if has_entries:
-            console.print(Panel.fit(f"[bold red]Refusing to proceed:[/bold red] out_dir is not empty:\n[yellow]{cfg.out_dir}[/yellow]", border_style="red"))
-            raise SystemExit(1)
+        # Create temporary directory for processing
+        temp_dir = tempfile.mkdtemp(prefix="convert_npz_to_latent_")
+        actual_out_dir = temp_dir
+        console.print(f"[cyan]Output will be written to zip file:[/cyan] {output_zip_path}")
+        console.print(f"[dim]Using temporary directory: {temp_dir}[/dim]")
+    else:
+        # Output is directory
+        if os.path.isdir(cfg.out_dir):
+            try:
+                has_entries = any(os.scandir(cfg.out_dir))
+            except PermissionError:
+                console.print(Panel.fit(f"[bold red]Cannot access out_dir:[/bold red] {cfg.out_dir}", border_style="red"))
+                raise SystemExit(1)
+            if has_entries:
+                console.print(Panel.fit(f"[bold red]Refusing to proceed:[/bold red] out_dir is not empty:\n[yellow]{cfg.out_dir}[/yellow]", border_style="red"))
+                raise SystemExit(1)
 
     # -----------------------
     # 檢查 data_dir 型態（資料夾或 zip）
@@ -551,7 +575,7 @@ def main():
     # Create output folders
     # -----------------------
     for split in ["train", "val", "test"]:
-        os.makedirs(os.path.join(cfg.out_dir, split), exist_ok=True)
+        os.makedirs(os.path.join(actual_out_dir, split), exist_ok=True)
 
     # -----------------------
     # Process three splits
@@ -567,7 +591,7 @@ def main():
             stats = process_split(
                 split,
                 dataset,
-                cfg.out_dir,
+                actual_out_dir,
                 model,
                 model_type,
                 device,
@@ -579,10 +603,48 @@ def main():
             zip_file.close()
 
     console.print("\n[bold green]All latent data generated successfully![/bold green]")
+    
     # -----------------------
-    # Write conversion metadata CSV
+    # Package to zip if needed
     # -----------------------
-    out_csv = os.path.join(cfg.out_dir, "conversion_metadata.csv")
+    if use_output_zip:
+        console.print(f"[cyan]Packaging results into zip file...[/cyan]")
+        output_zip_path = os.path.abspath(cfg.out_dir)
+        try:
+            with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                # Walk through temp directory and add all files
+                for root, dirs, files in os.walk(actual_out_dir):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        # Calculate relative path from temp_dir
+                        rel_path = os.path.relpath(file_path, actual_out_dir)
+                        # Use forward slashes for zip (ZIP standard)
+                        zip_rel_path = rel_path.replace(os.sep, '/')
+                        zip_file.write(file_path, zip_rel_path)
+            console.print(f"[green]✓[/green] Created zip file: [cyan]{output_zip_path}[/cyan]")
+        except Exception as e:
+            console.print(Panel.fit(f"[bold red]Failed to create zip file:[/bold red] {e}", border_style="red"))
+            raise
+        finally:
+            # Clean up temporary directory
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                    console.print(f"[dim]Cleaned up temporary directory[/dim]")
+                except Exception as e:
+                    console.print(f"[yellow]Warning: Failed to clean up temporary directory {temp_dir}: {e}[/yellow]")
+    
+    # -----------------------
+    # Write conversion metadata CSV (always outside zip)
+    # -----------------------
+    # If output is zip, save CSV next to the zip file
+    if use_output_zip:
+        output_zip_path = os.path.abspath(cfg.out_dir)
+        csv_dir = os.path.dirname(output_zip_path)
+        csv_name = os.path.splitext(os.path.basename(output_zip_path))[0] + "_conversion_metadata.csv"
+        out_csv = os.path.join(csv_dir, csv_name)
+    else:
+        out_csv = os.path.join(cfg.out_dir, "conversion_metadata.csv")
     from datetime import datetime
     import csv
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -618,6 +680,7 @@ def main():
     rows.append(("timestamp", started_at))
     rows.append(("data_dir", os.path.abspath(cfg.data_dir)))
     rows.append(("out_dir", os.path.abspath(cfg.out_dir)))
+    rows.append(("output_format", "zip" if use_output_zip else "directory"))
     rows.append(("vae_ckpt_resolved", os.path.abspath(ckpt_path)))
     rows.append(("model_script", model_source))
     rows.append(("model_type", model_type.upper()))
