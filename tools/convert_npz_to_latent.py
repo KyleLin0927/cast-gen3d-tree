@@ -24,22 +24,23 @@ from rich.progress import (
 # 使用方式 (Usage)
 # -----------------------------------------------------------------------------
 # 注意：
-# - --model_script 必填：需提供定義 UNet3DVAE 的訓練腳本路徑
+# - --model_script 必填：需提供定義 UNet3DVAE 或 VQVAE3D 的訓練腳本路徑
 # - --vae_ckpt 可為單一 .pt 檔或包含 best_*.pt/last_*.pt 的資料夾
 # - --out_dir 必須為資料夾（非 .pt 路徑）
 #
 # 參數說明 (Arguments)
 # - --data_dir       輸入資料根目錄；需含 train/、val/、test/ 三個子資料夾，內放 .npz 標籤，
 #                    shape=(32,32,32)、值為 0/1/2
-# - --out_dir        輸出資料夾；會建立 train/、val/、test/，每筆輸出 latent .npy（[512, latent_dim]）
+# - --out_dir        輸出資料夾；會建立 train/、val/、test/，每筆輸出 latent .npy
 # - --vae_ckpt       VAE checkpoint（檔或資料夾）；資料夾時優先取 best_*.pt，其次 last_*.pt
-# - --model_script   定義 UNet3DVAE 的 Python 腳本路徑（必填），用於重建模型結構
+# - --model_script   定義 UNet3DVAE 或 VQVAE3D 的 Python 腳本路徑（必填），用於重建模型結構
 # - --cpu            強制使用 CPU（預設自動選擇 CUDA → MPS → CPU）
 # - --aug_rot_x/y/z  啟用沿 X/Y/Z 軸的 90° 旋轉增強（僅 train split）
 # - --aug_flip_x/y/z 啟用沿 X/Y/Z 軸的翻轉增強（僅 train split）
 #
 # 輸出格式
-# - 使用 mu 作為 latent，將 [latent_dim, 8, 8, 8] 攤平成 [512, latent_dim]，儲存為 .npy 檔。
+# - UNet3DVAE: 使用 mu 作為 latent，將 [latent_dim, 8, 8, 8] 攤平成 [512, latent_dim]，儲存為 .npy 檔。
+# - VQVAE3D: 使用 codebook indices，將 [8, 8, 8] 攤平成 [512]，儲存為 .npy 檔。
 # ----------------------------------------------------------------------------- 
 
 # ---------------------------
@@ -209,7 +210,7 @@ def _detect_zip_base_prefix(zf: zipfile.ZipFile) -> str:
 # ---------------------------
 def save_latent(z, out_path):
     """
-    z: tensor [512, latent_dim]
+    z: tensor [512, latent_dim] for VAE or [512] for VQ-VAE
     """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     np.save(out_path, z.cpu().numpy())
@@ -286,53 +287,80 @@ def _resolve_checkpoint_path(ckpt_arg: str) -> str:
         raise FileNotFoundError(f"Checkpoint file not found: {ckpt_arg}")
     return ckpt_arg
 
-def _import_unet3dvae(script_path: str):
+def _import_model_class(script_path: str):
     """
-    Dynamically import UNet3DVAE from the training script.
+    Dynamically import UNet3DVAE or VQVAE3D from the training script.
+    Returns (model_class, model_type) where model_type is 'vae' or 'vqvae'.
     """
     if not os.path.exists(script_path):
         raise FileNotFoundError(f"Model script not found: {script_path}")
-    spec = importlib.util.spec_from_file_location("train_3d_unet_vae", script_path)
+    spec = importlib.util.spec_from_file_location("train_model", script_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Failed to load spec for: {script_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    if not hasattr(module, "UNet3DVAE"):
-        raise AttributeError("UNet3DVAE not found in the provided training script.")
-    return module.UNet3DVAE
+    
+    # Try VQVAE3D first, then UNet3DVAE
+    if hasattr(module, "VQVAE3D"):
+        return module.VQVAE3D, "vqvae"
+    elif hasattr(module, "UNet3DVAE"):
+        return module.UNet3DVAE, "vae"
+    else:
+        raise AttributeError(
+            "Neither VQVAE3D nor UNet3DVAE found in the provided training script. "
+            "Please ensure the script defines one of these classes."
+        )
 
 def _build_model_from_checkpoint(ckpt_path: str, device: torch.device, model_script: str | None):
     """
-    Load training checkpoint dict, reconstruct UNet3DVAE and load state_dict.
+    Load training checkpoint dict, reconstruct UNet3DVAE or VQVAE3D and load state_dict.
+    Returns (model, model_type) where model_type is 'vae' or 'vqvae'.
     """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     args = ckpt.get("args", {})
 
+    # Determine model script to import model class
+    if model_script is None:
+        raise ValueError("--model_script is required to locate model definition.")
+    ModelClass, model_type = _import_model_class(model_script)
+
     # Default/fallbacks if absent
     base = int(args.get("base", 64))
     latent_dim = int(args.get("latent_dim", 256))
-    skip_levels = int(args.get("skip_levels", 0 if args.get("no_skip_connections", False) else args.get("skip_levels", 0)))
 
-    # Determine model script to import UNet3DVAE
-    if model_script is None:
-        raise ValueError("--model_script is required to locate UNet3DVAE definition.")
-    UNet3DVAE = _import_unet3dvae(model_script)
-
-    model = UNet3DVAE(
-        in_ch=3,
-        out_ch=3,
-        base=base,
-        latent_dim=latent_dim,
-        skip_levels=skip_levels,
-    ).to(device)
+    if model_type == "vqvae":
+        # VQ-VAE specific parameters
+        codebook_size = int(args.get("codebook_size", 512))
+        commitment_cost = float(args.get("commitment_cost", 0.25))
+        
+        model = ModelClass(
+            in_ch=3,
+            out_ch=3,
+            base=base,
+            latent_dim=latent_dim,
+            codebook_size=codebook_size,
+            commitment_cost=commitment_cost,
+        ).to(device)
+    else:
+        # VAE specific parameters
+        skip_levels = int(args.get("skip_levels", 0 if args.get("no_skip_connections", False) else args.get("skip_levels", 0)))
+        
+        model = ModelClass(
+            in_ch=3,
+            out_ch=3,
+            base=base,
+            latent_dim=latent_dim,
+            skip_levels=skip_levels,
+        ).to(device)
+    
     model.load_state_dict(ckpt["model"])
     model.eval()
-    return model, latent_dim
+    return model, model_type
 
 # ---------------------------
 # Main conversion process
 # ---------------------------
-def process_split(split_name, dataset, out_dir, model, latent_dim, device, cfg):
+def process_split(split_name, dataset, out_dir, model, model_type, device, cfg):
     console = Console()
     console.print(f"\n[bold cyan]Processing split:[/bold cyan] {split_name}")
 
@@ -379,15 +407,22 @@ def process_split(split_name, dataset, out_dir, model, latent_dim, device, cfg):
             for idx, (aug, combo) in enumerate(augmented):
 
                 # -----------------------------------
-                # Encode: use mu as latent (NO sample)
+                # Encode: VAE uses mu, VQ-VAE uses codebook indices
                 # -----------------------------------
                 with torch.no_grad():
-                    # Directly call encoder; do not use skip connections; returns [B,C,8,8,8]
-                    mu, logvar, _ = model.encoder(aug, return_skips=False)
-                    z = mu.squeeze(0)                  # [latent_dim, 8, 8, 8]
-
-                # flatten to [512, latent_dim]
-                z = z.permute(1, 2, 3, 0).reshape(-1, latent_dim)  # [512, latent_dim]
+                    if model_type == "vqvae":
+                        # VQ-VAE: use encode_to_indices to get discrete codebook indices
+                        indices = model.encode_to_indices(aug)  # [B, 8, 8, 8]
+                        z = indices.squeeze(0)  # [8, 8, 8]
+                        # flatten to [512]
+                        z = z.reshape(-1)  # [512]
+                    else:
+                        # VAE: use mu as latent (NO sample)
+                        mu, logvar, _ = model.encoder(aug, return_skips=False)
+                        z = mu.squeeze(0)  # [latent_dim, 8, 8, 8]
+                        # flatten to [512, latent_dim]
+                        latent_dim = z.shape[0]
+                        z = z.permute(1, 2, 3, 0).reshape(-1, latent_dim)  # [512, latent_dim]
 
                 # output path
                 base = fname[0].replace(".npz","")
@@ -429,7 +464,7 @@ def main():
         "--model_script",
         type=str,
         required=True,
-        help="Path to a Python file that defines UNet3DVAE.",
+        help="Path to a Python file that defines UNet3DVAE or VQVAE3D.",
     )
 
     parser.add_argument("--aug_rot_x", action="store_true")
@@ -502,14 +537,15 @@ def main():
                 raise SystemExit(1)
 
     # -----------------------
-    # Load VAE
+    # Load VAE/VQ-VAE
     # -----------------------
-    console.print("[bold]Loading VAE...[/bold]")
+    console.print("[bold]Loading model...[/bold]")
     device = _resolve_device(force_cpu=cfg.cpu)
     ckpt_path = _resolve_checkpoint_path(cfg.vae_ckpt)
-    model, latent_dim = _build_model_from_checkpoint(
+    model, model_type = _build_model_from_checkpoint(
         ckpt_path, device, cfg.model_script
     )
+    console.print(f"[green]✓[/green] Loaded {model_type.upper()} model")
 
     # -----------------------
     # Create output folders
@@ -533,7 +569,7 @@ def main():
                 dataset,
                 cfg.out_dir,
                 model,
-                latent_dim,
+                model_type,
                 device,
                 cfg,
             )
@@ -556,11 +592,22 @@ def main():
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         ckpt_args = ckpt.get("args", {})
         base = ckpt_args.get("base", "unknown")
-        skip_levels = ckpt_args.get("skip_levels", 0 if ckpt_args.get("no_skip_connections", False) else ckpt_args.get("skip_levels", "unknown"))
+        latent_dim = ckpt_args.get("latent_dim", "unknown")
+        if model_type == "vqvae":
+            codebook_size = ckpt_args.get("codebook_size", "unknown")
+            commitment_cost = ckpt_args.get("commitment_cost", "unknown")
+            skip_levels = "N/A (VQ-VAE)"
+        else:
+            skip_levels = ckpt_args.get("skip_levels", 0 if ckpt_args.get("no_skip_connections", False) else ckpt_args.get("skip_levels", "unknown"))
+            codebook_size = "N/A (VAE)"
+            commitment_cost = "N/A (VAE)"
         model_source = os.path.abspath(cfg.model_script)
     except Exception:
         base = "unknown"
+        latent_dim = "unknown"
         skip_levels = "unknown"
+        codebook_size = "unknown"
+        commitment_cost = "unknown"
         model_source = os.path.abspath(cfg.model_script)
 
     total_inputs = sum(s["inputs"] for s in split_stats)
@@ -573,10 +620,17 @@ def main():
     rows.append(("out_dir", os.path.abspath(cfg.out_dir)))
     rows.append(("vae_ckpt_resolved", os.path.abspath(ckpt_path)))
     rows.append(("model_script", model_source))
+    rows.append(("model_type", model_type.upper()))
     rows.append(("device", device_str))
-    rows.append(("latent_dim", latent_dim))
     rows.append(("base", base))
-    rows.append(("skip_levels", skip_levels))
+    rows.append(("latent_dim", latent_dim))
+    if model_type == "vqvae":
+        rows.append(("codebook_size", codebook_size))
+        rows.append(("commitment_cost", commitment_cost))
+        rows.append(("output_format", "[512] (discrete codebook indices)"))
+    else:
+        rows.append(("skip_levels", skip_levels))
+        rows.append(("output_format", f"[512, {latent_dim}] (continuous latent vectors)"))
     # Aug flags
     rows.append(("aug_rot_x", str(bool(cfg.aug_rot_x)).upper()))
     rows.append(("aug_rot_y", str(bool(cfg.aug_rot_y)).upper()))
