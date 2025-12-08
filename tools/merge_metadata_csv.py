@@ -182,7 +182,24 @@ def main():
         raise SystemExit(1)
 
     # 確定輸出檔案名稱
-    output_csv = models_dir / args.output
+    output_path = Path(args.output).expanduser().resolve()
+    
+    # 如果輸出路徑是絕對路徑，直接使用；否則相對於 models_dir
+    if output_path.is_absolute():
+        output_csv = output_path
+    else:
+        output_csv = models_dir / args.output
+    
+    # 如果輸出路徑是一個已存在的目錄，在目錄下創建預設檔名
+    if output_csv.exists() and output_csv.is_dir():
+        output_csv = output_csv / "metadata_summary.csv"
+        console.print(
+            f"[yellow]提示：[/yellow] 輸出路徑是目錄，將在該目錄下創建 [cyan]{output_csv.name}[/cyan]"
+        )
+    
+    # 如果輸出路徑沒有 .csv 後綴，自動添加
+    if output_csv.suffix.lower() != ".csv":
+        output_csv = output_csv.with_suffix(".csv")
 
     # 合併所有 metadata
     # 使用第一個找到的 CSV 的 header
