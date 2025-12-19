@@ -162,20 +162,20 @@ class VoxelDataset(Dataset):
                     key = "arr_0" if "arr_0" in data else list(data.files)[0]
                     arr = data[key]
                 assert arr.shape == (32, 32, 32), f"Expected (32,32,32), got {arr.shape} from {path}"
-                # 优化：使用 int8 而不是 int64，节省 8 倍内存
-                # voxel 值只有 0,1,2，int8 足够（范围 -128 到 127）
+                # 優化：使用 int8 而不是 int64，節省 8 倍記憶體
+                # voxel 值只有 0,1,2，int8 足夠（範圍 -128 到 127）
                 arr_int8 = arr.astype(np.int8)
-                # 使用 torch.from_numpy 直接创建 tensor，避免额外复制
-                # 注意：需要确保 tensor 不会被修改，所以后续需要 clone
+                # 使用 torch.from_numpy 直接創建 tensor，避免額外複製
+                # 注意：需要確保 tensor 不會被修改，所以後續需要 clone
                 tensor = torch.from_numpy(arr_int8)
-                # 使用 pin_memory 可以加速 GPU 传输（如果使用 CUDA）
+                # 使用 pin_memory 可以加速 GPU 傳輸（如果使用 CUDA）
                 if torch.cuda.is_available():
                     tensor = tensor.pin_memory()
                 self.data_cache.append(tensor)
                 if console and (i + 1) % 1000 == 0:
                     console.print(f"  Loaded {i + 1}/{len(files)} files...")
             if console:
-                # 更新内存计算：int8 而不是 int64
+                # 更新記憶體計算：int8 而不是 int64
                 mem_mb = len(files) * 32 * 32 * 32 * 1 / (1024**2)
                 console.print(f"[green]✓[/green] Preloaded {len(files)} files (~{mem_mb:.1f} MB)")
 
@@ -246,8 +246,8 @@ class VoxelDataset(Dataset):
             kx, ky, kz, fx, fy, fz = self._random_choice()
 
         if self.preload:
-            # 优化：只在需要时 clone，并且转换为 int64（one_hot 需要）
-            # 注意：augmentation 操作（rot90, flip）会创建新 tensor，所以这里 clone 是必要的
+                # 優化：只在需要時 clone，並且轉換為 int64（one_hot 需要）
+                # 注意：augmentation 操作（rot90, flip）會創建新 tensor，所以這裡 clone 是必要的
             labels = self.data_cache[file_idx].clone().to(torch.int64)
         else:
             path = self.files[file_idx]
@@ -500,10 +500,16 @@ def parse_class_weights(arg: str):
 
 
 @torch.no_grad()
-def save_volume_and_projections(vol_logits, out_npz, out_png):
+def save_volume_and_projections(vol_logits, out_npz, out_png, title_suffix=""):
     """
     vol_logits: [3,32,32,32] logits.
     Saves argmax labels npz + 3-view max projection PNG.
+    
+    Args:
+        vol_logits: [3,32,32,32] logits tensor
+        out_npz: output npz file path
+        out_png: output png file path
+        title_suffix: optional suffix to add to the figure title (e.g., " - Val Sample #201")
     """
     import matplotlib.pyplot as plt
 
@@ -519,11 +525,11 @@ def save_volume_and_projections(vol_logits, out_npz, out_png):
 
     fig, axes = plt.subplots(1, 3, figsize=(9, 3))
     axes[0].imshow(max_z)
-    axes[0].set_title("MaxProj Z (Y,X)")
+    axes[0].set_title("MaxProj Z (Y,X)" + title_suffix)
     axes[1].imshow(max_y)
-    axes[1].set_title("MaxProj Y (Z,X)")
+    axes[1].set_title("MaxProj Y (Z,X)" + title_suffix)
     axes[2].imshow(max_x)
-    axes[2].set_title("MaxProj X (Z,Y)")
+    axes[2].set_title("MaxProj X (Z,Y)" + title_suffix)
     for ax in axes:
         ax.axis("off")
     fig.tight_layout()
@@ -534,7 +540,7 @@ def save_volume_and_projections(vol_logits, out_npz, out_png):
 @torch.no_grad()
 def compute_codebook_usage(indices: torch.Tensor, codebook_size: int) -> dict:
     """
-    计算 codebook usage 统计信息。
+    計算 codebook usage 統計資訊。
     
     Args:
         indices: [B, D, H, W] 或 [N] 的 tensor，包含 codebook indices
@@ -542,9 +548,9 @@ def compute_codebook_usage(indices: torch.Tensor, codebook_size: int) -> dict:
     
     Returns:
         dict with:
-            - active_codes: 被使用的 code 数量
+            - active_codes: 被使用的 code 數量
             - usage_rate: 使用率 (active_codes / codebook_size)
-            - code_counts: 每个 code 的使用次数（可选，用于 histogram）
+            - code_counts: 每個 code 的使用次數（可選，用於 histogram）
     """
     if indices.dim() > 1:
         flat_indices = indices.view(-1).cpu().numpy()
@@ -555,7 +561,7 @@ def compute_codebook_usage(indices: torch.Tensor, codebook_size: int) -> dict:
     active_codes = len(unique_codes)
     usage_rate = active_codes / codebook_size
     
-    # 计算每个 code 的使用次数
+    # 計算每個 code 的使用次數
     code_counts = np.bincount(flat_indices, minlength=codebook_size)
     
     return {
@@ -568,7 +574,7 @@ def compute_codebook_usage(indices: torch.Tensor, codebook_size: int) -> dict:
 @torch.no_grad()
 def compute_latent_entropy(indices: torch.Tensor, codebook_size: int) -> float:
     """
-    计算 latent grid 的熵（每个位置上的 latent index 熵）。
+    計算 latent grid 的熵（每個位置上的 latent index 熵）。
     
     Args:
         indices: [B, D, H, W] tensor，包含 codebook indices
@@ -580,16 +586,16 @@ def compute_latent_entropy(indices: torch.Tensor, codebook_size: int) -> float:
     B, D, H, W = indices.shape
     indices_np = indices.cpu().numpy()
     
-    # 对每个空间位置 (d, h, w)，计算该位置在不同 batch 上的分布熵
+    # 對每個空間位置 (d, h, w)，計算該位置在不同 batch 上的分布熵
     entropies = []
     for d in range(D):
         for h in range(H):
             for w in range(W):
                 pos_indices = indices_np[:, d, h, w]  # [B]
-                # 计算该位置的分布
+                # 計算該位置的分布
                 counts = np.bincount(pos_indices, minlength=codebook_size)
                 probs = counts / len(pos_indices)
-                probs = probs[probs > 0]  # 只考虑非零概率
+                probs = probs[probs > 0]  # 只考慮非零機率
                 if len(probs) > 0:
                     entropy = -np.sum(probs * np.log(probs + 1e-10))
                     entropies.append(entropy)
@@ -600,12 +606,12 @@ def compute_latent_entropy(indices: torch.Tensor, codebook_size: int) -> float:
 @torch.no_grad()
 def compute_per_class_accuracy(logits: torch.Tensor, labels: torch.Tensor, num_classes: int = 3) -> dict:
     """
-    计算每个类别的准确率。
+    計算每個類別的準確率。
     
     Args:
-        logits: [B, C, D, H, W] 预测 logits
-        labels: [B, D, H, W] 真实标签
-        num_classes: 类别数量
+        logits: [B, C, D, H, W] 預測 logits
+        labels: [B, D, H, W] 真實標籤
+        num_classes: 類別數量
     
     Returns:
         dict with per-class accuracy and overall accuracy
@@ -616,10 +622,10 @@ def compute_per_class_accuracy(logits: torch.Tensor, labels: torch.Tensor, num_c
     preds_flat = preds.view(-1).cpu().numpy()
     labels_flat = labels.view(-1).cpu().numpy()
     
-    # 总体准确率
+    # 總體準確率
     overall_acc = (preds_flat == labels_flat).mean()
     
-    # 每个类别的准确率
+    # 每個類別的準確率
     per_class_acc = {}
     per_class_counts = {}
     for c in range(num_classes):
@@ -853,12 +859,18 @@ def train(args, resume_checkpoint=None):
             console.print("[bold]AMP:[/bold] [green]ENABLED[/green]")
         else:
             console.print("[bold]AMP:[/bold] [yellow]DISABLED[/yellow]")
+        # Clear cache at start
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, 'reset_peak_memory_stats'):
+            torch.cuda.reset_peak_memory_stats()
     else:
         console.print("[bold]AMP:[/bold] [dim]N/A[/dim]")
 
     os.makedirs(exp_dir, exist_ok=True)
     samples_dir = os.path.join(exp_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
+    analytics_dir = os.path.join(exp_dir, "analytics")
+    os.makedirs(analytics_dir, exist_ok=True)
 
     start_epoch = 1
     best_val = math.inf
@@ -974,6 +986,9 @@ def train(args, resume_checkpoint=None):
         "loss_function": loss_formula,
         "loss_reconstruction": ce_desc,
         "loss_vq": f"VQ_Loss(codebook + {0.25} * commitment)",
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "effective_batch_size": args.batch_size * args.gradient_accumulation_steps,
+        "clear_cache_every": args.clear_cache_every,
     }
 
     # Save initial metadata (key-value format)
@@ -1095,6 +1110,17 @@ def train(args, resume_checkpoint=None):
             if epoch == start_epoch:
                 class_counts = torch.zeros(3, dtype=torch.long, device=device)
 
+            # Gradient accumulation setup
+            accumulation_steps = args.gradient_accumulation_steps
+            effective_batch_size = args.batch_size * accumulation_steps
+            if accumulation_steps > 1 and epoch == start_epoch:
+                console.print(
+                    f"[cyan]Gradient accumulation: {accumulation_steps} steps "
+                    f"(effective batch size: {effective_batch_size})[/cyan]"
+                )
+
+            optimizer.zero_grad(set_to_none=True)
+            
             for batch_idx, (onehot, labels) in enumerate(train_loader):
                 onehot = onehot.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
@@ -1103,7 +1129,6 @@ def train(args, resume_checkpoint=None):
                     for c in range(3):
                         class_counts[c] += (labels == c).sum()
 
-                optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast(
                     device_type=device.type, enabled=use_amp
                 ):
@@ -1124,20 +1149,43 @@ def train(args, resume_checkpoint=None):
                         weight=weight_tensor,
                     )
                     loss = ce + args.vq_beta * vq_loss
+                    # Scale loss by accumulation steps
+                    loss = loss / accumulation_steps
 
                 if scaler is not None:
                     scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+                # Update weights only after accumulating gradients
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    if scaler is not None:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                batch_size = labels.size(0)
+                running += loss.item() * batch_size * accumulation_steps
+                running_ce += ce.item() * batch_size * accumulation_steps
+                running_vq += vq_loss.item() * batch_size * accumulation_steps
+                
+                # Clear CUDA cache periodically if requested
+                if args.clear_cache_every > 0 and (batch_idx + 1) % args.clear_cache_every == 0:
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                
+                progress.update(epoch_task, advance=1)
+            
+            # Handle remaining gradients if batch count is not divisible by accumulation_steps
+            if len(train_loader) % accumulation_steps != 0:
+                if scaler is not None:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    loss.backward()
                     optimizer.step()
-
-                batch_size = labels.size(0)
-                running += loss.item() * batch_size
-                running_ce += ce.item() * batch_size
-                running_vq += vq_loss.item() * batch_size
-                progress.update(epoch_task, advance=1)
+                optimizer.zero_grad(set_to_none=True)
 
             train_loss = running / len(train_loader.dataset)
             train_ce = running_ce / len(train_loader.dataset)
@@ -1174,11 +1222,11 @@ def train(args, resume_checkpoint=None):
             running_vq = 0.0
             running_perplexity = 0.0
             
-            # 增量统计变量
-            code_counts = np.zeros(args.codebook_size, dtype=np.int64)  # 用于 codebook usage
-            position_counts = {}  # 用于 latent entropy: {(d,h,w): {code: count}}
-            correct_predictions = np.zeros(3, dtype=np.int64)  # 每个类别的正确预测数
-            total_predictions = np.zeros(3, dtype=np.int64)  # 每个类别的总数
+            # 增量統計變數
+            code_counts = np.zeros(args.codebook_size, dtype=np.int64)  # 用於 codebook usage
+            position_counts = {}  # 用於 latent entropy: {(d,h,w): {code: count}}
+            correct_predictions = np.zeros(3, dtype=np.int64)  # 每個類別的正確預測數
+            total_predictions = np.zeros(3, dtype=np.int64)  # 每個類別的總數
             
             with torch.no_grad():
                 for onehot, labels in val_loader:
@@ -1198,13 +1246,13 @@ def train(args, resume_checkpoint=None):
                     running_vq += vq_loss.item() * batch_size
                     running_perplexity += perplexity.item() * batch_size
                     
-                    # 增量计算指标（避免内存爆炸）
-                    # 1. Codebook usage: 累积 code counts
+                    # 增量計算指標（避免記憶體爆炸）
+                    # 1. Codebook usage: 累積 code counts
                     indices_flat = indices.cpu().view(-1).numpy()
                     batch_code_counts = np.bincount(indices_flat, minlength=args.codebook_size)
                     code_counts += batch_code_counts
                     
-                    # 2. Latent entropy: 累积每个位置的 code 分布
+                    # 2. Latent entropy: 累積每個位置的 code 分布
                     indices_np = indices.cpu().numpy()  # [B, 8, 8, 8]
                     B, D, H, W = indices_np.shape
                     for d in range(D):
@@ -1217,7 +1265,7 @@ def train(args, resume_checkpoint=None):
                                 pos_counts = np.bincount(pos_codes, minlength=args.codebook_size)
                                 position_counts[pos_key] += pos_counts
                     
-                    # 3. Per-class accuracy: 累积正确预测数
+                    # 3. Per-class accuracy: 累積正確預測數
                     preds = logits.argmax(dim=1).cpu()  # [B, 32, 32, 32]
                     labels_cpu = labels.cpu()
                     for c in range(3):
@@ -1235,7 +1283,7 @@ def train(args, resume_checkpoint=None):
             val_vq = running_vq / len(val_loader.dataset)
             val_perplexity = running_perplexity / len(val_loader.dataset)
             
-            # 计算最终指标
+            # 計算最終指標
             # 1. Codebook usage
             active_codes = (code_counts > 0).sum()
             val_active_codes = active_codes
@@ -1320,41 +1368,114 @@ def train(args, resume_checkpoint=None):
 
             # -------- Samples: reconstruction + random codebook samples --------
             if epoch % args.sample_every == 0:
+                total_samples = args.n_rec + args.n_samples
                 sample_task = progress.add_task(
-                    "[blue]Generating samples", total=args.n_samples + 1
+                    "[blue]Generating samples", total=total_samples
                 )
                 model.eval()
                 with torch.no_grad():
-                    # Reconstruction sample (for comparison)
-                    for onehot, labels in val_loader:
-                        onehot = onehot.to(device)
-                        logits, _, _, indices = model(onehot)
-                        rec = logits[0].detach().cpu()
+                    # Reconstruction samples (for comparison)
+                    # 根據參數選擇從 train 或 val 取樣本
+                    if args.rec_sample_from == "train":
+                        rec_files = train_files
+                        rec_dataset_name = "train"
+                    else:  # "val"
+                        rec_files = val_files
+                        rec_dataset_name = "val"
+                    
+                    n_rec_files = len(rec_files)
+                    # 均勻選擇 n_rec 個樣本
+                    if args.n_rec > 0:
+                        if n_rec_files == 0:
+                            progress.console.print(
+                                f"[yellow]Warning: No {rec_dataset_name} files available for reconstruction[/yellow]"
+                            )
+                        else:
+                            # 計算均勻分布的索引
+                            if args.n_rec == 1:
+                                rec_indices = [0]
+                            else:
+                                # 例如：n_rec=5, n_files=1000 -> [0, 200, 400, 600, 800]
+                                step = max(1, (n_rec_files - 1) // (args.n_rec - 1)) if args.n_rec > 1 else 1
+                                rec_indices = [min(i * step, n_rec_files - 1) for i in range(args.n_rec)]
+                            
+                            for rec_idx, rec_sample_idx in enumerate(rec_indices):
+                                rec_file_path = rec_files[rec_sample_idx]  # 原始文件路徑
+                                rec_file_name = os.path.basename(rec_file_path)  # 文件名
+                                
+                                # 直接從文件加載樣本（避免 train_loader shuffle 造成的問題）
+                                with np.load(rec_file_path, allow_pickle=False) as data:
+                                    key = "arr_0" if "arr_0" in data else list(data.files)[0]
+                                    arr = data[key]
+                                assert arr.shape == (32, 32, 32), f"Expected (32,32,32), got {arr.shape} from {rec_file_path}"
+                                labels_3d = torch.from_numpy(arr.astype(np.int64))  # [32, 32, 32]
+                                onehot_3d = VoxelDataset._one_hot(labels_3d, num_classes=3)  # [3, 32, 32, 32]
+                                onehot = onehot_3d.unsqueeze(0)  # [1, 3, 32, 32, 32]
+                                labels = labels_3d.unsqueeze(0)  # [1, 32, 32, 32]
+                                
+                                onehot = onehot.to(device)
+                                labels = labels.to(device)
+                                logits, _, _, indices = model(onehot)
+                                rec = logits[0].detach().cpu()
+                                rec_labels = labels[0].detach().cpu()  # 原始標籤
 
-                        # 儲存重建 voxel
-                        save_volume_and_projections(
-                            rec,
-                            os.path.join(
-                                samples_dir,
-                                f"rec_e{epoch}_{args.exp_name}.npz",
-                            ),
-                            os.path.join(
-                                samples_dir,
-                                f"rec_e{epoch}_{args.exp_name}.png",
-                            ),
-                        )
-                        # 順便把對應的 latent indices 也存起來
-                        rec_indices = indices[0].cpu().numpy().astype(np.int16)
-                        np.savez_compressed(
-                            os.path.join(
-                                samples_dir,
-                                f"rec_e{epoch}_{args.exp_name}_codes.npz",
-                            ),
-                            indices=rec_indices,
-                        )
-
-                        progress.update(sample_task, advance=1)
-                        break
+                                # 儲存重建 voxel（文件名包含 rec_idx 和 rec_sample_idx）
+                                rec_npz_path = os.path.join(
+                                    samples_dir,
+                                    f"rec_e{epoch}_{rec_idx}_{rec_sample_idx}_{args.exp_name}.npz",
+                                )
+                                rec_png_path = os.path.join(
+                                    samples_dir,
+                                    f"rec_e{epoch}_{rec_idx}_{rec_sample_idx}_{args.exp_name}.png",
+                                )
+                                
+                                # 圖片標題顯示是第幾個資料
+                                title_suffix = f" - {rec_dataset_name.capitalize()} Sample #{rec_sample_idx}"
+                                save_volume_and_projections(
+                                    rec,
+                                    rec_npz_path,
+                                    rec_png_path,
+                                    title_suffix=title_suffix,
+                                )
+                                
+                                # 順便把對應的 latent indices 也存起來
+                                rec_indices_array = indices[0].cpu().numpy().astype(np.int16)
+                                np.savez_compressed(
+                                    os.path.join(
+                                        samples_dir,
+                                        f"rec_e{epoch}_{rec_idx}_{rec_sample_idx}_{args.exp_name}_codes.npz",
+                                    ),
+                                    indices=rec_indices_array,
+                                )
+                                
+                                # 儲存原始標籤（用於對比）
+                                np.savez_compressed(
+                                    os.path.join(
+                                        samples_dir,
+                                        f"rec_e{epoch}_{rec_idx}_{rec_sample_idx}_{args.exp_name}_original.npz",
+                                    ),
+                                    labels=rec_labels.numpy().astype(np.uint8),
+                                )
+                                
+                                # 儲存重建樣本元數據（記錄是哪個文件）
+                                rec_metadata_path = os.path.join(
+                                    samples_dir,
+                                    f"rec_e{epoch}_{rec_idx}_{rec_sample_idx}_{args.exp_name}_metadata.txt",
+                                )
+                                with open(rec_metadata_path, "w") as f:
+                                    f.write(f"Reconstruction sample info:\n")
+                                    f.write(f"  Epoch: {epoch}\n")
+                                    f.write(f"  Reconstruction index: {rec_idx} / {args.n_rec - 1}\n")
+                                    f.write(f"  Dataset: {rec_dataset_name}\n")
+                                    f.write(f"  Sample index in {rec_dataset_name} set: {rec_sample_idx}\n")
+                                    f.write(f"  Original file: {rec_file_path}\n")
+                                    f.write(f"  Original filename: {rec_file_name}\n")
+                                    f.write(f"  Note: Sample loaded directly from file (not from DataLoader)\n")
+                                
+                                progress.console.print(
+                                    f"[dim]Reconstruction {rec_idx+1}/{args.n_rec}: {rec_file_name} ({rec_dataset_name} index {rec_sample_idx})[/dim]"
+                                )
+                                progress.update(sample_task, advance=1)
 
                     # Prior samples: random codebook indices
                     for i in range(args.n_samples):
@@ -1373,7 +1494,7 @@ def train(args, resume_checkpoint=None):
                                 f"sample_e{epoch}_{i}_{args.exp_name}.png",
                             ),
                         )
-                        # 儲存 latent indices，之後你也可以拿來看 random 結構的 code 分佈
+                        # 儲存 latent indices，之後你也可以拿來看 random 結構的 code 分布
                         prior_idx_np = prior_indices[0].cpu().numpy().astype(np.int16)
                         np.savez_compressed(
                             os.path.join(
@@ -1384,6 +1505,27 @@ def train(args, resume_checkpoint=None):
                         )
                         progress.update(sample_task, advance=1)
                 progress.remove_task(sample_task)
+
+                # -------- Codebook Usage Histogram --------
+                hist_dir = os.path.join(analytics_dir, "usage_hist")
+                os.makedirs(hist_dir, exist_ok=True)
+                # 使用 val_loader 第一批 indices 來檢查 code usage
+                with torch.no_grad():
+                    for onehot, labels in val_loader:
+                        onehot = onehot.to(device)
+                        _, _, _, indices = model(onehot)
+                        break
+                usage = compute_codebook_usage(indices, args.codebook_size)
+                counts = usage["code_counts"]
+                import matplotlib.pyplot as plt
+                plt.figure(figsize=(10, 4))
+                plt.bar(range(args.codebook_size), counts)
+                plt.title(f"Codebook Usage Histogram @ Epoch {epoch}")
+                plt.xlabel("Codebook index")
+                plt.ylabel("Count")
+                plt.tight_layout()
+                plt.savefig(os.path.join(hist_dir, f"usage_e{epoch}.png"), dpi=140)
+                plt.close()
 
             progress.update(overall_task, advance=1)
 
@@ -1421,6 +1563,79 @@ def train(args, resume_checkpoint=None):
         progress.remove_task(test_task)
         progress.update(overall_task, advance=1)
         progress.console.print(f"Final Test: test loss {test_loss:.4f}")
+
+    # -------- Final Analytics --------
+    console.print("[cyan]Running final codebook analytics using best model...[/cyan]")
+    # reload best model
+    model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=False)["model"])
+    model.eval()
+
+    from sklearn.manifold import TSNE
+    import umap.umap_ as umap
+    from scipy.spatial.distance import cdist
+    import matplotlib.pyplot as plt
+
+    emb = model.vq.embedding.weight.detach().cpu().numpy()  # [K, C]
+    K, C = emb.shape
+
+    # 1️⃣ t-SNE / UMAP
+    embed_dir = os.path.join(analytics_dir, "embedding")
+    os.makedirs(embed_dir, exist_ok=True)
+    tsne = TSNE(n_components=2, perplexity=min(30, K-1), init="pca").fit_transform(emb)
+    plt.figure(figsize=(5, 5))
+    plt.scatter(tsne[:, 0], tsne[:, 1], s=6)
+    plt.title("Codebook t-SNE")
+    plt.tight_layout()
+    plt.savefig(os.path.join(embed_dir, "tsne.png"), dpi=140)
+    plt.close()
+
+    um = umap.UMAP(n_components=2).fit_transform(emb)
+    plt.figure(figsize=(5, 5))
+    plt.scatter(um[:, 0], um[:, 1], s=6)
+    plt.title("Codebook UMAP")
+    plt.tight_layout()
+    plt.savefig(os.path.join(embed_dir, "umap.png"), dpi=140)
+    plt.close()
+
+    # 2️⃣ Latent Spatial Autocorrelation：看空間鄰接是否有趨勢
+    console.print("[cyan]Computing latent spatial correlation...[/cyan]")
+    spatial_dir = os.path.join(analytics_dir, "spatial")
+    os.makedirs(spatial_dir, exist_ok=True)
+    # 用 val 第一批
+    for onehot, labels in val_loader:
+        onehot = onehot.to(device)
+        _, _, _, indices = model(onehot)
+        break
+    # indices: [B, D, H, W]
+    indices = indices[0].cpu().numpy()
+    # 和 6 鄰接比較一致度
+    D, H, W = indices.shape
+    total = agree = 0
+    for d in range(D):
+        for h in range(H):
+            for w in range(W):
+                for dd, dh, dw in [(1, 0, 0), (0, 1, 0), (0, 0, 1)]:
+                    nd, nh, nw = d + dd, h + dh, w + dw
+                    if nd < D and nh < H and nw < W:
+                        total += 1
+                        if indices[d, h, w] == indices[nd, nh, nw]:
+                            agree += 1
+    spatial_score = agree / total if total > 0 else 0
+    with open(os.path.join(spatial_dir, "spatial_score.txt"), "w") as f:
+        f.write(str(spatial_score))
+    console.print(f"[green]Spatial Consistency Score: {spatial_score:.3f}[/green]")
+
+    # 3️⃣ Embedding Distance Heatmap
+    dist_dir = os.path.join(analytics_dir, "distance")
+    os.makedirs(dist_dir, exist_ok=True)
+    dist = cdist(emb, emb)
+    plt.figure(figsize=(6, 5))
+    plt.imshow(dist, cmap="viridis")
+    plt.colorbar(label="distance")
+    plt.title("Embedding Distance Matrix")
+    plt.tight_layout()
+    plt.savefig(os.path.join(dist_dir, "distance_heatmap.png"), dpi=140)
+    plt.close()
 
     # Clean last checkpoint
     last_checkpoint_removed = False
@@ -1583,6 +1798,19 @@ if __name__ == "__main__":
 
     parser.add_argument("--sample_every", type=int, default=5)
     parser.add_argument("--n_samples", type=int, default=4)
+    parser.add_argument(
+        "--n_rec",
+        type=int,
+        default=1,
+        help="Number of reconstruction samples to generate (evenly distributed from val set)",
+    )
+    parser.add_argument(
+        "--rec_sample_from",
+        type=str,
+        default="val",
+        choices=["train", "val"],
+        help="Which dataset to use for reconstruction sample: 'train' or 'val' (default: val)",
+    )
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument(
@@ -1604,6 +1832,18 @@ if __name__ == "__main__":
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--preload", action="store_true")
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of gradient accumulation steps (effective batch size = batch_size * gradient_accumulation_steps)",
+    )
+    parser.add_argument(
+        "--clear_cache_every",
+        type=int,
+        default=0,
+        help="Clear CUDA cache every N batches (0 = disabled)",
+    )
 
     parser.add_argument(
         "--export_latent_indices",
