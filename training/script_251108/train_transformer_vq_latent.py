@@ -33,6 +33,7 @@ from rich.progress import (
 from rich.panel import Panel
 
 import matplotlib.pyplot as plt
+from scipy import ndimage
 
 # ------------------------------------------------
 # Utility
@@ -430,6 +431,47 @@ def compute_decoder_occupancy(labels, air_class=0):
 
     return non_air_ratio, bbox_volume_ratio
 
+def compute_largest_component_ratio(labels, air_class=0):
+    """
+    Compute the ratio of the largest connected component to all non-air voxels.
+    
+    Parameters
+    ----------
+    labels : numpy.ndarray
+        Array of shape [32,32,32] containing class labels after argmax.
+    air_class : int, default=0
+        Class ID representing "air" voxels (typically 0).
+    
+    Returns
+    -------
+    largest_component_ratio : float
+        Ratio of largest connected component size to total non-air voxels.
+        Returns 0.0 if no non-air voxels exist.
+    """
+    mask = (labels != air_class).astype(np.int32)
+    non_air_count = mask.sum()
+    
+    if non_air_count == 0:
+        return 0.0
+    
+    # Find connected components (using 6-connectivity for 3D)
+    labeled_mask, num_features = ndimage.label(mask, structure=np.ones((3, 3, 3)))
+    
+    if num_features == 0:
+        return 0.0
+    
+    # Count voxels in each component
+    component_sizes = []
+    for i in range(1, num_features + 1):
+        component_size = (labeled_mask == i).sum()
+        component_sizes.append(component_size)
+    
+    # Get largest component size
+    largest_component_size = max(component_sizes) if component_sizes else 0
+    largest_component_ratio = float(largest_component_size) / float(non_air_count + 1e-8)
+    
+    return largest_component_ratio
+
 
 # ------------------------------------------------
 # Main
@@ -591,6 +633,18 @@ def main():
         type=float,
         default=1.0,
         help="採樣溫度（僅在 sample_mode=sample 時使用）。較高溫度 = 更多樣性。"
+    )
+    parser.add_argument(
+        "--analytics_n_samples",
+        type=int,
+        default=1000,
+        help="分析指標使用的訓練和生成樣本數量（預設 1000）。用於 MMD/Coverage、decode quality 分布比較等。較大值更準確但更慢。"
+    )
+    parser.add_argument(
+        "--n_sample_images",
+        type=int,
+        default=3,
+        help="每次 analytics 回合保存的 sample 圖片數量（預設 3）。每個 sample 會生成 .npy（token indices）、.npz（decoded voxels）和 .png（3-view projection）檔案。"
     )
 
     args = parser.parse_args()
@@ -1065,6 +1119,8 @@ def main():
         "preload": "TRUE" if args.preload else "FALSE",
         "sample_mode": args.sample_mode,
         "analytics_every": args.analytics_every,
+        "analytics_n_samples": args.analytics_n_samples,
+        "n_sample_images": args.n_sample_images,
         "vqvae_ckpt": vqvae_ckpt_path if vqvae_ckpt_path else "None",
         "latent_sequence_length": seq_len if seq_len is not None else "unknown",
         "latent_grid_size": f"{latent_grid_size}x{latent_grid_size}x{latent_grid_size}" if latent_grid_size is not None else "unknown",
@@ -1103,6 +1159,10 @@ def main():
                 "token_coverage",
                 "sample_diversity",
                 "transition_entropy_diff",
+                "mmd_hamming",
+                "coverage_hamming",
+                "mmd_cosine",
+                "coverage_cosine",
                 "epoch_time_secs",
                 "cumulative_time_secs",
                 "is_best",
@@ -1208,6 +1268,10 @@ def main():
             current_token_coverage = None
             current_sample_diversity = None
             current_transition_entropy_diff = None
+            current_mmd_hamming = None
+            current_coverage_hamming = None
+            current_mmd_cosine = None
+            current_coverage_cosine = None
 
             progress.update(overall, advance=1)
 
@@ -1225,19 +1289,34 @@ def main():
                     return z.numpy() if isinstance(z, torch.Tensor) else np.asarray(z)
                 
                 # Collect train sequences once (used by multiple analytics)
-                # Use max(100, auto_corr_eval_size) to cover all needs
+                # Use max(100, auto_corr_eval_size, analytics_n_samples) to cover all needs
                 auto_corr_eval_size = min(500, len(train_ds))
+                analytics_train_size = min(args.analytics_n_samples, len(train_ds))
+                max_collect_size = max(100, auto_corr_eval_size, analytics_train_size)
                 train_sequences_collected = []
+                if max_collect_size > 100:  # Only show progress bar if collecting many samples
+                    collect_task = progress.add_task(
+                        f"[cyan]Collecting {max_collect_size} train sequences", total=max_collect_size
+                    )
                 for z in train_ds:
                     train_sequences_collected.append(to_numpy(z))
-                    if len(train_sequences_collected) >= max(100, auto_corr_eval_size):
+                    if max_collect_size > 100:
+                        progress.update(collect_task, advance=1)
+                    if len(train_sequences_collected) >= max_collect_size:
                         break
+                if max_collect_size > 100:
+                    progress.remove_task(collect_task)
                 
                 # Generate samples once (used by multiple analytics)
                 # Generate enough samples for all analytics (max of all needs)
-                num_gen_samples = max(5, 5, 4)  # entropy(5), diversity(5), drift(4)
+                # MMD/Coverage and decode quality need analytics_n_samples samples
+                num_gen_samples = max(5, 5, 4, args.analytics_n_samples)  # entropy(5), diversity(5), drift(4), mmd_coverage/decode_quality(N)
                 gen_samples_all = []
-                for _ in range(num_gen_samples):
+                if num_gen_samples > 10:  # Only show progress bar if generating many samples
+                    gen_task = progress.add_task(
+                        f"[cyan]Generating {num_gen_samples} latent samples", total=num_gen_samples
+                    )
+                for i in range(num_gen_samples):
                     s = sample_latent(
                         model, 
                         seq_len=actual_seq_len, 
@@ -1246,6 +1325,10 @@ def main():
                         temperature=args.sample_temperature
                     )
                     gen_samples_all.append(s)
+                    if num_gen_samples > 10:
+                        progress.update(gen_task, advance=1)
+                if num_gen_samples > 10:
+                    progress.remove_task(gen_task)
                 # ============================================================
 
                 # (1) Token Transition Entropy: 評估 Prior 是否在學語法，不是純 token 頻率
@@ -1334,23 +1417,6 @@ def main():
                 )
                 
                 # Save grammar strength metrics
-                with open(os.path.join(ep_dir, "grammar_strength_metrics.txt"), "w") as f:
-                    f.write("Token Transition Entropy Diagnostics\n")
-                    f.write("目的：評估 Prior 是否在學語法，不是純 token 頻率\n")
-                    f.write("\n")
-                    f.write(f"  Train avg_transition_entropy = {train_mean_entropy:.6f}\n")
-                    f.write(f"  Generated avg_transition_entropy = {gen_mean_entropy:.6f}\n")
-                    f.write(f"  Difference = {gen_mean_entropy - train_mean_entropy:.6f}\n")
-                    f.write(f"  n_train_sequences = {len(train_sequences_collected[:100])}\n")
-                    f.write(f"  n_gen_sequences = 5\n")
-                    f.write("\n建議參考：\n")
-                    f.write("  • entropy 高 → 轉換無章法（每個 token 後續選擇多樣，語法較弱）\n")
-                    f.write("  • entropy 低 → collapsed（所有 token 都導向相同後續）\n")
-                    f.write("  • entropy 適中 ✔ → 模型正在學規則（有明確的語法結構）\n")
-                    f.write("  • 應該與訓練資料的 transition entropy 比較\n")
-                    f.write("  • 如果 gen_entropy 遠低於 train_entropy → 可能過度收斂\n")
-                    f.write("  • 如果 gen_entropy 遠高於 train_entropy → 可能未學到語法\n")
-                
                 with open(os.path.join(ep_dir, "grammar_strength_metrics.csv"), "w", newline="") as f:
                     w = csv.writer(f)
                     w.writerow(["metric", "value"])
@@ -1466,37 +1532,6 @@ def main():
                         gen_autocorr_mean = np.mean(gen_autocorr_samples)
                 
                 # Save auto-correlation metrics
-                with open(os.path.join(ep_dir, "grid_autocorrelation_metrics.txt"), "w") as f:
-                    f.write("Auto-correlation of Token Grid Diagnostics\n")
-                    f.write("目的：評估 Transformer prior 是否學到空間連續性（鄰近 latent token 是否相關）\n")
-                    f.write("\n")
-                    if latent_grid_size is not None:
-                        f.write(f"  Grid size = {latent_grid_size}x{latent_grid_size}x{latent_grid_size}\n")
-                        f.write(f"  n_train_sequences_used = {len(train_autocorr_samples) if train_autocorr_samples else 0} (max: {auto_corr_eval_size})\n")
-                        if train_autocorr_mean is not None:
-                            f.write(f"  Train mean_autocorrelation = {train_autocorr_mean:.6f}\n")
-                            if train_autocorr_dirs is not None:
-                                f.write(f"    Direction (1,0,0) = {train_autocorr_dirs[0]:.6f}\n")
-                                f.write(f"    Direction (0,1,0) = {train_autocorr_dirs[1]:.6f}\n")
-                                f.write(f"    Direction (0,0,1) = {train_autocorr_dirs[2]:.6f}\n")
-                        if gen_autocorr_mean is not None:
-                            f.write(f"  Generated mean_autocorrelation = {gen_autocorr_mean:.6f}\n")
-                            if gen_autocorr_dirs is not None:
-                                f.write(f"    Direction (1,0,0) = {gen_autocorr_dirs[0]:.6f}\n")
-                                f.write(f"    Direction (0,1,0) = {gen_autocorr_dirs[1]:.6f}\n")
-                                f.write(f"    Direction (0,0,1) = {gen_autocorr_dirs[2]:.6f}\n")
-                        if train_autocorr_mean is not None and gen_autocorr_mean is not None:
-                            f.write(f"  Difference = {gen_autocorr_mean - train_autocorr_mean:.6f}\n")
-                    else:
-                        f.write("  [Warning] Cannot compute auto-correlation: latent_grid_size is unknown\n")
-                        f.write("  (Sequence length is not a perfect cube)\n")
-                    f.write("\n建議參考：\n")
-                    f.write("  • correlation 接近 1.0 → 空間連續性強（鄰近 token 高度相關）\n")
-                    f.write("  • correlation 接近 0.0 → 空間連續性弱（鄰近 token 無關）\n")
-                    f.write("  • correlation < 0 → 空間反相關（罕見，可能表示模型學到對比模式）\n")
-                    f.write("  • 如果 gen_autocorr 遠低於 train_autocorr → 模型可能未學到空間結構\n")
-                    f.write("  • 如果 gen_autocorr 接近 train_autocorr → 模型學到了空間連續性\n")
-                
                 with open(os.path.join(ep_dir, "grid_autocorrelation_metrics.csv"), "w", newline="") as f:
                     w = csv.writer(f)
                     w.writerow(["metric", "value"])
@@ -1555,7 +1590,7 @@ def main():
                     plt.savefig(os.path.join(ep_dir, "grid_autocorrelation.png"), dpi=140)
                     plt.close(fig)
 
-                # (2) Sample Diversity & Edit Distance
+                # (2) Sample Diversity
                 # Reuse generated samples
                 K = 5
                 multi_samples = gen_samples_all[:K]
@@ -1569,44 +1604,10 @@ def main():
                         hamming_dists.append(hamming)
                 sample_diversity = np.mean(hamming_dists) if len(hamming_dists) > 0 else 0.0
                 
-                # [S1b] Edit Distance (Levenshtein-like): measure sequence-level differences
-                def token_edit_distance(seq1, seq2):
-                    """Compute normalized edit distance between two token sequences."""
-                    # Simple token-level edit distance: count insertions, deletions, substitutions
-                    # For efficiency, use a simplified version: count mismatches and length differences
-                    min_len = min(len(seq1), len(seq2))
-                    max_len = max(len(seq1), len(seq2))
-                    # Count mismatches in overlapping region
-                    mismatches = (seq1[:min_len] != seq2[:min_len]).sum()
-                    # Add length difference as edit cost
-                    length_diff = max_len - min_len
-                    # Normalize by max length
-                    edit_dist = (mismatches + length_diff) / max_len if max_len > 0 else 0.0
-                    return edit_dist
-                
-                edit_dists = []
-                for i in range(K):
-                    for j in range(i + 1, K):
-                        ed = token_edit_distance(multi_samples[i], multi_samples[j])
-                        edit_dists.append(ed)
-                avg_edit_distance = np.mean(edit_dists) if len(edit_dists) > 0 else 0.0
-                
                 # [S2] Unique tokens across all samples
                 all_tokens = np.concatenate(multi_samples)
                 unique_tokens = len(np.unique(all_tokens))
                 token_coverage = unique_tokens / args.codebook_size
-                
-                # Save sample diversity metric
-                with open(os.path.join(ep_dir, "sample_diversity.txt"), "w") as f:
-                    f.write("Sample Diversity Diagnostics\n")
-                    f.write(f"  sample_diversity (mean pairwise Hamming distance) = {sample_diversity:.6f}\n")
-                    f.write(f"  unique_tokens (across all samples) = {unique_tokens} / {args.codebook_size}\n")
-                    f.write(f"  token_coverage = {token_coverage:.6f}\n")
-                    f.write(f"  n_samples = {K}\n")
-                    f.write("\n建議參考：\n")
-                    f.write("  • 若 sample_diversity < 0.1 → collapse（所有樣本幾乎相同）\n")
-                    f.write("  • 若 sample_diversity 接近 1.0 → 樣本完全不同（可能過度多樣化）\n")
-                    f.write("  • token_coverage 表示使用了多少比例的 codebook tokens\n")
                 
                 # [S3] Token Sequence Visualization: show token indices over sequence
                 fig, axes = plt.subplots(K, 1, figsize=(12, 2*K))
@@ -1627,77 +1628,122 @@ def main():
                     w = csv.writer(f)
                     w.writerow(["metric", "value"])
                     w.writerow(["sample_diversity", f"{sample_diversity:.6f}"])
-                    w.writerow(["avg_edit_distance", f"{avg_edit_distance:.6f}"])
                     w.writerow(["unique_tokens", unique_tokens])
                     w.writerow(["token_coverage", f"{token_coverage:.6f}"])
                     w.writerow(["n_samples", K])
 
-                # Update sample_diversity.txt
-                with open(os.path.join(ep_dir, "sample_diversity.txt"), "a") as f:
-                    f.write(f"  avg_edit_distance (normalized) = {avg_edit_distance:.6f}\n")
-                    f.write("  • edit_distance 接近 0 → 序列幾乎相同（collapse）\n")
-                    f.write("  • edit_distance 接近 1 → 序列完全不同（高多樣性）\n")
-
-                # (4) Decode Quality: Occupancy Ratio & Projection Views
-                # Decode generated token indices to voxels and compute occupancy metrics
+                # (4) Decode Quality: Distribution Comparison (Train vs Generated)
+                # Decode multiple samples and compare distributions
                 if vqvae_model is not None:
+                    grid_size_to_use = latent_grid_size if latent_grid_size is not None else 8
+                    
+                    # Decode train samples (use same number as analytics_n_samples)
+                    n_decode_samples = min(args.analytics_n_samples, len(train_sequences_collected), len(gen_samples_all))
+                    train_decode_samples = train_sequences_collected[:n_decode_samples]
+                    gen_decode_samples = gen_samples_all[:n_decode_samples]
+                    
+                    train_non_air_ratios = []
+                    train_bbox_ratios = []
+                    train_largest_component_ratios = []
+                    gen_non_air_ratios = []
+                    gen_bbox_ratios = []
+                    gen_largest_component_ratios = []
+                    
+                    decode_task = progress.add_task(
+                        f"[cyan]Decoding {n_decode_samples * 2} samples for distribution comparison", 
+                        total=n_decode_samples * 2
+                    )
+                    
                     with torch.no_grad():
-                        # Sample a latent sequence (token indices)
-                        z_sample_tokens = sample_latent(
-                            model, 
-                            seq_len=actual_seq_len, 
-                            device=device, 
-                            mode=args.sample_mode,
-                            temperature=args.sample_temperature
-                        )  # [seq_len] - token indices
-                        
-                        # Reshape token indices to spatial grid: [seq_len] -> [8,8,8]
-                        grid_size_to_use = latent_grid_size if latent_grid_size is not None else 8
-                        if len(z_sample_tokens) != grid_size_to_use ** 3:
-                            console.print(f"[yellow]Warning:[/yellow] Sequence length {len(z_sample_tokens)} != {grid_size_to_use}^3, skipping decode")
-                        else:
-                            # Reshape to [8,8,8]
-                            indices_grid = z_sample_tokens.reshape(grid_size_to_use, grid_size_to_use, grid_size_to_use)
-                            indices_tensor = torch.from_numpy(indices_grid).long().to(device)  # [8, 8, 8] or [1, 8, 8, 8]
+                        # Decode train samples
+                        for train_seq in train_decode_samples:
+                            if len(train_seq) != grid_size_to_use ** 3:
+                                progress.update(decode_task, advance=1)
+                                continue
                             
-                            # Decode using VQ-VAE: indices -> logits (compatible with different VQ-VAE implementations)
-                            logits = decode_indices_to_voxels(vqvae_model, indices_tensor, device)  # [1, 3, 32, 32, 32]
-                            logits_np = logits[0].detach().cpu().numpy()  # [3, 32, 32, 32]
+                            indices_grid = train_seq.reshape(grid_size_to_use, grid_size_to_use, grid_size_to_use)
+                            indices_tensor = torch.from_numpy(indices_grid).long().to(device)
                             
-                            # Convert logits to labels
-                            labels = np.argmax(logits_np, axis=0).astype(np.uint8)  # [32, 32, 32]
+                            logits = decode_indices_to_voxels(vqvae_model, indices_tensor, device)
+                            logits_np = logits[0].detach().cpu().numpy()
+                            labels = np.argmax(logits_np, axis=0).astype(np.uint8)
                             
-                            # Compute occupancy metrics
                             non_air_ratio, bbox_ratio = compute_decoder_occupancy(labels, air_class=0)
-
-                            # Save occupancy metrics
-                            with open(os.path.join(ep_dir, "decoder_occupancy.txt"), "w") as f_occ:
-                                f_occ.write("Decoder Occupancy Diagnostics (Generated Latent)\n")
-                                f_occ.write(f"  non_air_ratio        = {non_air_ratio:.6f}\n")
-                                f_occ.write(f"  bbox_volume_ratio    = {bbox_ratio:.6f}\n")
-                                f_occ.write("\n建議參考：\n")
-                                f_occ.write("  • non_air_ratio 接近 0 → 幾乎全空氣，代表 Transformer latent 掉出 tree manifold\n")
-                                f_occ.write("  • 可以跟 VQ-VAE 在真實資料上的平均 non_air_ratio 比較（約 ~0.02 左右）\n")
-                                f_occ.write("  • bbox_volume_ratio 很小 → 只剩一小撮點，疑似 collapsed blob\n")
+                            largest_component_ratio = compute_largest_component_ratio(labels, air_class=0)
                             
-                            # Save 3-view projection
-                            max_z = labels.max(axis=0)
-                            max_y = labels.max(axis=1)
-                            max_x = labels.max(axis=2)
-                            fig, axes = plt.subplots(1, 3, figsize=(9, 3))
-                            axes[0].imshow(max_z, cmap="viridis")
-                            axes[0].set_title("MaxProj Z (Y,X)")
-                            axes[1].imshow(max_y, cmap="viridis")
-                            axes[1].set_title("MaxProj Y (Z,X)")
-                            axes[2].imshow(max_x, cmap="viridis")
-                            axes[2].set_title("MaxProj X (Z,Y)")
-                            for ax in axes:
-                                ax.axis("off")
-                            fig.tight_layout()
-                            plt.savefig(os.path.join(ep_dir, "vae_projection.png"), dpi=140)
-                            plt.close(fig)
+                            train_non_air_ratios.append(non_air_ratio)
+                            train_bbox_ratios.append(bbox_ratio)
+                            train_largest_component_ratios.append(largest_component_ratio)
+                            progress.update(decode_task, advance=1)
+                        
+                        # Decode generated samples
+                        for gen_seq in gen_decode_samples:
+                            if len(gen_seq) != grid_size_to_use ** 3:
+                                progress.update(decode_task, advance=1)
+                                continue
+                            
+                            indices_grid = gen_seq.reshape(grid_size_to_use, grid_size_to_use, grid_size_to_use)
+                            indices_tensor = torch.from_numpy(indices_grid).long().to(device)
+                            
+                            logits = decode_indices_to_voxels(vqvae_model, indices_tensor, device)
+                            logits_np = logits[0].detach().cpu().numpy()
+                            labels = np.argmax(logits_np, axis=0).astype(np.uint8)
+                            
+                            non_air_ratio, bbox_ratio = compute_decoder_occupancy(labels, air_class=0)
+                            largest_component_ratio = compute_largest_component_ratio(labels, air_class=0)
+                            
+                            gen_non_air_ratios.append(non_air_ratio)
+                            gen_bbox_ratios.append(bbox_ratio)
+                            gen_largest_component_ratios.append(largest_component_ratio)
+                            progress.update(decode_task, advance=1)
+                    
+                    progress.remove_task(decode_task)
+                    
+                    # Convert to numpy arrays for statistics
+                    train_non_air_ratios = np.array(train_non_air_ratios)
+                    train_bbox_ratios = np.array(train_bbox_ratios)
+                    train_largest_component_ratios = np.array(train_largest_component_ratios)
+                    gen_non_air_ratios = np.array(gen_non_air_ratios)
+                    gen_bbox_ratios = np.array(gen_bbox_ratios)
+                    gen_largest_component_ratios = np.array(gen_largest_component_ratios)
+                    
+                    # Save CSV
+                    with open(os.path.join(ep_dir, "decoder_occupancy_distribution.csv"), "w", newline="") as f:
+                        w = csv.writer(f)
+                        w.writerow(["metric", "train_mean", "train_std", "gen_mean", "gen_std", "n_samples"])
+                        w.writerow(["non_air_ratio", f"{train_non_air_ratios.mean():.6f}", f"{train_non_air_ratios.std():.6f}",
+                                   f"{gen_non_air_ratios.mean():.6f}", f"{gen_non_air_ratios.std():.6f}", n_decode_samples])
+                        w.writerow(["bbox_volume_ratio", f"{train_bbox_ratios.mean():.6f}", f"{train_bbox_ratios.std():.6f}",
+                                   f"{gen_bbox_ratios.mean():.6f}", f"{gen_bbox_ratios.std():.6f}", n_decode_samples])
+                        w.writerow(["largest_component_ratio", f"{train_largest_component_ratios.mean():.6f}", f"{train_largest_component_ratios.std():.6f}",
+                                   f"{gen_largest_component_ratios.mean():.6f}", f"{gen_largest_component_ratios.std():.6f}", n_decode_samples])
+                    
+                    # Visualize non_air_ratio distribution (histogram: train vs gen)
+                    if len(train_non_air_ratios) > 0 and len(gen_non_air_ratios) > 0:
+                        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+                        
+                        # Histogram of non_air_ratio
+                        axes[0].hist(train_non_air_ratios, bins=50, alpha=0.7, label='Train', color='blue', edgecolor='black')
+                        axes[0].hist(gen_non_air_ratios, bins=50, alpha=0.7, label='Generated', color='red', edgecolor='black')
+                        axes[0].axvline(x=train_non_air_ratios.mean(), color='blue', linestyle='--', linewidth=2, label=f'Train Mean: {train_non_air_ratios.mean():.4f}')
+                        axes[0].axvline(x=gen_non_air_ratios.mean(), color='red', linestyle='--', linewidth=2, label=f'Gen Mean: {gen_non_air_ratios.mean():.4f}')
+                        axes[0].set_xlabel("non_air_ratio")
+                        axes[0].set_ylabel("Frequency")
+                        axes[0].set_title("non_air_ratio Distribution (Train vs Generated)")
+                        axes[0].legend()
+                        axes[0].grid(True, alpha=0.3)
+                        
+                        # Box plot comparison
+                        axes[1].boxplot([train_non_air_ratios, gen_non_air_ratios], labels=['Train', 'Generated'])
+                        axes[1].set_ylabel("non_air_ratio")
+                        axes[1].set_title("non_air_ratio Box Plot Comparison")
+                        axes[1].grid(True, alpha=0.3)
+                        
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(ep_dir, "non_air_ratio_distribution.png"), dpi=140)
+                        plt.close(fig)
 
-                            console.print(f"[dim]Decoded sample: non_air_ratio={non_air_ratio:.6f}, bbox_ratio={bbox_ratio:.6f}[/dim]")
+                    console.print(f"[dim]Decode quality distribution: train non_air={train_non_air_ratios.mean():.4f}±{train_non_air_ratios.std():.4f}, gen={gen_non_air_ratios.mean():.4f}±{gen_non_air_ratios.std():.4f}[/dim]")
 
                 # (5) Token Usage: Perplexity-like Metrics
                 # Compute perplexity-like metrics to measure grammar token variety
@@ -1741,22 +1787,9 @@ def main():
                     w.writerow(["effective_vocab_size", f"{train_ppl_metrics['effective_vocab_size']:.0f}", f"{gen_ppl_metrics['effective_vocab_size']:.0f}"])
                     w.writerow(["token_entropy", f"{train_ppl_metrics['token_entropy']:.6f}", f"{gen_ppl_metrics['token_entropy']:.6f}"])
                 
-                with open(os.path.join(ep_dir, "token_usage_metrics.txt"), "w") as f:
-                    f.write("Token Usage (Perplexity-like) Diagnostics\n")
-                    f.write(f"  Train perplexity = {train_ppl_metrics['perplexity']:.6f}\n")
-                    f.write(f"  Generated perplexity = {gen_ppl_metrics['perplexity']:.6f}\n")
-                    f.write(f"  Train effective vocab size = {train_ppl_metrics['effective_vocab_size']:.0f} / {args.codebook_size}\n")
-                    f.write(f"  Generated effective vocab size = {gen_ppl_metrics['effective_vocab_size']:.0f} / {args.codebook_size}\n")
-                    f.write(f"  Train token entropy = {train_ppl_metrics['token_entropy']:.6f}\n")
-                    f.write(f"  Generated token entropy = {gen_ppl_metrics['token_entropy']:.6f}\n")
-                    f.write("\n建議參考：\n")
-                    f.write("  • Perplexity 高 → token 使用多樣（grammar variety 高）\n")
-                    f.write("  • Perplexity 低 → token 使用集中（可能 collapse）\n")
-                    f.write("  • Effective vocab size 表示實際使用的 token 種類數\n")
-                
                 # (6) 若提供 VQ-VAE 模型：保存 token indices 樣本並解碼為 voxels
                 if vqvae_model is not None and samples_dir is not None:
-                    n_samples = 3
+                    n_samples = args.n_sample_images
                     grid_size_to_use = latent_grid_size if latent_grid_size is not None else 8
                     for sample_idx in range(n_samples):
                         with torch.no_grad():
@@ -1867,7 +1900,211 @@ def main():
                     w.writerow(["transition_js", f"{drift_metrics['transition_js']:.6f}"])
                 console.print(f"[dim]Analytics saved to {ep_dir}[/dim]")
                 current_kl = drift_metrics['transition_kl']
-                current_mmd = None  # MMD removed
+                
+                # (8) MMD and Coverage: Distance-based metrics between train and generated latents
+                # Collect larger sets for MMD/Coverage computation
+                n_train_samples = min(args.analytics_n_samples, len(train_sequences_collected))
+                n_gen_samples = min(args.analytics_n_samples, len(gen_samples_all))
+                
+                train_samples_mmd = train_sequences_collected[:n_train_samples]
+                gen_samples_mmd = gen_samples_all[:n_gen_samples]
+                
+                def compute_hamming_distance(seq1, seq2):
+                    """Compute normalized Hamming distance between two token sequences."""
+                    seq1 = np.asarray(seq1, dtype=np.int64)
+                    seq2 = np.asarray(seq2, dtype=np.int64)
+                    if len(seq1) != len(seq2):
+                        # Pad or truncate to same length
+                        min_len = min(len(seq1), len(seq2))
+                        seq1 = seq1[:min_len]
+                        seq2 = seq2[:min_len]
+                    # Normalized Hamming distance: fraction of positions that differ
+                    return float(np.mean(seq1 != seq2))
+                
+                def compute_cosine_distance_onehot(seq1, seq2, codebook_size):
+                    """Compute cosine distance using one-hot encoding."""
+                    seq1 = np.asarray(seq1, dtype=np.int64)
+                    seq2 = np.asarray(seq2, dtype=np.int64)
+                    
+                    # Create one-hot encodings
+                    onehot1 = np.zeros((len(seq1), codebook_size), dtype=np.float32)
+                    onehot2 = np.zeros((len(seq2), codebook_size), dtype=np.float32)
+                    
+                    # Set valid indices
+                    valid1 = (seq1 >= 0) & (seq1 < codebook_size)
+                    valid2 = (seq2 >= 0) & (seq2 < codebook_size)
+                    onehot1[np.arange(len(seq1))[valid1], seq1[valid1]] = 1.0
+                    onehot2[np.arange(len(seq2))[valid2], seq2[valid2]] = 1.0
+                    
+                    # Flatten and compute cosine distance
+                    vec1 = onehot1.flatten()
+                    vec2 = onehot2.flatten()
+                    
+                    # Normalize to unit vectors
+                    norm1 = np.linalg.norm(vec1)
+                    norm2 = np.linalg.norm(vec2)
+                    if norm1 == 0 or norm2 == 0:
+                        return 1.0  # Maximum distance if one is zero vector
+                    
+                    vec1 = vec1 / norm1
+                    vec2 = vec2 / norm2
+                    
+                    # Cosine distance = 1 - cosine similarity
+                    cosine_sim = np.dot(vec1, vec2)
+                    return float(1.0 - cosine_sim)
+                
+                def compute_mmd_coverage(train_samples, gen_samples, codebook_size, distance_type="hamming", epsilon=0.6, progress_obj=None, task_desc=None):
+                    """
+                    Compute MMD (mean minimum distance) and Coverage metrics.
+                    
+                    Args:
+                        train_samples: list of training token sequences
+                        gen_samples: list of generated token sequences
+                        codebook_size: size of codebook
+                        distance_type: "hamming" or "cosine_onehot"
+                        epsilon: threshold for coverage (distance < epsilon means "covered")
+                        progress_obj: optional Progress object for progress bar
+                        task_desc: optional task description for progress bar
+                    
+                    Returns:
+                        dict with mmd_mean, mmd_std, coverage_ratio, coverage_count
+                    """
+                    n_train = len(train_samples)
+                    n_gen = len(gen_samples)
+                    
+                    if n_train == 0 or n_gen == 0:
+                        return {
+                            "mmd_mean": 0.0,
+                            "mmd_std": 0.0,
+                            "coverage_ratio": 0.0,
+                            "coverage_count": 0,
+                        }
+                    
+                    # Compute distance function
+                    if distance_type == "hamming":
+                        dist_fn = compute_hamming_distance
+                    elif distance_type == "cosine_onehot":
+                        dist_fn = lambda s1, s2: compute_cosine_distance_onehot(s1, s2, codebook_size)
+                    else:
+                        raise ValueError(f"Unknown distance_type: {distance_type}")
+                    
+                    # Add progress bar if requested and sample size is large
+                    mmd_task = None
+                    if progress_obj is not None and task_desc is not None and n_train > 50:
+                        mmd_task = progress_obj.add_task(task_desc, total=n_train)
+                    
+                    # For each train sample, find minimum distance to any gen sample
+                    min_distances = []
+                    covered_count = 0
+                    
+                    for idx, train_seq in enumerate(train_samples):
+                        min_dist = float('inf')
+                        for gen_seq in gen_samples:
+                            dist = dist_fn(train_seq, gen_seq)
+                            min_dist = min(min_dist, dist)
+                        
+                        min_distances.append(min_dist)
+                        if min_dist < epsilon:
+                            covered_count += 1
+                        
+                        # Update progress
+                        if mmd_task is not None:
+                            progress_obj.update(mmd_task, advance=1)
+                    
+                    if mmd_task is not None:
+                        progress_obj.remove_task(mmd_task)
+                    
+                    mmd_mean = float(np.mean(min_distances))
+                    mmd_std = float(np.std(min_distances))
+                    coverage_ratio = float(covered_count) / float(n_train) if n_train > 0 else 0.0
+                    
+                    return {
+                        "mmd_mean": mmd_mean,
+                        "mmd_std": mmd_std,
+                        "coverage_ratio": coverage_ratio,
+                        "coverage_count": covered_count,
+                        "n_train": n_train,
+                        "n_gen": n_gen,
+                    }
+                
+                # Compute MMD and Coverage with Hamming distance
+                mmd_coverage_hamming = compute_mmd_coverage(
+                    train_samples_mmd, 
+                    gen_samples_mmd, 
+                    args.codebook_size, 
+                    distance_type="hamming",
+                    epsilon=0.6,
+                    progress_obj=progress,
+                    task_desc=f"[yellow]Computing MMD/Coverage (Hamming, {n_train_samples} train × {n_gen_samples} gen)"
+                )
+                
+                # Compute MMD and Coverage with Cosine distance (one-hot)
+                mmd_coverage_cosine = compute_mmd_coverage(
+                    train_samples_mmd, 
+                    gen_samples_mmd, 
+                    args.codebook_size, 
+                    distance_type="cosine_onehot",
+                    epsilon=0.6,
+                    progress_obj=progress,
+                    task_desc=f"[yellow]Computing MMD/Coverage (Cosine, {n_train_samples} train × {n_gen_samples} gen)"
+                )
+                
+                # Save MMD and Coverage metrics
+                mmd_coverage_csv = os.path.join(ep_dir, "mmd_coverage_metrics.csv")
+                with open(mmd_coverage_csv, "w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["metric", "hamming", "cosine_onehot"])
+                    w.writerow(["mmd_mean", f"{mmd_coverage_hamming['mmd_mean']:.6f}", f"{mmd_coverage_cosine['mmd_mean']:.6f}"])
+                    w.writerow(["mmd_std", f"{mmd_coverage_hamming['mmd_std']:.6f}", f"{mmd_coverage_cosine['mmd_std']:.6f}"])
+                    w.writerow(["coverage_ratio", f"{mmd_coverage_hamming['coverage_ratio']:.6f}", f"{mmd_coverage_cosine['coverage_ratio']:.6f}"])
+                    w.writerow(["coverage_count", mmd_coverage_hamming['coverage_count'], mmd_coverage_cosine['coverage_count']])
+                    w.writerow(["n_train", mmd_coverage_hamming['n_train'], mmd_coverage_cosine['n_train']])
+                    w.writerow(["n_gen", mmd_coverage_hamming['n_gen'], mmd_coverage_cosine['n_gen']])
+                    w.writerow(["epsilon", "0.6", "0.6"])
+                
+                # Visualize MMD distribution
+                # Compute sample of pairwise distances for visualization (limit to 100 samples for efficiency)
+                viz_train_size = min(100, n_train_samples)
+                viz_gen_size = min(100, n_gen_samples)
+                hamming_dists_all = []
+                for train_seq in train_samples_mmd[:viz_train_size]:
+                    min_dists = []
+                    for gen_seq in gen_samples_mmd[:viz_gen_size]:
+                        dist = compute_hamming_distance(train_seq, gen_seq)
+                        min_dists.append(dist)
+                    hamming_dists_all.extend(min_dists)
+                
+                if len(hamming_dists_all) > 0:
+                    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+                    
+                    # Histogram of distances
+                    axes[0].hist(hamming_dists_all, bins=50, alpha=0.7, color='blue', edgecolor='black')
+                    axes[0].axvline(x=mmd_coverage_hamming['mmd_mean'], color='red', linestyle='--', linewidth=2, label=f"MMD Mean: {mmd_coverage_hamming['mmd_mean']:.4f}")
+                    axes[0].axvline(x=0.6, color='green', linestyle='--', linewidth=2, label=f"Coverage Threshold: 0.6")
+                    axes[0].set_xlabel("Hamming Distance")
+                    axes[0].set_ylabel("Frequency")
+                    axes[0].set_title(f"Distance Distribution (Hamming, {viz_train_size}x{viz_gen_size} samples)")
+                    axes[0].legend()
+                    axes[0].grid(True, alpha=0.3)
+                    
+                    # Coverage comparison
+                    axes[1].bar(['Hamming', 'Cosine'], 
+                               [mmd_coverage_hamming['coverage_ratio'], mmd_coverage_cosine['coverage_ratio']],
+                               color=['blue', 'orange'], alpha=0.7)
+                    axes[1].set_ylabel("Coverage Ratio")
+                    axes[1].set_title("Coverage Comparison")
+                    axes[1].set_ylim([0, 1])
+                    axes[1].grid(True, alpha=0.3)
+                    
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(ep_dir, "mmd_coverage_visualization.png"), dpi=140)
+                    plt.close(fig)
+                
+                # Store for summary CSV and console output
+                current_mmd_hamming = mmd_coverage_hamming['mmd_mean']
+                current_coverage_hamming = mmd_coverage_hamming['coverage_ratio']
+                current_mmd_cosine = mmd_coverage_cosine['mmd_mean']
+                current_coverage_cosine = mmd_coverage_cosine['coverage_ratio']
 
                 # Create transition matrix comparison plots (already done in token grammar section)
                 # Transition matrices are visualized in token_transition_histogram.png
@@ -1897,21 +2134,31 @@ def main():
                         except Exception as e:
                             console.print(f"[yellow]Warning:[/yellow] Failed to parse grammar_strength_metrics.csv: {e}")
                     
-                    # 讀取 decoder_occupancy.txt
-                    occ_file = os.path.join(ep_dir, "decoder_occupancy.txt")
+                    # 讀取 decoder_occupancy_distribution.csv
+                    occ_file = os.path.join(ep_dir, "decoder_occupancy_distribution.csv")
                     if os.path.exists(occ_file):
                         try:
-                            import re
-                            with open(occ_file, "r") as f:
-                                content = f.read()
-                                non_air_match = re.search(r"non_air_ratio\s*=\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)", content)
-                                bbox_match = re.search(r"bbox_volume_ratio\s*=\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)", content)
-                                if non_air_match:
-                                    row["non_air_ratio"] = float(non_air_match.group(1))
-                                if bbox_match:
-                                    row["bbox_volume_ratio"] = float(bbox_match.group(1))
+                            with open(occ_file, "r", newline="") as f:
+                                reader = csv.DictReader(f)
+                                for r in reader:
+                                    metric = r.get("metric", "").strip()
+                                    if metric == "non_air_ratio":
+                                        row["non_air_ratio_train_mean"] = float(r.get("train_mean", "")) if r.get("train_mean") else ""
+                                        row["non_air_ratio_train_std"] = float(r.get("train_std", "")) if r.get("train_std") else ""
+                                        row["non_air_ratio_gen_mean"] = float(r.get("gen_mean", "")) if r.get("gen_mean") else ""
+                                        row["non_air_ratio_gen_std"] = float(r.get("gen_std", "")) if r.get("gen_std") else ""
+                                    elif metric == "bbox_volume_ratio":
+                                        row["bbox_volume_ratio_train_mean"] = float(r.get("train_mean", "")) if r.get("train_mean") else ""
+                                        row["bbox_volume_ratio_train_std"] = float(r.get("train_std", "")) if r.get("train_std") else ""
+                                        row["bbox_volume_ratio_gen_mean"] = float(r.get("gen_mean", "")) if r.get("gen_mean") else ""
+                                        row["bbox_volume_ratio_gen_std"] = float(r.get("gen_std", "")) if r.get("gen_std") else ""
+                                    elif metric == "largest_component_ratio":
+                                        row["largest_component_ratio_train_mean"] = float(r.get("train_mean", "")) if r.get("train_mean") else ""
+                                        row["largest_component_ratio_train_std"] = float(r.get("train_std", "")) if r.get("train_std") else ""
+                                        row["largest_component_ratio_gen_mean"] = float(r.get("gen_mean", "")) if r.get("gen_mean") else ""
+                                        row["largest_component_ratio_gen_std"] = float(r.get("gen_std", "")) if r.get("gen_std") else ""
                         except Exception as e:
-                            console.print(f"[yellow]Warning:[/yellow] Failed to parse decoder_occupancy.txt: {e}")
+                            console.print(f"[yellow]Warning:[/yellow] Failed to parse decoder_occupancy_distribution.csv: {e}")
                     
                     # 讀取 grid_autocorrelation_metrics.csv
                     autocorr_file = os.path.join(ep_dir, "grid_autocorrelation_metrics.csv")
@@ -1974,8 +2221,6 @@ def main():
                                         row["sample_diversity"] = float(value) if value else ""
                                         # Store for history CSV
                                         current_sample_diversity = float(value) if value else None
-                                    elif metric == "avg_edit_distance":
-                                        row["avg_edit_distance"] = float(value) if value else ""
                                     elif metric == "unique_tokens":
                                         row["unique_tokens"] = int(value) if value else ""
                                     elif metric == "token_coverage":
@@ -2031,6 +2276,35 @@ def main():
                         except Exception as e:
                             console.print(f"[yellow]Warning:[/yellow] Failed to parse token_usage_metrics.csv: {e}")
                     
+                    # 讀取 mmd_coverage_metrics.csv
+                    mmd_coverage_file = os.path.join(ep_dir, "mmd_coverage_metrics.csv")
+                    if os.path.exists(mmd_coverage_file):
+                        try:
+                            with open(mmd_coverage_file, "r", newline="") as f:
+                                reader = csv.DictReader(f)
+                                for r in reader:
+                                    metric = r.get("metric", "").strip()
+                                    hamming_val = r.get("hamming", "").strip()
+                                    cosine_val = r.get("cosine_onehot", "").strip()
+                                    if metric == "mmd_mean":
+                                        row["mmd_mean_hamming"] = float(hamming_val) if hamming_val else ""
+                                        row["mmd_mean_cosine"] = float(cosine_val) if cosine_val else ""
+                                    elif metric == "mmd_std":
+                                        row["mmd_std_hamming"] = float(hamming_val) if hamming_val else ""
+                                        row["mmd_std_cosine"] = float(cosine_val) if cosine_val else ""
+                                    elif metric == "coverage_ratio":
+                                        row["coverage_ratio_hamming"] = float(hamming_val) if hamming_val else ""
+                                        row["coverage_ratio_cosine"] = float(cosine_val) if cosine_val else ""
+                                    elif metric == "coverage_count":
+                                        row["coverage_count_hamming"] = int(hamming_val) if hamming_val else ""
+                                        row["coverage_count_cosine"] = int(cosine_val) if cosine_val else ""
+                                    elif metric == "n_train":
+                                        row["mmd_n_train"] = int(hamming_val) if hamming_val else ""
+                                    elif metric == "n_gen":
+                                        row["mmd_n_gen"] = int(hamming_val) if hamming_val else ""
+                        except Exception as e:
+                            console.print(f"[yellow]Warning:[/yellow] Failed to parse mmd_coverage_metrics.csv: {e}")
+                    
                     # 處理匯總 CSV：讀取現有數據，合併新欄位，追加新行
                     file_exists = os.path.exists(analytics_summary_csv)
                     existing_rows = []
@@ -2043,10 +2317,61 @@ def main():
                             existing_fields = list(reader.fieldnames) if reader.fieldnames else []
                             existing_rows = list(reader)
                     
-                    # 確定所有欄位（epoch 在前，其他按字母順序）
+                    # 確定所有欄位（使用指定的順序）
                     all_fields = set(existing_fields) if existing_fields else set()
                     all_fields.update(row.keys())
-                    all_fields_sorted = ["epoch"] + sorted([f for f in all_fields if f != "epoch"])
+                    
+                    # 定義字段順序（用戶指定）
+                    field_order = [
+                        "epoch",
+                        # Decode quality metrics
+                        "non_air_ratio_train_mean",
+                        "non_air_ratio_train_std",
+                        "bbox_volume_ratio_train_mean",
+                        "bbox_volume_ratio_train_std",
+                        "largest_component_ratio_train_mean",
+                        "largest_component_ratio_train_std",
+                        # MMD/Coverage metrics
+                        "coverage_ratio_hamming",
+                        "coverage_count_hamming",
+                        "mmd_mean_hamming",
+                        "mmd_std_hamming",
+                        # Sample diversity metrics
+                        "sample_diversity",
+                        "unique_tokens",
+                        "token_coverage",
+                        # Auto-correlation metrics
+                        "autocorr_difference",
+                        "gen_mean_autocorrelation",
+                        "train_mean_autocorrelation",
+                        # Transition metrics
+                        "transition_entropy_diff",
+                        "transition_kl",
+                        "transition_js",
+                        "transition_l1",
+                        "gen_avg_transition_entropy",
+                        "train_avg_transition_entropy",
+                        # Token usage metrics
+                        "gen_token_entropy",
+                        "train_token_entropy",
+                        "gen_perplexity",
+                        "train_perplexity",
+                        "gen_effective_vocab_size",
+                        "train_effective_vocab_size",
+                    ]
+                    
+                    # 按照指定順序排列，未列出的字段放在最後（按字母順序）
+                    ordered_fields = []
+                    remaining_fields = set(all_fields)
+                    
+                    for field in field_order:
+                        if field in remaining_fields:
+                            ordered_fields.append(field)
+                            remaining_fields.remove(field)
+                    
+                    # 添加剩餘字段（按字母順序）
+                    ordered_fields.extend(sorted(remaining_fields))
+                    all_fields_sorted = ordered_fields
                     
                     # 重寫整個文件（包含新行）
                     with open(analytics_summary_csv, "w", newline="") as f:
@@ -2067,8 +2392,10 @@ def main():
             best_marker = " | ★ Best!" if is_best else ""
             drift_str = f" | TransKL={current_kl:.6f}" if current_kl is not None else ""
             token_coverage_str = f" | TokenCov={current_token_coverage:.4f}" if current_token_coverage is not None else ""
+            mmd_str = f" | MMD_H={current_mmd_hamming:.4f}" if current_mmd_hamming is not None else ""
+            coverage_str = f" | Cov_H={current_coverage_hamming:.3f}" if current_coverage_hamming is not None else ""
             console.print(
-                f"Epoch {epoch:03d}: train={train_loss:.6f} | val={val_loss:.6f}{drift_str}{token_coverage_str} | {dt:.1f}s{best_marker}"
+                f"Epoch {epoch:03d}: train={train_loss:.6f} | val={val_loss:.6f}{drift_str}{token_coverage_str}{mmd_str}{coverage_str} | {dt:.1f}s{best_marker}"
             )
 
             # History
@@ -2081,6 +2408,10 @@ def main():
                 "token_coverage": f"{current_token_coverage:.6f}" if current_token_coverage is not None else "",
                 "sample_diversity": f"{current_sample_diversity:.6f}" if current_sample_diversity is not None else "",
                 "transition_entropy_diff": f"{current_transition_entropy_diff:.6f}" if current_transition_entropy_diff is not None else "",
+                "mmd_hamming": f"{current_mmd_hamming:.6f}" if current_mmd_hamming is not None else "",
+                "coverage_hamming": f"{current_coverage_hamming:.6f}" if current_coverage_hamming is not None else "",
+                "mmd_cosine": f"{current_mmd_cosine:.6f}" if current_mmd_cosine is not None else "",
+                "coverage_cosine": f"{current_coverage_cosine:.6f}" if current_coverage_cosine is not None else "",
                 "epoch_time_secs": f"{dt:.2f}",
                 "cumulative_time_secs": f"{cum_secs:.2f}",
                 "is_best": "TRUE" if is_best else "FALSE",
