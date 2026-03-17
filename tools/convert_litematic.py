@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+""" 使用範例：
+python /Users/kylelin/projects/MineTree/treevox/tools/convert_litematic.py \
+  --in /Users/kylelin/projects/MineTree/dataset/ds_260228/ds_260228_stage_1_replace_log \
+  --out  /Users/kylelin/projects/MineTree/dataset/ds_260228/ds_260228_stage_2_remove_leaves  \
+  --mode replace \
+  --target minecraft:air \
+  --sources minecraft:oak_leaves,minecraft:jungle_leaves
+"""
+
 """
 批量處理 .litematic 檔：
 1) 來源方塊清單可自訂（--sources），不只樹葉。
 2) 兩種模式：
    - persistent：把來源方塊設為 persistent=true（保留其他屬性）
    - replace   ：把來源方塊整塊替換成 --target 指定的方塊
-3) 固定輸出尺寸為 32x32x32：
+3) 輸出尺寸可自訂（預設 32x32x32，可用 --size 指定）：
    - X/Z 水平置中：不足補空氣，超過以中心為基準裁切
-   - Y 只往上補空氣；若超過 32，保留底部 32 層（自上方裁切）
+   - Y 只往上補空氣；若超過目標高度，保留底部指定層數（自上方裁切）
 4) 檔名規則：tree-0001.litematic -> tree-001-<suffix>.litematic
    - 無數字則 <原名>-<suffix>.litematic
 5) 一定輸出（不論是否有修改）
@@ -21,9 +31,12 @@
    - 注意：如果原始文件缺少 Entities/TileEntities 鍵（表示沒有實體數據），
      會自動跳過實體清除步驟，因為沒有實體需要處理
 8) 跳過超尺寸：
-   - --skip-if-oversize 當任一 Region 大於 32x32x32 且需要裁切時，整檔跳過不輸出
-9) 遞迴搜尋所有子資料夾，並保持輸出資料夾結構與輸入資料夾結構相同
-10) 錯誤處理：
+   - --skip-if-oversize 當任一 Region 大於指定尺寸且需要裁切時，整檔跳過不輸出
+9) 自訂輸出尺寸：
+   - --size 可指定輸出尺寸，格式：XxYxZ（例如 64x64x64）或 X,Y,Z（例如 64,64,64）
+   - 預設為 32x32x32
+10) 遞迴搜尋所有子資料夾，並保持輸出資料夾結構與輸入資料夾結構相同
+11) 錯誤處理：
     - --verbose-errors：顯示詳細的錯誤堆棧跟踪信息（用於調試）
     - 默認只顯示簡單錯誤信息（文件名: 錯誤消息）
 
@@ -64,7 +77,7 @@ DEFAULT_SOURCE_BLOCK_IDS = {
     "minecraft:cherry_leaves",
 }
 AIR = BlockState("minecraft:air")
-TARGET_SIZE = (32, 32, 32)
+DEFAULT_TARGET_SIZE = (32, 32, 32)
 NAME_NUMERIC_RE = re.compile(r"(.*?)(\d+)(\.litematic)$", re.IGNORECASE)
 
 
@@ -74,24 +87,83 @@ def parse_sources(arg_val: str | None) -> set[str]:
     --sources 的解析：
     - None：使用預設樹葉集合
     - "id1,id2,id3"：逗號分隔的方塊 ID
-    - "@/path/to/list.txt"：每行一個方塊 ID，# 開頭為註解
+    - "@/path/to/list.txt" 或 "/absolute/path/to/list.txt"：每行一個方塊 ID，# 開頭為註解
+      支持相對路徑和絕對路徑，絕對路徑會自動解析
     """
     if arg_val is None:
         return set(DEFAULT_SOURCE_BLOCK_IDS)
 
+    # 去除首尾空格（處理用戶輸入時可能誤加的空格）
+    arg_val = arg_val.strip()
+
+    # 檢查是否為文件路徑（以 @ 開頭，或是絕對路徑）
+    file_path = None
     if arg_val.startswith("@"):
-        p = Path(arg_val[1:]).expanduser().resolve()
+        # @ 前綴格式：@/path/to/file.txt 或 @./relative/path.txt
+        # 去除 @ 後也要去除可能的空格
+        path_str = arg_val[1:].strip()
+        file_path = Path(path_str)
+    else:
+        # 檢查是否為絕對路徑（以 / 開頭，或 Windows 的 C:\ 等）
+        test_path = Path(arg_val)
+        # 如果是絕對路徑（Unix: / 開頭，Windows: C:\ 等），視為文件路徑
+        if test_path.is_absolute():
+            file_path = test_path
+        # 如果是相對路徑且文件存在，也視為文件路徑
+        elif test_path.is_file():
+            file_path = test_path
+    
+    if file_path is not None:
+        # 解析路徑：展開 ~ 並解析為絕對路徑
+        p = file_path.expanduser().resolve()
         if not p.is_file():
-            raise FileNotFoundError(f"來源清單檔不存在：{p}")
+            raise FileNotFoundError(f"來源清單檔不存在：{p}（原始輸入：{arg_val}）")
         ids = set()
-        for line in p.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            ids.add(line)
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                ids.add(line)
+        except Exception as e:
+            raise IOError(f"讀取來源清單檔失敗：{p}（錯誤：{e}）")
+        if not ids:
+            raise ValueError(f"來源清單檔為空或無有效內容：{p}")
         return ids
 
+    # 否則視為逗號分隔的方塊 ID 列表
     return {s.strip() for s in arg_val.split(",") if s.strip()}
+
+
+def parse_size(arg_val: str | None) -> Tuple[int, int, int]:
+    """
+    --size 的解析：
+    - None：使用預設 32x32x32
+    - "XxYxZ"：例如 "64x64x64" 或 "16x32x16"
+    - "X,Y,Z"：逗號分隔，例如 "64,64,64"
+    """
+    if arg_val is None:
+        return DEFAULT_TARGET_SIZE
+    
+    # 嘗試 "XxYxZ" 格式
+    if "x" in arg_val.lower():
+        parts = arg_val.lower().split("x")
+        if len(parts) == 3:
+            try:
+                return (int(parts[0]), int(parts[1]), int(parts[2]))
+            except ValueError:
+                raise ValueError(f"無效的尺寸格式：{arg_val}（應為 XxYxZ，例如 64x64x64）")
+    
+    # 嘗試 "X,Y,Z" 格式
+    if "," in arg_val:
+        parts = arg_val.split(",")
+        if len(parts) == 3:
+            try:
+                return (int(parts[0].strip()), int(parts[1].strip()), int(parts[2].strip()))
+            except ValueError:
+                raise ValueError(f"無效的尺寸格式：{arg_val}（應為 X,Y,Z，例如 64,64,64）")
+    
+    raise ValueError(f"無效的尺寸格式：{arg_val}（應為 XxYxZ 或 X,Y,Z，例如 64x64x64 或 64,64,64）")
 
 
 def build_output_name(src_name: str, suffix: str) -> str:
@@ -249,17 +321,17 @@ def transform_palette_in_region(region: Region, mode: str, source_ids: set[str],
     region.filter(lambda bs: map_blockstate(bs, mode, source_ids, target_id))
 
 
-# ========================= 32x32x32 重製（用 range_* 真座標） =========================
-def crop_or_pad_to_32(region: Region) -> Region:
+# ========================= 自訂尺寸重製（用 range_* 真座標） =========================
+def crop_or_pad_to_size(region: Region, target_size: Tuple[int, int, int]) -> Region:
     """
-    產生新的 32x32x32 Region：
+    產生新的指定尺寸 Region：
       * X/Z 置中補空氣或置中裁切
-      * Y 往上補空氣或從上方裁切（保留底部 32）
+      * Y 往上補空氣或從上方裁切（保留底部 target_size[1]）
     使用 range_x/y/z 取得真實座標，避免負尺寸/反向座標造成全空氣。
     """
     rx, ry, rz = region_ranges(region)
     sx, sy, sz = len(rx), len(ry), len(rz)
-    tx, ty, tz = TARGET_SIZE
+    tx, ty, tz = target_size
 
     def calc_span(src_n: int, tgt_n: int, center: bool) -> tuple[int, int, int]:
         """回傳 (src_start_idx, src_end_idx, dst_start_idx) —— 針對 rx/ry/rz 的 index 範圍。"""
@@ -270,12 +342,12 @@ def crop_or_pad_to_32(region: Region) -> Region:
             src_start = (src_n - tgt_n) // 2 if center else 0
             return src_start, src_start + tgt_n, 0
 
-    # X/Z 置中；Y 自底開始（>32 僅保留底下 32）
+    # X/Z 置中；Y 自底開始（超過目標高度僅保留底部）
     ix0, ix1, dx0 = calc_span(sx, tx, center=True)
     iz0, iz1, dz0 = calc_span(sz, tz, center=True)
     iy0, iy1, dy0 = (0, min(sy, ty), 0)
 
-    # 建目標 32³ 區域
+    # 建目標區域
     new_reg = make_region(tx, ty, tz)
 
     # 先填空氣（陣列語法；setblock 已棄用）
@@ -474,6 +546,7 @@ def process_one_file(
     src_root: Path | None = None,  # 新增：來源根目錄，用於計算相對路徑
     dst_root: Path | None = None,  # 新增：輸出根目錄，用於鏡像結構
     verbose_errors: bool = False,  # 是否顯示詳細錯誤信息
+    target_size: Tuple[int, int, int] = DEFAULT_TARGET_SIZE,  # 目標尺寸
 ) -> tuple[str, str]:
     """
     回傳 (status, 訊息/路徑)
@@ -484,18 +557,19 @@ def process_one_file(
         schem, has_entities = safe_load_schematic(src)
 
         # 若設定跳過超尺寸，且這次又會裁切（沒有 keep_original_regions），就直接跳過不輸出
-        if skip_if_oversize and not keep_original_regions and is_oversize(schem, TARGET_SIZE):
-            return "skip", f"{src.name}: skipped due to oversize (>32³)"
+        if skip_if_oversize and not keep_original_regions and is_oversize(schem, target_size):
+            tx, ty, tz = target_size
+            return "skip", f"{src.name}: skipped due to oversize (>{tx}×{ty}×{tz})"
 
         # palette 級別轉換
         for region in schem.regions.values():
             transform_palette_in_region(region, mode, source_ids, target_id)
 
-        # 固定 32x32x32：逐 key 覆蓋（不可對 schem.regions 整體賦值）
+        # 固定為目標尺寸：逐 key 覆蓋（不可對 schem.regions 整體賦值）
         if not keep_original_regions:
             for name in list(schem.regions.keys()):
                 old_reg = schem.regions[name]
-                schem.regions[name] = crop_or_pad_to_32(old_reg)
+                schem.regions[name] = crop_or_pad_to_size(old_reg, target_size)
 
         # 清除實體（若指定且文件有實體數據）
         removed = 0
@@ -540,7 +614,7 @@ def iter_litematics(indir: Path) -> Iterable[Path]:
 
 # ========================= CLI 主程式 =========================
 def main():
-    ap = argparse.ArgumentParser(description="批量修改 .litematic，並轉成 32x32x32（遞迴搜尋所有子資料夾並保持結構）")
+    ap = argparse.ArgumentParser(description="批量修改 .litematic，並轉成指定尺寸（預設 32x32x32，遞迴搜尋所有子資料夾並保持結構）")
     ap.add_argument("--in", dest="indir", required=True, help="來源資料夾（會遞迴搜尋所有子資料夾）")
     ap.add_argument("--out", dest="outdir", required=True, help="輸出資料夾（會鏡像來源資料夾的子資料夾結構）")
     ap.add_argument(
@@ -552,7 +626,7 @@ def main():
     ap.add_argument(
         "--sources",
         default=None,
-        help="來源方塊清單：逗號分隔的方塊ID，或 '@檔案路徑'（每行一個）。未提供則使用 8 種樹葉。",
+        help="來源方塊清單：逗號分隔的方塊ID，或 '@檔案路徑'/'絕對路徑'（每行一個方塊ID，#開頭為註解）。未提供則使用 8 種樹葉。",
     )
     ap.add_argument(
         "--target",
@@ -561,9 +635,14 @@ def main():
     )
     ap.add_argument("--suffix", default=None, help="輸出檔名要附加的字串（例：mytag），未提供則維持原檔名。")
     ap.add_argument(
+        "--size",
+        default=None,
+        help="輸出尺寸，格式：XxYxZ（例如 64x64x64）或 X,Y,Z（例如 64,64,64）。預設為 32x32x32。",
+    )
+    ap.add_argument(
         "--keep-original-regions",
         action="store_true",
-        help="保留原 Region 尺寸（不轉 32x32x32）。預設會轉。",
+        help="保留原 Region 尺寸（不轉為指定尺寸）。預設會轉。",
     )
     # 清除實體選項（互斥）
     ap.add_argument("--strip-entities", action="store_true", help="清除所有實體（entities 與 tile entities）")
@@ -574,7 +653,7 @@ def main():
     ap.add_argument(
         "--skip-if-oversize",
         action="store_true",
-        help="若任一 Region 超過 32x32x32 且會裁切，則整檔跳過不輸出",
+        help="若任一 Region 超過指定尺寸且會裁切，則整檔跳過不輸出",
     )
 
     # 詳細錯誤信息
@@ -609,16 +688,21 @@ def main():
         raise SystemExit(f"來源資料夾不存在：{indir}")
 
     source_ids = parse_sources(args.sources)
+    target_size = parse_size(args.size)
 
     files = list(iter_litematics(indir))
     if not files:
         raise SystemExit(f"來源資料夾及其子資料夾內找不到 .litematic：{indir}")
 
+    tx, ty, tz = target_size
     rprint(f"[bold]模式[/bold]: {args.mode}")
     rprint(f"[bold]來源方塊數[/bold]: {len(source_ids)}")
     rprint(f"[bold]來源資料夾[/bold]: {indir}")
     rprint(f"[bold]輸出資料夾[/bold]: {outdir}")
-    rprint(f"[bold]固定輸出尺寸[/bold]: 32x32x32  (除非指定 --keep-original-regions)")
+    if args.keep_original_regions:
+        rprint(f"[bold]輸出尺寸[/bold]: 保留原始尺寸")
+    else:
+        rprint(f"[bold]固定輸出尺寸[/bold]: {tx}×{ty}×{tz}")
     if args.suffix:
         rprint(f"[bold]輸出檔名 suffix[/bold]: {args.suffix}")
     if args.mode == "replace":
@@ -626,7 +710,7 @@ def main():
     if strip_mode != "none":
         rprint(f"[bold yellow]將清除實體：{strip_mode}[/bold yellow]")
     if args.skip_if_oversize and not args.keep_original_regions:
-        rprint(f"[bold yellow]遇到超過 32³ 的檔案將跳過[/bold yellow]")
+        rprint(f"[bold yellow]遇到超過 {tx}×{ty}×{tz} 的檔案將跳過[/bold yellow]")
     rprint()
 
     ok, fail, skipped = 0, 0, 0
@@ -660,6 +744,7 @@ def main():
                 src_root=indir,  # 傳入來源根目錄
                 dst_root=outdir,  # 傳入輸出根目錄
                 verbose_errors=args.verbose_errors,  # 傳入詳細錯誤選項
+                target_size=target_size,  # 傳入目標尺寸
             )
             if status == "ok":
                 ok += 1
