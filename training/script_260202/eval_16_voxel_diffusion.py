@@ -8,10 +8,13 @@
 - 層次 C：前幾個樣本的完整動力學軌跡（用於畫 divergence 圖）
 
 輸出文件：
-- eval_batch.csv: 每個樣本的指標（層次 A）
-- eval_summary.csv: 統計摘要（層次 B）
+- simple_result.csv: 每個樣本的指標（層次 A）
+- simple_summary.csv: 統計摘要（層次 B）
+- dynamics_result.csv: 前幾個樣本的最終結果（層次 C）
+- dynamics_summary.csv: 前幾個樣本的統計摘要（層次 C）
 - dynamics_trace.csv: 前幾個樣本的完整軌跡（層次 C）
-- divergence_plot.png: 可視化圖表
+- dynamics_divergence_plot.png: 可視化圖表
+- dynamics_timing_distribution_plot.png: t_emerge / t_lockin 分布圖
 
 使用方式:
   python eval_16_voxel_diffusion.py --checkpoint <path/to/checkpoint.pt> --n_samples 100
@@ -22,6 +25,7 @@ import os
 import math
 import time
 import random
+import shlex
 from datetime import datetime
 import numpy as np
 import torch
@@ -164,21 +168,53 @@ def compute_dynamics_metrics(labels: np.ndarray, t_int: int) -> Dict:
     return metrics
 
 
-def compute_t_emerge_and_t_commit(sample_trace_data: List[Dict]) -> Tuple[Optional[int], Optional[int]]:
+def decode_probs_to_labels(probs: torch.Tensor, log_mask_threshold: Optional[float] = None) -> np.ndarray:
     """
-    計算 t_emerge 和 t_commit。
+    Decode class probabilities into discrete labels.
+    
+    Args:
+        probs: [3, 16, 16, 16] class probabilities (air=0, log=1, leaf=2)
+        log_mask_threshold: if provided, use threshold-based log mask decoding.
+            - log if P(log) >= threshold
+            - otherwise choose between air/leaf by argmax on [P(air), P(leaf)]
+            if None, use full argmax over 3 classes.
+    
+    Returns:
+        labels: [16, 16, 16] uint8 in {0,1,2}
+    """
+    if log_mask_threshold is None:
+        return probs.argmax(dim=0).cpu().numpy().astype(np.uint8)
+    
+    labels = probs.argmax(dim=0).cpu().numpy().astype(np.uint8)
+    
+    probs_np = probs.detach().cpu().numpy()
+    log_mask = probs_np[1] >= float(log_mask_threshold)
+    
+    # For non-log voxels, keep only air/leaf decision.
+    non_log_mask = ~log_mask
+    if np.any(non_log_mask):
+        air_or_leaf = np.argmax(probs_np[[0, 2]], axis=0)  # 0->air, 1->leaf
+        labels[non_log_mask] = np.where(air_or_leaf[non_log_mask] == 0, 0, 2)
+    
+    labels[log_mask] = 1
+    return labels
+
+
+def compute_t_emerge_and_t_lockin(sample_trace_data: List[Dict]) -> Tuple[Optional[int], Optional[int]]:
+    """
+    計算 t_emerge 和 t_lockin。
     
     Args:
         sample_trace_data: List of trace data for a single sample, sorted by t (descending)
     
     Returns:
-        Tuple of (t_emerge, t_commit), both can be None if not found
+        Tuple of (t_emerge, t_lockin), both can be None if not found
     """
     # Sort by t descending (from high to low, i.e., 1000 -> 0)
     sorted_data = sorted(sample_trace_data, key=lambda x: x['t'], reverse=True)
     
     t_emerge = None
-    t_commit = None
+    t_lockin = None
     
     # Find t_emerge: base_connected_size > 10, consecutive two records, and log_size < 100
     for i in range(len(sorted_data) - 1):
@@ -197,47 +233,22 @@ def compute_t_emerge_and_t_commit(sample_trace_data: List[Dict]) -> Tuple[Option
                 t_emerge = r2['t']
                 break
     
-    # Find t_commit: t_emerge exists, base_connected_ratio >= 0.8, consecutive two records, and log_size < 100
-    if t_emerge is not None:
-        # Only check records after t_emerge (t <= t_emerge, since t decreases)
-        for i in range(len(sorted_data) - 1):
-            r1 = sorted_data[i]
-            r2 = sorted_data[i + 1]
-            
-            # Only consider records at or after t_emerge
-            if r1['t'] > t_emerge or r2['t'] > t_emerge:
-                continue
-            
-            log_size1 = r1.get('Log_Size', 0)
-            log_size2 = r2.get('Log_Size', 0)
-            
-            # Calculate base_connected_ratio (use Base_Connected_Ratio if available, otherwise calculate)
-            if 'Base_Connected_Ratio' in r1:
-                ratio1 = r1['Base_Connected_Ratio']
-            else:
-                total_log_size1 = r1.get('Total_Log_Size', r1.get('Log_Size', 0))
-                if total_log_size1 > 0:
-                    ratio1 = r1.get('Base_Connected_Size', 0) / total_log_size1
-                else:
-                    ratio1 = 0.0
-            
-            if 'Base_Connected_Ratio' in r2:
-                ratio2 = r2['Base_Connected_Ratio']
-            else:
-                total_log_size2 = r2.get('Total_Log_Size', r2.get('Log_Size', 0))
-                if total_log_size2 > 0:
-                    ratio2 = r2.get('Base_Connected_Size', 0) / total_log_size2
-                else:
-                    ratio2 = 0.0
-            
-            # Check conditions: log_size < 100 and base_connected_ratio >= 0.8 for both records
-            if log_size1 < 100 and log_size2 < 100:
-                if ratio1 >= 0.8 and ratio2 >= 0.8:
-                    # Use the earlier t (smaller t value, which is r2 since sorted descending)
-                    t_commit = r2['t']
-                    break
+    # Find t_lockin:
+    # lock-in time = from this timestep onward, Is_Main_Trunk_Broken no longer flips
+    if sorted_data:
+        states = [bool(r.get('Is_Main_Trunk_Broken', False)) for r in sorted_data]
+        last_flip_idx = None
+        for i in range(len(states) - 1):
+            if states[i] != states[i + 1]:
+                last_flip_idx = i
+        if last_flip_idx is None:
+            # Never flips across tracked trajectory, lock-in starts at the earliest tracked timestep
+            t_lockin = sorted_data[0]['t']
+        else:
+            # Flip happens between i and i+1; lock-in starts at i+1 (smaller t)
+            t_lockin = sorted_data[last_flip_idx + 1]['t']
     
-    return t_emerge, t_commit
+    return t_emerge, t_lockin
 
 
 def load_model(checkpoint_path: str, device: torch.device) -> Tuple[nn.Module, Dict]:
@@ -286,6 +297,7 @@ def batch_evaluation(
     exp_name: Optional[str] = None,
     save_projections: bool = True,
     save_npz: bool = False,
+    log_mask_threshold: Optional[float] = None,
     console: Optional[Console] = None,
 ) -> Tuple[List[Dict], float]:
     """
@@ -303,6 +315,7 @@ def batch_evaluation(
         exp_name: experiment name for projection titles (optional)
         save_projections: whether to save 3-view projections (default: True)
         save_npz: whether to save npz files for each sample (default: False)
+        log_mask_threshold: decode with log mask threshold if set; otherwise use argmax
         console: rich console for progress
     
     Returns:
@@ -320,13 +333,13 @@ def batch_evaluation(
     # Create projections directory if output_dir is provided and save_projections is enabled
     projections_dir = None
     if output_dir and save_projections:
-        projections_dir = os.path.join(output_dir, "batch_projections")
+        projections_dir = os.path.join(output_dir, "simple_projections")
         os.makedirs(projections_dir, exist_ok=True)
     
     # Create npz directory if output_dir is provided and save_npz is enabled
     npz_dir = None
     if output_dir and save_npz:
-        npz_dir = os.path.join(output_dir, "batch_npz")
+        npz_dir = os.path.join(output_dir, "simple_npz")
         os.makedirs(npz_dir, exist_ok=True)
     
     with Progress(
@@ -365,7 +378,7 @@ def batch_evaluation(
                 # Convert to onehot-like and then to labels
                 x_0_onehot = centered_to_onehot(x_0_batch[i])  # [3, 16, 16, 16] in [0,1]
                 probs = F.softmax(x_0_onehot, dim=0)
-                labels = probs.argmax(dim=0).cpu().numpy().astype(np.uint8)  # [16, 16, 16]
+                labels = decode_probs_to_labels(probs, log_mask_threshold=log_mask_threshold)  # [16, 16, 16]
                 
                 # Compute metrics
                 metrics = compute_sample_metrics(labels)
@@ -375,7 +388,7 @@ def batch_evaluation(
                 # Save 3-view projection if output_dir is provided
                 if projections_dir:
                     try:
-                        projection_path = os.path.join(projections_dir, f"sample_{sample_counter+1:03d}.png")
+                        projection_path = os.path.join(projections_dir, f"simple_sample_{sample_counter+1:03d}.png")
                         title_suffix = f" Sample {sample_counter+1}"
                         save_labels_and_projections(
                             labels,
@@ -389,7 +402,7 @@ def batch_evaluation(
                 # Save npz file if enabled
                 if npz_dir:
                     try:
-                        npz_path = os.path.join(npz_dir, f"sample_{sample_counter+1:03d}.npz")
+                        npz_path = os.path.join(npz_dir, f"simple_sample_{sample_counter+1:03d}.npz")
                         # Save labels and metrics (flatten metrics dict into separate arrays)
                         save_dict = {"labels": labels, "sample_id": f"{sample_counter+1:03d}"}
                         # Add each metric as a separate array
@@ -430,6 +443,7 @@ def dynamics_evaluation(
     save_projections: bool = True,
     save_track_projections: bool = False,
     save_npz: bool = False,
+    log_mask_threshold: Optional[float] = None,
     console: Optional[Console] = None,
 ) -> Tuple[List[Dict], float]:
     """
@@ -449,6 +463,7 @@ def dynamics_evaluation(
         save_projections: whether to save 3-view projections for final states (default: True)
         save_track_projections: whether to save 3-view projections at each tracking step (default: False)
         save_npz: whether to save npz files for final states and tracking steps (default: False)
+        log_mask_threshold: decode with log mask threshold if set; otherwise use argmax
         console: rich console for progress
     
     Returns:
@@ -505,7 +520,7 @@ def dynamics_evaluation(
             # Use x0_hat (predicted clean state) for metrics
             x0hat_onehot = centered_to_onehot(x0_hat.unsqueeze(0))[0]  # [3, 16, 16, 16]
             probs = F.softmax(x0hat_onehot, dim=0)
-            labels = probs.argmax(dim=0).cpu().numpy().astype(np.uint8)
+            labels = decode_probs_to_labels(probs, log_mask_threshold=log_mask_threshold)
             
             # Compute metrics
             metrics = compute_dynamics_metrics(labels, t_int)
@@ -518,7 +533,7 @@ def dynamics_evaluation(
                 try:
                     projection_path = os.path.join(
                         track_projections_dir,
-                        f"sample_{global_sample_idx+1:03d}_step_{step_idx:04d}_t_{t_int:04d}.png"
+                        f"dynamics_sample_{global_sample_idx+1:03d}_step_{step_idx:04d}_t_{t_int:04d}.png"
                     )
                     title_suffix = f" Sample {global_sample_idx+1}, Step {step_idx}, t={t_int}"
                     save_labels_and_projections(
@@ -537,7 +552,7 @@ def dynamics_evaluation(
                 try:
                     npz_path = os.path.join(
                         track_npz_dir,
-                        f"sample_{global_sample_idx+1:03d}_step_{step_idx:04d}_t_{t_int:04d}.npz"
+                        f"dynamics_sample_{global_sample_idx+1:03d}_step_{step_idx:04d}_t_{t_int:04d}.npz"
                     )
                     # Save labels and metrics (flatten metrics dict into separate arrays)
                     save_dict = {
@@ -601,7 +616,7 @@ def dynamics_evaluation(
                     sample_idx = batch_start + i
                     x_0_onehot = centered_to_onehot(x_0_batch[i])  # [3, 16, 16, 16] in [0,1]
                     probs = F.softmax(x_0_onehot, dim=0)
-                    labels = probs.argmax(dim=0).cpu().numpy().astype(np.uint8)  # [16, 16, 16]
+                    labels = decode_probs_to_labels(probs, log_mask_threshold=log_mask_threshold)  # [16, 16, 16]
                     final_samples[sample_idx] = labels
             
             progress.update(task, advance=current_batch_size)
@@ -610,7 +625,7 @@ def dynamics_evaluation(
     if projections_dir and final_samples:
         for sample_idx, labels in final_samples.items():
             try:
-                projection_path = os.path.join(projections_dir, f"sample_{sample_idx+1:03d}.png")
+                projection_path = os.path.join(projections_dir, f"dynamics_sample_{sample_idx+1:03d}.png")
                 title_suffix = f" Dynamics Sample {sample_idx+1}"
                 save_labels_and_projections(
                     labels,
@@ -622,7 +637,7 @@ def dynamics_evaluation(
                 console.print(f"[yellow]⚠[/yellow] Failed to save projection for dynamics sample {sample_idx+1}: {e}")
     
     # Compute and save final state metrics (sorted by sample_idx)
-    # Group trace_data by sample_idx for t_emerge and t_commit calculation
+    # Group trace_data by sample_idx for t_emerge and t_lockin calculation
     trace_by_sample = {}
     for row in trace_data:
         sid = row['sample_idx']
@@ -637,11 +652,19 @@ def dynamics_evaluation(
             metrics = compute_sample_metrics(labels)
             metrics['ID'] = f"{sample_idx+1:03d}"
             
-            # Calculate t_emerge and t_commit from trace_data
+            # Add Base_Connected_Ratio to final state metrics
+            total_log_size = metrics.get('Total_Log_Size', metrics.get('Log_Size', 0))
+            if total_log_size > 0:
+                base_connected_ratio = metrics.get('Base_Connected_Size', 0) / total_log_size
+            else:
+                base_connected_ratio = 0.0
+            metrics['Base_Connected_Ratio'] = base_connected_ratio
+            
+            # Calculate t_emerge and t_lockin from trace_data
             sample_trace = trace_by_sample.get(sample_idx, [])
-            t_emerge, t_commit = compute_t_emerge_and_t_commit(sample_trace)
+            t_emerge, t_lockin = compute_t_emerge_and_t_lockin(sample_trace)
             metrics['t_emerge'] = t_emerge if t_emerge is not None else -1
-            metrics['t_commit'] = t_commit if t_commit is not None else -1
+            metrics['t_lockin'] = t_lockin if t_lockin is not None else -1
             
             final_metrics.append(metrics)
         except Exception as e:
@@ -653,7 +676,7 @@ def dynamics_evaluation(
             try:
                 # Compute metrics for final state (already computed above, but need for npz)
                 metrics = compute_sample_metrics(labels)
-                npz_path = os.path.join(npz_dir, f"sample_{sample_idx+1:03d}.npz")
+                npz_path = os.path.join(npz_dir, f"dynamics_sample_{sample_idx+1:03d}.npz")
                 # Save labels and metrics (flatten metrics dict into separate arrays)
                 save_dict = {
                     "labels": labels,
@@ -744,7 +767,7 @@ def save_batch_results(batch_metrics: List[Dict], output_dir: str, console: Opti
         console = Console()
     
     os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, "eval_batch.csv")
+    csv_path = os.path.join(output_dir, "simple_result.csv")
     
     # Define fieldnames (ID first, then other metrics)
     fieldnames = ['ID'] + [k for k in batch_metrics[0].keys() if k != 'ID']
@@ -774,15 +797,15 @@ def save_dynamics_samples(dynamics_metrics: List[Dict], output_dir: str, console
         return
     
     os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, "dynamics_samples.csv")
+    csv_path = os.path.join(output_dir, "dynamics_result.csv")
     
-    # Define fieldnames with specific order (t_emerge and t_commit after Is_Broken)
+    # Define fieldnames with specific order (t_emerge and t_lockin after Is_Broken)
     base_fields = ['ID']
     metric_field_order = [
         'Is_Main_Trunk_Broken',
         'Is_Broken',
         't_emerge',  # After Is_Broken
-        't_commit',  # After Is_Broken
+        't_lockin',  # After Is_Broken
         'Mass',
         'Height',
         'Log_Size',
@@ -915,6 +938,40 @@ def compute_summary_statistics(batch_metrics: List[Dict]) -> Dict:
     }
 
 
+def compute_dynamics_summary_statistics(dynamics_metrics: List[Dict]) -> Dict:
+    """
+    計算 dynamics 最終狀態的統計摘要（基於 dynamics_result.csv 同一批資料）。
+    
+    Args:
+        dynamics_metrics: List of metrics dicts for final states of dynamics samples
+    
+    Returns:
+        dict with summary statistics
+    """
+    if not dynamics_metrics:
+        return {}
+    
+    summary = compute_summary_statistics(dynamics_metrics)
+    n = len(dynamics_metrics)
+    
+    # t_emerge/t_lockin statistics (-1 means not found)
+    t_emerge_values = [m.get('t_emerge', -1) for m in dynamics_metrics if m.get('t_emerge', -1) >= 0]
+    t_lockin_values = [m.get('t_lockin', -1) for m in dynamics_metrics if m.get('t_lockin', -1) >= 0]
+    
+    summary.update({
+        'n_t_emerge_found': len(t_emerge_values),
+        't_emerge_missing_rate': (1.0 - len(t_emerge_values) / n) if n > 0 else 0.0,
+        'avg_t_emerge': float(np.mean(t_emerge_values)) if t_emerge_values else -1.0,
+        'std_t_emerge': float(np.std(t_emerge_values)) if t_emerge_values else -1.0,
+        'n_t_lockin_found': len(t_lockin_values),
+        't_lockin_missing_rate': (1.0 - len(t_lockin_values) / n) if n > 0 else 0.0,
+        'avg_t_lockin': float(np.mean(t_lockin_values)) if t_lockin_values else -1.0,
+        'std_t_lockin': float(np.std(t_lockin_values)) if t_lockin_values else -1.0,
+    })
+    
+    return summary
+
+
 def save_summary(summary: Dict, output_dir: str, console: Optional[Console] = None):
     """
     保存統計摘要到 CSV 文件。
@@ -928,7 +985,7 @@ def save_summary(summary: Dict, output_dir: str, console: Optional[Console] = No
         console = Console()
     
     os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, "eval_summary.csv")
+    csv_path = os.path.join(output_dir, "simple_summary.csv")
     
     # Prepare CSV rows
     rows = [
@@ -937,8 +994,9 @@ def save_summary(summary: Dict, output_dir: str, console: Optional[Console] = No
         ["", ""],  # Empty row for separation
         ["Breakage Analysis", ""],
         ["Main Trunk Breakage Rate (%)", f"{summary['breakage_rate']:.2f}"],
-        ["Broken Rate (%)", f"{summary['broken_rate']:.2f}"],
         ["Success Rate (%)", f"{summary['success_rate']:.2f}"],
+        ["Any Wood Disconnection Rate (%)", f"{summary['broken_rate']:.2f}"],
+        ["Average Base-Connected Ratio", f"{summary['avg_base_connected_ratio']:.4f}"],
         ["", ""],  # Empty row for separation
         ["Size Statistics", ""],
         ["Avg Mass (voxels)", f"{summary['avg_mass']:.1f}"],
@@ -978,6 +1036,67 @@ def save_summary(summary: Dict, output_dir: str, console: Optional[Console] = No
         writer.writerows(rows)
     
     console.print(f"[green]✓[/green] Saved summary: {csv_path}")
+
+
+def save_dynamics_summary(summary: Dict, output_dir: str, console: Optional[Console] = None):
+    """
+    保存 dynamics 統計摘要到 CSV 文件。
+    
+    Args:
+        summary: dynamics summary statistics dict
+        output_dir: output directory
+        console: rich console
+    """
+    if console is None:
+        console = Console()
+    
+    if not summary:
+        console.print("[yellow]⚠[/yellow] No dynamics summary to save")
+        return
+    
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, "dynamics_summary.csv")
+    
+    rows = [
+        ["Metric", "Value"],
+        ["Number of Samples", summary['n_samples']],
+        ["", ""],
+        ["Breakage Analysis", ""],
+        ["Main Trunk Breakage Rate (%)", f"{summary['breakage_rate']:.2f}"],
+        ["Success Rate (%)", f"{summary['success_rate']:.2f}"],
+        ["Any Wood Disconnection Rate (%)", f"{summary['broken_rate']:.2f}"],
+        ["Average Base-Connected Ratio", f"{summary['avg_base_connected_ratio']:.4f}"],
+        ["", ""],
+        ["Size Statistics", ""],
+        ["Avg Mass (voxels)", f"{summary['avg_mass']:.1f}"],
+        ["Std Mass (voxels)", f"{summary['std_mass']:.1f}"],
+        ["Avg Height", f"{summary['avg_height']:.1f}"],
+        ["Std Height", f"{summary['std_height']:.1f}"],
+        ["Avg Log Size (voxels)", f"{summary['avg_log_size']:.1f}"],
+        ["Std Log Size (voxels)", f"{summary['std_log_size']:.1f}"],
+        ["Avg Leaf Size (voxels)", f"{summary['avg_leaf_size']:.1f}"],
+        ["Std Leaf Size (voxels)", f"{summary['std_leaf_size']:.1f}"],
+        ["Avg Base Connected Size (voxels)", f"{summary['avg_base_connected_size']:.1f}"],
+        ["Std Base Connected Size (voxels)", f"{summary['std_base_connected_size']:.1f}"],
+        ["Avg Base Connected Ratio", f"{summary['avg_base_connected_ratio']:.4f}"],
+        ["Std Base Connected Ratio", f"{summary['std_base_connected_ratio']:.4f}"],
+        ["", ""],
+        ["t_emerge/t_lockin Statistics", ""],
+        ["t_emerge Found Samples", summary['n_t_emerge_found']],
+        ["t_emerge Missing Rate", f"{summary['t_emerge_missing_rate']:.4f}"],
+        ["Avg t_emerge", f"{summary['avg_t_emerge']:.2f}" if summary['avg_t_emerge'] >= 0 else "N/A"],
+        ["Std t_emerge", f"{summary['std_t_emerge']:.2f}" if summary['std_t_emerge'] >= 0 else "N/A"],
+        ["t_lockin Found Samples", summary['n_t_lockin_found']],
+        ["t_lockin Missing Rate", f"{summary['t_lockin_missing_rate']:.4f}"],
+        ["Avg t_lockin", f"{summary['avg_t_lockin']:.2f}" if summary['avg_t_lockin'] >= 0 else "N/A"],
+        ["Std t_lockin", f"{summary['std_t_lockin']:.2f}" if summary['std_t_lockin'] >= 0 else "N/A"],
+    ]
+    
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerows(rows)
+    
+    console.print(f"[green]✓[/green] Saved dynamics summary: {csv_path}")
 
 
 def save_dynamics_trace(trace_data: List[Dict], output_dir: str, console: Optional[Console] = None):
@@ -1080,7 +1199,7 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
         return
     
     os.makedirs(output_dir, exist_ok=True)
-    png_path = os.path.join(output_dir, "divergence_plot.png")
+    png_path = os.path.join(output_dir, "dynamics_divergence_plot.png")
     
     # Group by sample_idx
     samples = {}
@@ -1098,8 +1217,8 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
     T = max(row['t'] for row in trace_data) if trace_data else 1000
     t_threshold = int(T * 0.95)  # Start from 95% of T
     
-    # Create figure with subplots (3 rows, 2 cols = 6 plots)
-    fig, axes = plt.subplots(3, 2, figsize=(12, 15))
+    # Create figure with subplots (2 rows, 2 cols = 4 plots)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     
     # Determine final state (is_main_trunk_broken) for each sample
     # This is used for averaging in Plot 3 and Plot 4
@@ -1132,14 +1251,66 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
     
     # Plot 2: Is_Main_Trunk_Broken over time (as fraction)
     ax2 = axes[0, 1]
-    for sid in samples_to_plot:
-        data = samples[sid]
-        ts = [r['t'] for r in data]
-        broken = [1.0 if r['Is_Main_Trunk_Broken'] else 0.0 for r in data]
-        ax2.plot(ts, broken, label=f'Sample {sid+1}', alpha=0.7, linewidth=1.5)
+    # Aggregate main trunk breakage rate across ALL dynamics samples per timestep
+    total_counts_by_t = {}
+    broken_counts_by_t = {}
+    total_counts_broken_group_by_t = {}
+    broken_counts_broken_group_by_t = {}
+    total_counts_unbroken_group_by_t = {}
+    broken_counts_unbroken_group_by_t = {}
+    for sid, data in samples.items():
+        is_final_broken = sample_final_states.get(sid, False)
+        for r in data:
+            t_val = r['t']
+            total_counts_by_t[t_val] = total_counts_by_t.get(t_val, 0) + 1
+            if r.get('Is_Main_Trunk_Broken', False):
+                broken_counts_by_t[t_val] = broken_counts_by_t.get(t_val, 0) + 1
+            else:
+                broken_counts_by_t.setdefault(t_val, broken_counts_by_t.get(t_val, 0))
+            
+            # Split by final state group (broken vs unbroken)
+            if is_final_broken:
+                total_counts_broken_group_by_t[t_val] = total_counts_broken_group_by_t.get(t_val, 0) + 1
+                if r.get('Is_Main_Trunk_Broken', False):
+                    broken_counts_broken_group_by_t[t_val] = broken_counts_broken_group_by_t.get(t_val, 0) + 1
+                else:
+                    broken_counts_broken_group_by_t.setdefault(
+                        t_val, broken_counts_broken_group_by_t.get(t_val, 0)
+                    )
+            else:
+                total_counts_unbroken_group_by_t[t_val] = total_counts_unbroken_group_by_t.get(t_val, 0) + 1
+                if r.get('Is_Main_Trunk_Broken', False):
+                    broken_counts_unbroken_group_by_t[t_val] = broken_counts_unbroken_group_by_t.get(t_val, 0) + 1
+                else:
+                    broken_counts_unbroken_group_by_t.setdefault(
+                        t_val, broken_counts_unbroken_group_by_t.get(t_val, 0)
+                    )
+    if total_counts_by_t:
+        sorted_ts = sorted(total_counts_by_t.keys(), reverse=True)
+        rates = []
+        rates_broken_group = []
+        rates_unbroken_group = []
+        for t_val in sorted_ts:
+            total = total_counts_by_t[t_val]
+            broken = broken_counts_by_t.get(t_val, 0)
+            rate = broken / total if total > 0 else 0.0
+            rates.append(rate)
+            
+            total_b = total_counts_broken_group_by_t.get(t_val, 0)
+            broken_b = broken_counts_broken_group_by_t.get(t_val, 0)
+            rates_broken_group.append((broken_b / total_b) if total_b > 0 else np.nan)
+            
+            total_u = total_counts_unbroken_group_by_t.get(t_val, 0)
+            broken_u = broken_counts_unbroken_group_by_t.get(t_val, 0)
+            rates_unbroken_group.append((broken_u / total_u) if total_u > 0 else np.nan)
+        
+        ax2.plot(sorted_ts, rates, color='purple', linewidth=2.2, label='Breakage Rate (All)')
+        ax2.plot(sorted_ts, rates_broken_group, color='red', linewidth=2.0, linestyle='--', label='Breakage Rate (Broken)')
+        ax2.plot(sorted_ts, rates_unbroken_group, color='green', linewidth=2.0, linestyle='--', label='Breakage Rate (Unbroken)')
     ax2.set_xlabel('Timestep (t)')
-    ax2.set_ylabel('Is Main Trunk Broken (1=True, 0=False)')
-    ax2.set_title('Main Trunk Breakage Status During Sampling')
+    ax2.set_ylabel('Main Trunk Breakage Rate')
+    ax2.set_title('Main Trunk Breakage Rate During Sampling (All Dynamics Samples)')
+    ax2.set_ylim([0, 1.05])
     ax2.legend()
     ax2.grid(True, alpha=0.3)
     ax2.invert_xaxis()
@@ -1293,51 +1464,134 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
     ax4.invert_xaxis()
     ax4.set_ylim([0, 1.1])  # Ratio should be between 0 and 1
     
-    # Plot 5: Histogram of t_emerge
-    ax5 = axes[2, 0]
-    t_emerge_values = []
-    for sid in sorted(samples.keys()):
-        sample_trace = samples[sid]
-        t_emerge, _ = compute_t_emerge_and_t_commit(sample_trace)
-        if t_emerge is not None:
-            t_emerge_values.append(t_emerge)
-    
-    if t_emerge_values:
-        ax5.hist(t_emerge_values, bins=30, edgecolor='black', alpha=0.7)
-        ax5.set_xlabel('t_emerge (Timestep)')
-        ax5.set_ylabel('Frequency')
-        ax5.set_title('Distribution of t_emerge (Tree Emergence Time)')
-        ax5.grid(True, alpha=0.3)
-        ax5.invert_xaxis()  # Invert to show from high t to low t
-    else:
-        ax5.text(0.5, 0.5, 'No t_emerge data', ha='center', va='center', transform=ax5.transAxes)
-        ax5.set_title('Distribution of t_emerge (Tree Emergence Time)')
-    
-    # Plot 6: Histogram of t_commit (only non-None values)
-    ax6 = axes[2, 1]
-    t_commit_values = []
-    for sid in sorted(samples.keys()):
-        sample_trace = samples[sid]
-        _, t_commit = compute_t_emerge_and_t_commit(sample_trace)
-        if t_commit is not None:
-            t_commit_values.append(t_commit)
-    
-    if t_commit_values:
-        ax6.hist(t_commit_values, bins=30, edgecolor='black', alpha=0.7, color='green')
-        ax6.set_xlabel('t_commit (Timestep)')
-        ax6.set_ylabel('Frequency')
-        ax6.set_title('Distribution of t_commit (Tree Completion Time)')
-        ax6.grid(True, alpha=0.3)
-        ax6.invert_xaxis()  # Invert to show from high t to low t
-    else:
-        ax6.text(0.5, 0.5, 'No t_commit data', ha='center', va='center', transform=ax6.transAxes)
-        ax6.set_title('Distribution of t_commit (Tree Completion Time)')
-    
     plt.tight_layout()
     plt.savefig(png_path, dpi=150, bbox_inches='tight')
     plt.close()
     
     console.print(f"[green]✓[/green] Saved divergence plot: {png_path}")
+
+
+def plot_timing_distributions(trace_data: List[Dict], output_dir: str, console: Optional[Console] = None):
+    """
+    繪製 t_emerge 與 t_lockin 的分布圖，另存為獨立圖片。
+    """
+    if console is None:
+        console = Console()
+    
+    if not trace_data:
+        console.print("[yellow]⚠[/yellow] No trace data to plot timing distributions")
+        return
+    
+    os.makedirs(output_dir, exist_ok=True)
+    png_path = os.path.join(output_dir, "dynamics_timing_distribution_plot.png")
+    
+    # Group by sample_idx
+    samples = {}
+    for row in trace_data:
+        sid = row['sample_idx']
+        if sid not in samples:
+            samples[sid] = []
+        samples[sid].append(row)
+    
+    # Determine final state (is_main_trunk_broken) for each sample
+    sample_final_states = {}
+    for sid in samples.keys():
+        data = samples[sid]
+        if data:
+            final_data = min(data, key=lambda x: x['t'])
+            sample_final_states[sid] = final_data.get('Is_Main_Trunk_Broken', False)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+    
+    # Histogram 1: t_emerge
+    ax1 = axes[0]
+    t_emerge_broken = []
+    t_emerge_unbroken = []
+    for sid in sorted(samples.keys()):
+        sample_trace = samples[sid]
+        t_emerge, _ = compute_t_emerge_and_t_lockin(sample_trace)
+        if t_emerge is not None:
+            if sample_final_states.get(sid, False):
+                t_emerge_broken.append(t_emerge)
+            else:
+                t_emerge_unbroken.append(t_emerge)
+    
+    if t_emerge_broken or t_emerge_unbroken:
+        data_to_plot = []
+        labels = []
+        colors = []
+        if t_emerge_broken:
+            data_to_plot.append(t_emerge_broken)
+            labels.append('Broken')
+            colors.append('red')
+        if t_emerge_unbroken:
+            data_to_plot.append(t_emerge_unbroken)
+            labels.append('Unbroken')
+            colors.append('green')
+        ax1.hist(data_to_plot, bins=30, edgecolor='black', alpha=0.65, label=labels, color=colors)
+        if t_emerge_broken:
+            mean_b = float(np.mean(t_emerge_broken))
+            ax1.axvline(mean_b, color='red', linestyle='--', linewidth=2.0, label='Broken mean')
+        if t_emerge_unbroken:
+            mean_u = float(np.mean(t_emerge_unbroken))
+            ax1.axvline(mean_u, color='green', linestyle='--', linewidth=2.0, label='Unbroken mean')
+        ax1.set_xlabel('t_emerge (Timestep)')
+        ax1.set_ylabel('Frequency')
+        ax1.set_title('Distribution of t_emerge (Tree Emergence Time)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        ax1.invert_xaxis()
+    else:
+        ax1.text(0.5, 0.5, 'No t_emerge data', ha='center', va='center', transform=ax1.transAxes)
+        ax1.set_title('Distribution of t_emerge (Tree Emergence Time)')
+    
+    # Histogram 2: t_lockin
+    ax2 = axes[1]
+    t_lockin_broken = []
+    t_lockin_unbroken = []
+    for sid in sorted(samples.keys()):
+        sample_trace = samples[sid]
+        _, t_lockin = compute_t_emerge_and_t_lockin(sample_trace)
+        if t_lockin is not None:
+            if sample_final_states.get(sid, False):
+                t_lockin_broken.append(t_lockin)
+            else:
+                t_lockin_unbroken.append(t_lockin)
+    
+    if t_lockin_broken or t_lockin_unbroken:
+        data_to_plot = []
+        labels = []
+        colors = []
+        if t_lockin_broken:
+            data_to_plot.append(t_lockin_broken)
+            labels.append('Broken')
+            colors.append('red')
+        if t_lockin_unbroken:
+            data_to_plot.append(t_lockin_unbroken)
+            labels.append('Unbroken')
+            colors.append('green')
+        ax2.hist(data_to_plot, bins=30, edgecolor='black', alpha=0.65, label=labels, color=colors)
+        if t_lockin_broken:
+            mean_b = float(np.mean(t_lockin_broken))
+            ax2.axvline(mean_b, color='red', linestyle='--', linewidth=2.0, label='Broken mean')
+        if t_lockin_unbroken:
+            mean_u = float(np.mean(t_lockin_unbroken))
+            ax2.axvline(mean_u, color='green', linestyle='--', linewidth=2.0, label='Unbroken mean')
+        ax2.set_xlabel('t_lockin (Timestep)')
+        ax2.set_ylabel('Frequency')
+        ax2.set_title('Distribution of t_lockin (Trunk State Lock-in Time)')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        ax2.invert_xaxis()
+    else:
+        ax2.text(0.5, 0.5, 'No t_lockin data', ha='center', va='center', transform=ax2.transAxes)
+        ax2.set_title('Distribution of t_lockin (Trunk State Lock-in Time)')
+    
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    console.print(f"[green]✓[/green] Saved timing distribution plot: {png_path}")
 
 
 def fmt_secs(s: float) -> str:
@@ -1347,6 +1601,18 @@ def fmt_secs(s: float) -> str:
     if h > 0:
         return f"{h:d}h {m:02d}m {s:02d}s"
     return f"{m:02d}m {s:02d}s"
+
+
+def get_invocation_command() -> str:
+    """Reconstruct the current command in a shell-safe format."""
+    if not sys.argv:
+        return ""
+
+    executable_name = Path(sys.executable).name if sys.executable else "python"
+    if executable_name.startswith("python"):
+        executable_name = "python"
+
+    return shlex.join([executable_name, *sys.argv])
 
 
 def save_metadata(metadata: Dict, output_dir: str, console: Optional[Console] = None):
@@ -1470,15 +1736,27 @@ def main():
     parser.add_argument("--save_track_projections", action="store_true", help="Save 3-view projections at each tracking step during dynamics analysis (default: disabled)")
     parser.add_argument("--save_npz", action="store_true", help="Save npz files for each sample (default: disabled)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility (default: None, use random seed)")
+    parser.add_argument(
+        "--log_mask_threshold",
+        type=float,
+        default=None,
+        help="Use threshold-based log mask decoding (e.g., 0.4/0.5/0.6). If not set, use argmax decoding."
+    )
     
     args = parser.parse_args()
     
     # Set random seeds if seed is provided
     if args.seed is not None:
+        random.seed(args.seed)
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
+            # Make cuDNN behavior deterministic when possible.
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        # Enforce deterministic algorithms where PyTorch supports it.
+        torch.use_deterministic_algorithms(True, warn_only=True)
     
     console = Console()
     console.print("[bold]16x16x16 Voxel Diffusion Model Evaluation[/bold]\n")
@@ -1491,6 +1769,10 @@ def main():
     console.print(f"[cyan]Using device: {device}[/cyan]")
     if args.seed is not None:
         console.print(f"[cyan]Random seed: {args.seed}[/cyan]")
+    if args.log_mask_threshold is None:
+        console.print("[cyan]Label decoding: argmax[/cyan]")
+    else:
+        console.print(f"[cyan]Label decoding: log-mask threshold = {args.log_mask_threshold:.4f}[/cyan]")
     
     # Load model
     model, checkpoint = load_model(args.checkpoint, device)
@@ -1530,11 +1812,14 @@ def main():
     
     # Get script name
     current_script = Path(__file__).name if "__file__" in globals() else "interactive_session"
+    invocation_command = get_invocation_command()
     
     # Prepare initial metadata
     initial_metadata = {
         "exp_name": args.exp_name,
         "evaluation_start_time": eval_start_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "execution_cwd": os.getcwd(),
+        "execution_command": invocation_command,
         "checkpoint_path": args.checkpoint,
         "checkpoint_epoch": checkpoint_epoch,
         "checkpoint_best_val_loss": checkpoint_best_val_loss,
@@ -1561,10 +1846,20 @@ def main():
         "no_projections": bool_to_str(args.no_projections),
         "save_track_projections": bool_to_str(args.save_track_projections),
         "save_npz": bool_to_str(args.save_npz),
-        "eval_batch_csv": os.path.join(exp_output_dir, "eval_batch.csv"),
-        "eval_summary_csv": os.path.join(exp_output_dir, "eval_summary.csv"),
+        "label_decoding_mode": "argmax" if args.log_mask_threshold is None else "log_mask_threshold",
+        "log_mask_threshold": args.log_mask_threshold if args.log_mask_threshold is not None else "None",
+        # New standardized output filenames
+        "simple_eval_csv": os.path.join(exp_output_dir, "simple_result.csv"),
+        "simple_summary_csv": os.path.join(exp_output_dir, "simple_summary.csv"),
+        "dynamics_result_csv": os.path.join(exp_output_dir, "dynamics_result.csv"),
+        "dynamics_summary_csv": os.path.join(exp_output_dir, "dynamics_summary.csv"),
         "dynamics_trace_csv": os.path.join(exp_output_dir, "dynamics_trace.csv"),
-        "divergence_plot_png": os.path.join(exp_output_dir, "divergence_plot.png"),
+        "dynamics_divergence_plot_png": os.path.join(exp_output_dir, "dynamics_divergence_plot.png"),
+        "dynamics_timing_distribution_plot_png": os.path.join(exp_output_dir, "dynamics_timing_distribution_plot.png"),
+        # Backward-compat keys pointing to new paths
+        "eval_batch_csv": os.path.join(exp_output_dir, "simple_result.csv"),
+        "eval_summary_csv": os.path.join(exp_output_dir, "simple_summary.csv"),
+        "divergence_plot_png": os.path.join(exp_output_dir, "dynamics_divergence_plot.png"),
     }
     
     # Save initial metadata
@@ -1593,6 +1888,7 @@ def main():
         exp_name=args.exp_name,
         save_projections=not args.no_projections,
         save_npz=args.save_npz,
+        log_mask_threshold=args.log_mask_threshold,
         console=console,
     )
     
@@ -1632,17 +1928,25 @@ def main():
         save_projections=not args.no_projections,
         save_track_projections=args.save_track_projections,
         save_npz=args.save_npz,
+        log_mask_threshold=args.log_mask_threshold,
         console=console,
     )
     
     # Save dynamics samples final results (Level C - final states)
     save_dynamics_samples(dynamics_final_metrics, exp_output_dir, console)
     
+    # Compute and save dynamics summary (Level C - summary)
+    dynamics_summary = compute_dynamics_summary_statistics(dynamics_final_metrics)
+    save_dynamics_summary(dynamics_summary, exp_output_dir, console)
+    
     # Save dynamics trace (Level C)
     save_dynamics_trace(trace_data, exp_output_dir, console)
     
     # Plot divergence
     plot_divergence(trace_data, exp_output_dir, args.n_dynamics_samples, console)
+    
+    # Plot timing distributions (t_emerge / t_lockin)
+    plot_timing_distributions(trace_data, exp_output_dir, console)
     
     # Compute total evaluation time
     total_secs = time.time() - global_t0
@@ -1684,6 +1988,14 @@ def main():
         "avg_components_log": summary['avg_components_log'],
         "avg_components_leaf": summary['avg_components_leaf'],
         "n_dynamics_tracking_points": len(trace_data),
+        # Dynamics final-state summary statistics
+        "dynamics_n_samples": dynamics_summary.get('n_samples', 0),
+        "dynamics_breakage_rate": dynamics_summary.get('breakage_rate', 0.0),
+        "dynamics_broken_rate": dynamics_summary.get('broken_rate', 0.0),
+        "dynamics_success_rate": dynamics_summary.get('success_rate', 0.0),
+        "dynamics_avg_base_connected_ratio": dynamics_summary.get('avg_base_connected_ratio', 0.0),
+        "dynamics_t_emerge_missing_rate": dynamics_summary.get('t_emerge_missing_rate', 0.0),
+        "dynamics_t_lockin_missing_rate": dynamics_summary.get('t_lockin_missing_rate', 0.0),
     }
     
     # Append final metadata
