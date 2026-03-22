@@ -31,6 +31,8 @@ import argparse
 import os
 import math
 import random
+import shlex
+import sys
 import time
 import csv
 import zipfile
@@ -95,6 +97,18 @@ def fmt_secs(s: float) -> str:
     if h > 0:
         return f"{h:d}h {m:02d}m {s:02d}s"
     return f"{m:02d}m {s:02d}s"
+
+
+def get_invocation_command() -> str:
+    """Reconstruct the current command in a shell-safe format."""
+    if not sys.argv:
+        return ""
+
+    executable_name = Path(sys.executable).name if sys.executable else "python"
+    if executable_name.startswith("python"):
+        executable_name = "python"
+
+    return shlex.join([executable_name, *sys.argv])
 
 
 def parse_class_weights(arg: str):
@@ -567,7 +581,17 @@ def q_sample(x_0, t, alpha_bar, device):
 
 
 @torch.no_grad()
-def sample_voxels(model, betas, shape, device, n_steps=None, use_amp=False, track_every=None, track_callback=None):
+def sample_voxels(
+    model,
+    betas,
+    shape,
+    device,
+    n_steps=None,
+    use_amp=False,
+    track_every=None,
+    track_callback=None,
+    verbose: bool = True,
+):
     """
     Reverse diffusion process: sample voxels from noise.
     
@@ -580,6 +604,7 @@ def sample_voxels(model, betas, shape, device, n_steps=None, use_amp=False, trac
         use_amp: whether to use mixed precision
         track_every: if not None, track metrics every N steps (calls track_callback)
         track_callback: callback function(sample_idx, step_idx, t_int, x_current, x0_hat) called every track_every steps
+        verbose: if False, skip step-wise debug prints (useful for bulk generation)
     
     Returns:
         x_0: [B, C, H, W, D] sampled voxels in [-1,1] range
@@ -619,7 +644,7 @@ def sample_voxels(model, betas, shape, device, n_steps=None, use_amp=False, trac
 
         # === 檢查數值是否失控 ===
         # 我們只在第 0 號樣本 (i==0) 且每隔 200 步印一次，避免洗版
-        if i % 200 == 0:
+        if verbose and i % 200 == 0:
             # 計算 sqrt(alpha_bar_t) - 這是導致數值爆炸的關鍵
             sab = torch.sqrt(alpha_bar_t).item()
             
@@ -655,7 +680,7 @@ def sample_voxels(model, betas, shape, device, n_steps=None, use_amp=False, trac
         pred_x0_after_clamp_max = pred_x0.max().item()
         
         # 如果數值被 clamp 了，記錄日誌
-        if i % 200 == 0:
+        if verbose and i % 200 == 0:
             was_clamped = (pred_x0_before_clamp_min < -1.0) or (pred_x0_before_clamp_max > 1.0)
             if was_clamped:
                 print(f"  [Clamp修正] pred_x0 已鉗制至: range=[{pred_x0_after_clamp_min:.2f}, {pred_x0_after_clamp_max:.2f}]")
@@ -1316,6 +1341,7 @@ def train_diffusion(args):
         loss_desc = "MSE (uniform weighting)"
     
     current_script = Path(__file__).name if "__file__" in globals() else "interactive_session"
+    invocation_command = get_invocation_command()
 
     # Create initial metadata (all fields that can be determined before training)
     # Note: start_epoch is set correctly after resume check above
@@ -1325,8 +1351,10 @@ def train_diffusion(args):
         "start_epoch": start_epoch,
         "end_epoch": args.epochs,
         "training_start_time": train_start_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "execution_cwd": os.getcwd(),
+        "execution_command": invocation_command,
         "best_model_path": os.path.join(ckpt_dir, "best.pt"),
-        "last_checkpoint_path": os.path.join(ckpt_dir, "best.pt"),
+        "last_checkpoint_path": os.path.join(ckpt_dir, "last.pt"),
         "samples_directory": samples_dir,
         "data_root": args.data_root,
         "out_dir": args.out_dir,
@@ -1369,6 +1397,7 @@ def train_diffusion(args):
         "n_samples": args.n_samples,
         "sample_steps": args.sample_steps if args.sample_steps is not None else args.T,
         "save_every": args.save_every,
+        "val_loss_explosion_factor": args.val_loss_explosion_factor,
         "loss_function": loss_desc,
         "loss_reconstruction": loss_desc,  # For diffusion, reconstruction loss is the MSE loss
         "T": args.T,
@@ -1403,6 +1432,7 @@ def train_diffusion(args):
         "epoch",
         "train_loss",
         "val_loss",
+        "is_best",
         "grad_norm_max",
         "grad_norm_mean",
         "grad_norm_before_clip_max",
@@ -1423,7 +1453,6 @@ def train_diffusion(args):
         "loss_tbin_9",
         "epoch_time_secs",
         "cumulative_time_secs",
-        "is_best",
         "occupancy_mean",
         "occupancy_std",
         "component_count_mean",
@@ -1500,7 +1529,11 @@ def train_diffusion(args):
             console=console,
             refresh_per_second=1,  # 限制每秒最多更新 1 次
         )
-    
+
+    # Early stop (val loss explosion); updated inside training loop if triggered
+    stopped_early_val_explosion = False
+    training_stop_detail = ""
+
     with progress_context as progress:
         overall_task = progress.add_task(
             "[cyan]Training", total=remaining_epochs + 1
@@ -1951,6 +1984,22 @@ def train_diffusion(args):
             val_pred_mean = np.mean(val_pred_means)
             val_pred_std = np.mean(val_pred_stds)
             progress.remove_task(epoch_task)
+
+            # Stop if val loss explodes vs best val seen so far (before this epoch's update)
+            stop_for_val_explosion = False
+            val_explosion_detail = ""
+            fac = args.val_loss_explosion_factor
+            if fac > 0:
+                if not math.isfinite(val_loss):
+                    stop_for_val_explosion = True
+                    val_explosion_detail = f"val_loss is not finite ({val_loss})"
+                elif math.isfinite(best_val_loss) and best_val_loss > 0 and val_loss > fac * best_val_loss:
+                    stop_for_val_explosion = True
+                    thr = fac * best_val_loss
+                    val_explosion_detail = (
+                        f"val_loss {val_loss:.6g} > {fac}×best_val_loss "
+                        f"({best_val_loss:.6g}, threshold {thr:.6g})"
+                    )
 
             # Logging
             epoch_secs = time.time() - epoch_t0
@@ -2521,6 +2570,12 @@ def train_diffusion(args):
                 
                 # Add learning rate
                 log_dict["train/lr"] = optimizer.param_groups[0]['lr']
+
+                if stop_for_val_explosion:
+                    log_dict["train/val_explosion_stop"] = 1
+                    log_dict["train/stopped_early"] = 1
+                    log_dict["train/stop_reason"] = "val_loss_explosion"
+                    log_dict["train/val_explosion_detail"] = val_explosion_detail[:1024]
                 
                 # Use epoch number as step for epoch-level logging
                 # All metrics are logged at epoch level, x-axis will show epochs (1, 2, 3, ...)
@@ -2644,13 +2699,21 @@ def train_diffusion(args):
                 "args": vars(args),
             }
 
-            # Save best model only
+            # Save best model (when validation loss improves)
             if is_best:
                 torch.save(ckpt, os.path.join(ckpt_dir, "best.pt"))
+            # Save last checkpoint every epoch (for resume / latest state)
+            torch.save(ckpt, os.path.join(ckpt_dir, "last.pt"))
+            # Save periodic checkpoint every save_every epochs
+            if (epoch + 1) % args.save_every == 0:
+                periodic_path = os.path.join(ckpt_dir, f"ckpt_e{epoch+1:04d}.pt")
+                torch.save(ckpt, periodic_path)
 
             # Display epoch results (similar to train_VQVAE.py format)
             best_marker = " | ★ Best!" if is_best else ""
             ckpt_marker = " | 💾 Saved" if is_best else ""
+            if (epoch + 1) % args.save_every == 0:
+                ckpt_marker += f" | ckpt_e{epoch+1:04d}"
             progress.console.print(
                 f"Epoch {epoch+1:03d}: train {train_loss:.6f} | "
                 f"val {val_loss:.6f} | {fmt_secs(epoch_secs)}"
@@ -2659,17 +2722,31 @@ def train_diffusion(args):
 
             progress.update(overall_task, advance=1)
 
+            if stop_for_val_explosion:
+                progress.console.print(
+                    Panel.fit(
+                        "[bold red]Training terminated: validation loss explosion[/bold red]\n\n"
+                        f"{val_explosion_detail}",
+                        border_style="red",
+                    )
+                )
+                stopped_early_val_explosion = True
+                training_stop_detail = val_explosion_detail
+                break
+
     total_secs = cumulative_time_offset + (time.time() - global_t0)
     train_end_time = datetime.now()
 
     # Append final metadata fields (append to end to maintain field order)
     final_metadata = {
         "training_end_time": train_end_time.strftime("%Y-%m-%d %H:%M:%S"),
-        "last_checkpoint_path": os.path.join(ckpt_dir, "best.pt") if os.path.exists(os.path.join(ckpt_dir, "best.pt")) else "not_available",
+        "last_checkpoint_path": os.path.join(ckpt_dir, "last.pt") if os.path.exists(os.path.join(ckpt_dir, "last.pt")) else "not_available",
         "best_val_loss": best_val_loss,
         "final_test_loss": None,  # Diffusion script doesn't have test set
         "total_training_time_secs": total_secs,
         "total_training_time_formatted": fmt_secs(total_secs),
+        "stopped_early_val_explosion": "TRUE" if stopped_early_val_explosion else "FALSE",
+        "training_stop_detail": training_stop_detail if training_stop_detail else "None",
     }
 
     # Append to key-value format metadata
@@ -2703,7 +2780,11 @@ def train_diffusion(args):
         f"[green]✓[/green] Updated experiment metadata (flat) with final fields: [cyan]{csv3_path}[/cyan]"
     )
 
-    console.print(f"\n[bold green]Training completed![/bold green]")
+    if stopped_early_val_explosion:
+        console.print(f"\n[bold yellow]Training stopped early (val loss explosion).[/bold yellow]")
+        console.print(f"[dim]{training_stop_detail}[/dim]")
+    else:
+        console.print(f"\n[bold green]Training completed![/bold green]")
     console.print(f"Best validation loss: {best_val_loss:.6f}")
     console.print(f"Total training time: {fmt_secs(total_secs)}")
     console.print(f"Checkpoints saved to: {ckpt_dir}")
@@ -2775,7 +2856,14 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no_amp", action="store_true", help="Disable mixed precision training")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint (filename in checkpoints/)")
-    parser.add_argument("--save_every", type=int, default=10, help="Save checkpoint every N epochs")
+    parser.add_argument("--save_every", type=int, default=50, help="Save periodic checkpoint every N epochs (e.g. ckpt_e0050.pt)")
+    parser.add_argument(
+        "--val_loss_explosion_factor",
+        type=float,
+        default=10.0,
+        help="Stop training if val_loss > factor * best_val_loss (historical best before this epoch). "
+        "Non-finite val_loss also stops. Use 0 to disable.",
+    )
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm for clipping")
     parser.add_argument("--notes", type=str, default="", help="Notes or comments for this experiment (will be saved to metadata)")
     parser.add_argument(
