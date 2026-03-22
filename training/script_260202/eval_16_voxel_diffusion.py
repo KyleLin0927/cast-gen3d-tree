@@ -15,6 +15,7 @@
 - dynamics_trace.csv: 前幾個樣本的完整軌跡（層次 C）
 - dynamics_divergence_plot.png: 可視化圖表
 - dynamics_timing_distribution_plot.png: t_emerge / t_lockin 分布圖
+- dynamics_xt/: x_t 三視圖目錄（使用 --save_xt_projections 時生成）
 
 使用方式:
   python eval_16_voxel_diffusion.py --checkpoint <path/to/checkpoint.pt> --n_samples 100
@@ -35,6 +36,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import csv
 import json
+import traceback
 
 try:
     from scipy.ndimage import label
@@ -43,6 +45,8 @@ except ImportError:
     HAS_SCIPY = False
     print("[WARNING] scipy not installed. Component count will be disabled.")
 
+import matplotlib
+matplotlib.use("Agg")  # Headless backend for saving without display
 import matplotlib.pyplot as plt
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
@@ -442,6 +446,7 @@ def dynamics_evaluation(
     exp_name: Optional[str] = None,
     save_projections: bool = True,
     save_track_projections: bool = False,
+    save_xt_projections: bool = False,
     save_npz: bool = False,
     log_mask_threshold: Optional[float] = None,
     console: Optional[Console] = None,
@@ -462,6 +467,7 @@ def dynamics_evaluation(
         exp_name: experiment name for projection titles (optional)
         save_projections: whether to save 3-view projections for final states (default: True)
         save_track_projections: whether to save 3-view projections at each tracking step (default: False)
+        save_xt_projections: whether to save 3-view projections of x_t (noisy state) at each tracking step (default: False)
         save_npz: whether to save npz files for final states and tracking steps (default: False)
         log_mask_threshold: decode with log mask threshold if set; otherwise use argmax
         console: rich console for progress
@@ -490,6 +496,14 @@ def dynamics_evaluation(
         track_projections_dir = os.path.join(output_dir, "dynamics_track_projections")
         os.makedirs(track_projections_dir, exist_ok=True)
     
+    # Create x_t projections directory if save_xt_projections is enabled
+    xt_projections_dir = None
+    if output_dir and save_xt_projections:
+        xt_projections_dir = os.path.abspath(os.path.join(output_dir, "dynamics_xt"))
+        os.makedirs(xt_projections_dir, exist_ok=True)
+        if console:
+            console.print(f"[dim]x_t projections will be saved to: {xt_projections_dir}[/dim]")
+    
     # Create npz directories if save_npz is enabled
     npz_dir = None
     track_npz_dir = None
@@ -508,12 +522,13 @@ def dynamics_evaluation(
     # Track number of saved projections
     track_projection_count = 0
     track_npz_count = 0
+    xt_projection_count = 0
     
     def make_track_callback(batch_offset: int):
         """Create a track callback function with batch offset."""
         def track_callback(sample_idx, step_idx, t_int, x_current, x0_hat):
             """Callback to track metrics at each step."""
-            nonlocal track_projection_count, track_npz_count
+            nonlocal track_projection_count, track_npz_count, xt_projection_count
             # sample_idx is relative to the batch, add batch_offset to get global index
             global_sample_idx = batch_offset + sample_idx
             
@@ -574,6 +589,26 @@ def dynamics_evaluation(
                 except Exception as e:
                     if console:
                         console.print(f"[yellow]⚠[/yellow] Failed to save track npz for sample {global_sample_idx+1}, step {step_idx}: {e}")
+            
+            # Save x_t (noisy state) 3-view projection if enabled
+            if xt_projections_dir is not None:
+                try:
+                    xt_projection_path = os.path.join(
+                        xt_projections_dir,
+                        f"dynamics_sample_{global_sample_idx+1:03d}_step_{step_idx:04d}_t_{t_int:04d}_xt.png"
+                    )
+                    title_suffix = f" Sample {global_sample_idx+1}, Step {step_idx}, t={t_int} (x_t)"
+                    _save_xt_projections_impl(
+                        x_current,
+                        xt_projection_path,
+                        title_suffix=title_suffix,
+                        exp_name=exp_name if exp_name else None
+                    )
+                    xt_projection_count += 1
+                except Exception as e:
+                    if console:
+                        console.print(f"[yellow]⚠[/yellow] Failed to save x_t projection for sample {global_sample_idx+1}, step {step_idx}: {e}")
+                        console.print(f"[dim]{traceback.format_exc()}[/dim]")
         
         return track_callback
     
@@ -705,7 +740,31 @@ def dynamics_evaluation(
         console.print(f"[green]✓[/green] Saved {len(final_samples)} final state npz files to: {npz_dir}")
     if track_npz_dir:
         console.print(f"[green]✓[/green] Saved {track_npz_count} track step npz files to: {track_npz_dir}")
+    if xt_projections_dir:
+        console.print(f"[green]✓[/green] Saved {xt_projection_count} x_t projections to: {xt_projections_dir}")
     return trace_data, elapsed_time, final_metrics
+
+
+def _save_xt_projections_impl(x_t: torch.Tensor, out_png: str, title_suffix: str = "", exp_name: str = ""):
+    """
+    Save 3-view projections of x_t (noisy diffusion state).
+    Converts centered x_t to pseudo-labels via argmax for visualization.
+    Priority: wood (1) > leaf (2) > air (0)
+    
+    Args:
+        x_t: [3, 16, 16, 16] tensor in centered form (values in [-1, 1])
+        out_png: output png file path
+        title_suffix: optional suffix to add to the figure title
+        exp_name: experiment name to display as main title
+    """
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    # Ensure tensor is float32 and contiguous (in case of AMP/GPU)
+    x_t = x_t.detach().float().clone()
+    # Convert centered to [0,1] then argmax to get pseudo-labels (noisy but viewable)
+    x_onehot = centered_to_onehot(x_t.unsqueeze(0))[0]  # [3, 16, 16, 16] in [0,1]
+    probs = F.softmax(x_onehot, dim=0)
+    labels = probs.argmax(dim=0).cpu().numpy().astype(np.uint8)  # [16, 16, 16]
+    save_labels_and_projections(labels, out_png, title_suffix=title_suffix, exp_name=exp_name)
 
 
 def save_labels_and_projections(labels: np.ndarray, out_png: str, title_suffix: str = "", exp_name: str = ""):
@@ -1734,6 +1793,7 @@ def main():
     parser.add_argument("--device", type=str, default=None, help="Device (cuda/cpu, default: auto)")
     parser.add_argument("--no_projections", action="store_true", help="Disable saving 3-view projections (default: enabled)")
     parser.add_argument("--save_track_projections", action="store_true", help="Save 3-view projections at each tracking step during dynamics analysis (default: disabled)")
+    parser.add_argument("--save_xt_projections", action="store_true", help="Save 3-view projections of x_t (noisy diffusion state) at each tracking step to dynamics_xt/ (default: disabled)")
     parser.add_argument("--save_npz", action="store_true", help="Save npz files for each sample (default: disabled)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility (default: None, use random seed)")
     parser.add_argument(
@@ -1845,6 +1905,7 @@ def main():
         "save_projections": bool_to_str(not args.no_projections),
         "no_projections": bool_to_str(args.no_projections),
         "save_track_projections": bool_to_str(args.save_track_projections),
+        "save_xt_projections": bool_to_str(args.save_xt_projections),
         "save_npz": bool_to_str(args.save_npz),
         "label_decoding_mode": "argmax" if args.log_mask_threshold is None else "log_mask_threshold",
         "log_mask_threshold": args.log_mask_threshold if args.log_mask_threshold is not None else "None",
@@ -1856,6 +1917,7 @@ def main():
         "dynamics_trace_csv": os.path.join(exp_output_dir, "dynamics_trace.csv"),
         "dynamics_divergence_plot_png": os.path.join(exp_output_dir, "dynamics_divergence_plot.png"),
         "dynamics_timing_distribution_plot_png": os.path.join(exp_output_dir, "dynamics_timing_distribution_plot.png"),
+        "dynamics_xt_dir": os.path.join(exp_output_dir, "dynamics_xt"),
         # Backward-compat keys pointing to new paths
         "eval_batch_csv": os.path.join(exp_output_dir, "simple_result.csv"),
         "eval_summary_csv": os.path.join(exp_output_dir, "simple_summary.csv"),
@@ -1927,6 +1989,7 @@ def main():
         exp_name=args.exp_name,
         save_projections=not args.no_projections,
         save_track_projections=args.save_track_projections,
+        save_xt_projections=args.save_xt_projections,
         save_npz=args.save_npz,
         log_mask_threshold=args.log_mask_threshold,
         console=console,
