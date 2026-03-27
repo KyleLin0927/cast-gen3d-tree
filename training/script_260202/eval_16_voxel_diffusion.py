@@ -63,88 +63,13 @@ try:
         BetaSchedule,
         sample_voxels,
         centered_to_onehot,
-        compute_trunk_breakage,
-        compute_occupancy_rates,
-        compute_component_counts_26neighbor,
-        compute_largest_log_component_ratio,
     )
 except ImportError as e:
     print(f"[ERROR] Failed to import from training script: {e}")
     print("Make sure unet_diffusion_16_voxel.py is in the same directory.")
     sys.exit(1)
 
-
-def compute_sample_metrics(labels: np.ndarray) -> Dict:
-    """
-    計算單個樣本的所有指標。
-    
-    Args:
-        labels: [16, 16, 16] numpy array with class labels (0=air, 1=log, 2=leaf)
-    
-    Returns:
-        dict with metrics:
-            - ID: sample ID
-            - Is_Main_Trunk_Broken: bool, True if main trunk is broken (no connected path from ground to top)
-            - Is_Broken: bool, True if there are any disconnected wood components (not connected to ground)
-            - Mass: total non-air voxels
-            - Height: highest non-air voxel Y coordinate (from ground Y=0)
-            - Log_Size: total log voxels
-            - Leaf_Size: total leaf voxels
-            - Base_Connected_Size: size of base-connected log component
-            - Total_Log_Size: total log voxels (same as Log_Size)
-            - Largest_Log_Ratio: ratio of largest log component
-            - Occupancy_Non_Air: occupancy rate of non-air
-            - Occupancy_Log: occupancy rate of log
-            - Occupancy_Leaf: occupancy rate of leaf
-            - Components_Non_Air: number of non-air components
-            - Components_Log: number of log components
-            - Components_Leaf: number of leaf components
-    """
-    # Trunk breakage analysis
-    trunk_info = compute_trunk_breakage(labels, debug=False)
-    
-    # Occupancy rates
-    occ_rates = compute_occupancy_rates(labels)
-    
-    # Component counts
-    comp_counts = compute_component_counts_26neighbor(labels)
-    
-    # Largest log component ratio
-    largest_log_ratio = compute_largest_log_component_ratio(labels)
-    
-    # Mass (total non-air voxels)
-    mass = int((labels != 0).sum())
-    
-    # Height (highest non-air voxel, Y=0 is ground, so we find max Y)
-    # labels shape is [Z, Y, X], so Y is at index 1
-    non_air_coords = np.argwhere(labels != 0)
-    if len(non_air_coords) > 0:
-        max_y = non_air_coords[:, 1].max()  # Largest Y = highest point
-        height = max_y + 1  # Convert to height from ground (Y=0 is ground, so height = max_y + 1)
-    else:
-        height = 0
-    
-    # Log and leaf sizes
-    log_size = int((labels == 1).sum())
-    leaf_size = int((labels == 2).sum())
-    
-    return {
-        'Is_Main_Trunk_Broken': trunk_info['is_main_trunk_broken'],
-        'Is_Broken': trunk_info['is_broken'],
-        'Mass': mass,
-        'Height': height,
-        'Log_Size': log_size,
-        'Leaf_Size': leaf_size,
-        'Base_Connected_Size': trunk_info['base_connected_size'],
-        'Total_Log_Size': trunk_info['total_wood_size'],
-        'Largest_Log_Ratio': largest_log_ratio if largest_log_ratio >= 0 else -1.0,
-        'Occupancy_Non_Air': occ_rates['non_air'],
-        'Occupancy_Log': occ_rates['log'],
-        'Occupancy_Leaf': occ_rates['leaf'],
-        'Components_Non_Air': comp_counts['non_air'],
-        'Components_Log': comp_counts['log'],
-        'Components_Leaf': comp_counts['leaf'],
-    }
+from voxel_sample_metrics import compute_sample_metrics
 
 
 def compute_dynamics_metrics(labels: np.ndarray, t_int: int) -> Dict:
@@ -160,15 +85,6 @@ def compute_dynamics_metrics(labels: np.ndarray, t_int: int) -> Dict:
     """
     metrics = compute_sample_metrics(labels)
     metrics['t'] = t_int
-    
-    # Calculate Base_Connected_Ratio = Base_Connected_Size / Total_Log_Size
-    total_log_size = metrics.get('Total_Log_Size', metrics.get('Log_Size', 0))
-    if total_log_size > 0:
-        base_connected_ratio = metrics['Base_Connected_Size'] / total_log_size
-    else:
-        base_connected_ratio = 0.0
-    metrics['Base_Connected_Ratio'] = base_connected_ratio
-    
     return metrics
 
 
@@ -687,14 +603,6 @@ def dynamics_evaluation(
             metrics = compute_sample_metrics(labels)
             metrics['ID'] = f"{sample_idx+1:03d}"
             
-            # Add Base_Connected_Ratio to final state metrics
-            total_log_size = metrics.get('Total_Log_Size', metrics.get('Log_Size', 0))
-            if total_log_size > 0:
-                base_connected_ratio = metrics.get('Base_Connected_Size', 0) / total_log_size
-            else:
-                base_connected_ratio = 0.0
-            metrics['Base_Connected_Ratio'] = base_connected_ratio
-            
             # Calculate t_emerge and t_lockin from trace_data
             sample_trace = trace_by_sample.get(sample_idx, [])
             t_emerge, t_lockin = compute_t_emerge_and_t_lockin(sample_trace)
@@ -871,6 +779,7 @@ def save_dynamics_samples(dynamics_metrics: List[Dict], output_dir: str, console
         'Leaf_Size',
         'Base_Connected_Size',
         'Base_Connected_Ratio',
+        'Scorer_Category',
         'Largest_Log_Ratio',
         'Occupancy_Non_Air',
         'Occupancy_Log',
@@ -1203,6 +1112,7 @@ def save_dynamics_trace(trace_data: List[Dict], output_dir: str, console: Option
         'Leaf_Size',
         'Base_Connected_Size',
         'Base_Connected_Ratio',  # Before Largest_Log_Ratio
+        'Scorer_Category',
         'Largest_Log_Ratio',
         'Occupancy_Non_Air',
         'Occupancy_Log',
