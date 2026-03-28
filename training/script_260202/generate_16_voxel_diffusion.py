@@ -44,11 +44,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
@@ -66,6 +61,7 @@ except ImportError as e:
     print(f"[ERROR] Failed to import from unet_diffusion_16_voxel: {e}")
     sys.exit(1)
 
+from utils.voxel_label_projections import save_labels_and_projections
 from utils.voxel_npz_io import save_voxel_npz
 from utils.voxel_sample_metrics import (
     ALL_SCORER_CATEGORIES,
@@ -93,33 +89,6 @@ def decode_probs_to_labels(
         labels[non_log_mask] = np.where(air_or_leaf[non_log_mask] == 0, 0, 2)
     labels[log_mask] = 1
     return labels
-
-
-def save_labels_and_projections(labels: np.ndarray, out_png: str, title_suffix: str = "") -> None:
-    """三視圖 PNG（子圖標題使用 title_suffix）。"""
-    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
-
-    def priority_max(arr, axis):
-        priority = np.where(arr == 1, 3, np.where(arr == 2, 2, 1))
-        max_priority = priority.max(axis=axis)
-        return np.where(max_priority == 3, 1, np.where(max_priority == 2, 2, 0))
-
-    max_z = priority_max(labels, axis=0)
-    max_y = priority_max(labels, axis=1)
-    max_x = priority_max(labels, axis=2)
-
-    fig, axes = plt.subplots(1, 3, figsize=(9, 3))
-    axes[0].imshow(max_z)
-    axes[0].set_title("Z" + title_suffix)
-    axes[1].imshow(max_y)
-    axes[1].set_title("Y" + title_suffix)
-    axes[2].imshow(max_x)
-    axes[2].set_title("X" + title_suffix)
-    for ax in axes:
-        ax.axis("off")
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=140, bbox_inches="tight")
-    plt.close(fig)
 
 
 def load_model(checkpoint_path: str, device: torch.device) -> Tuple[nn.Module, Dict]:

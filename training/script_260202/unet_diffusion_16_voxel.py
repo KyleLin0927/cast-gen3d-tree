@@ -46,6 +46,7 @@ from typing import Tuple
 import numpy as np
 import torch
 
+from utils.voxel_label_projections import save_labels_and_projections
 from utils.voxel_npz_io import load_voxel_npz, save_voxel_npz
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1064,56 +1065,6 @@ def save_volume_and_projections(vol_logits, out_npz, out_png, title_suffix=""):
     
     fig.tight_layout()
     fig.savefig(out_heatmap_png, dpi=140)
-    plt.close(fig)
-
-
-@torch.no_grad()
-def save_labels_and_projections(labels: np.ndarray, out_png: str, title_suffix: str = "", exp_name: str = ""):
-    """
-    Save 3-view projections from discrete labels (no softmax).
-    Priority: wood (1) > leaf (2) > air (0)
-    
-    Args:
-        labels: [16,16,16] uint8 array, values in {0,1,2}
-        out_png: output png file path
-        title_suffix: optional suffix to add to the figure title
-        exp_name: experiment name to display as main title
-    """
-    import matplotlib.pyplot as plt
-    from pathlib import Path
-
-    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
-
-    def priority_max(arr, axis):
-        """Max projection with priority: wood (1) > leaf (2) > air (0)"""
-        # Create priority mask: wood=3, leaf=2, air=1
-        priority = np.where(arr == 1, 3, np.where(arr == 2, 2, 1))
-        # Find max priority along axis
-        max_priority = priority.max(axis=axis)
-        # Map back to original labels: 3->1 (wood), 2->2 (leaf), 1->0 (air)
-        result = np.where(max_priority == 3, 1, np.where(max_priority == 2, 2, 0))
-        return result
-
-    max_z = priority_max(labels, axis=0)  # XY view
-    max_y = priority_max(labels, axis=1)  # XZ view
-    max_x = priority_max(labels, axis=2)  # YZ view
-
-    fig, axes = plt.subplots(1, 3, figsize=(9, 3))
-    axes[0].imshow(max_z)
-    axes[0].set_title("Z" + title_suffix)
-    axes[1].imshow(max_y)
-    axes[1].set_title("Y" + title_suffix)
-    axes[2].imshow(max_x)
-    axes[2].set_title("X" + title_suffix)
-    for ax in axes:
-        ax.axis("off")
-    
-    # Add main title (experiment name) if provided
-    if exp_name:
-        fig.suptitle(exp_name, fontsize=12, fontweight='bold', y=1.02)
-    
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=140, bbox_inches='tight')
     plt.close(fig)
 
 
