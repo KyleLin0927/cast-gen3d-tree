@@ -22,6 +22,7 @@ batch_litematic_to_npz.py
   * 處理完成後刪除臨時文件
   * 原始文件保持不變
 - 本腳本不處理實體數據，只轉換方塊數據為 voxel 格式
+- 輸出 .npz 內陣列鍵名為 ``voxel``（int8 立方體）
 """
 
 import argparse
@@ -173,7 +174,7 @@ def process_single_file(args_tuple):
             out_rel_path_str = rel_path_str.replace('.litematic', '.npz')
             
             npz_buffer = BytesIO()
-            np.savez_compressed(npz_buffer, data=voxel)
+            np.savez_compressed(npz_buffer, voxel=voxel)
             npz_buffer.seek(0)
             return (True, rel_path_str, None, npz_buffer.getvalue(), out_rel_path_str)
         else:
@@ -188,7 +189,7 @@ def process_single_file(args_tuple):
             out_abs_path.parent.mkdir(parents=True, exist_ok=True)
             
             # 儲存
-            np.savez_compressed(str(out_abs_path), data=voxel)
+            np.savez_compressed(str(out_abs_path), voxel=voxel)
             return (True, str(rel_path), None, None, None)
     except Exception as e:
         rel_path_str = str(rel_path) if isinstance(rel_path, Path) else rel_path
