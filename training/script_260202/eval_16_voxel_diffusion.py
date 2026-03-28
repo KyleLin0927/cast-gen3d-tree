@@ -17,6 +17,8 @@
 - dynamics_timing_distribution_plot.png: t_emerge / t_lockin 分布圖
 - dynamics_xt/: x_t 三視圖目錄（使用 --save_xt_projections 時生成）
 
+（若啟用 --save_npz / 軌跡 npz：每檔僅含陣列鍵 ``voxel``；指標見對應 CSV。）
+
 使用方式:
   python eval_16_voxel_diffusion.py --checkpoint <path/to/checkpoint.pt> --n_samples 100
 """
@@ -69,7 +71,8 @@ except ImportError as e:
     print("Make sure unet_diffusion_16_voxel.py is in the same directory.")
     sys.exit(1)
 
-from voxel_sample_metrics import compute_sample_metrics
+from utils.voxel_npz_io import save_voxel_npz
+from utils.voxel_sample_metrics import compute_sample_metrics
 
 
 def compute_dynamics_metrics(labels: np.ndarray, t_int: int) -> Dict:
@@ -319,21 +322,11 @@ def batch_evaluation(
                     except Exception as e:
                         console.print(f"[yellow]⚠[/yellow] Failed to save projection for sample {sample_counter+1}: {e}")
                 
-                # Save npz file if enabled
+                # Save npz file if enabled (single array key ``voxel``; metrics stay in CSV)
                 if npz_dir:
                     try:
                         npz_path = os.path.join(npz_dir, f"simple_sample_{sample_counter+1:03d}.npz")
-                        # Save labels and metrics (flatten metrics dict into separate arrays)
-                        save_dict = {"labels": labels, "sample_id": f"{sample_counter+1:03d}"}
-                        # Add each metric as a separate array
-                        for key, value in metrics.items():
-                            if isinstance(value, (int, float, bool)):
-                                save_dict[f"metric_{key}"] = np.array([value])
-                            elif isinstance(value, np.ndarray):
-                                save_dict[f"metric_{key}"] = value
-                            else:
-                                save_dict[f"metric_{key}"] = np.array([str(value)])
-                        np.savez(npz_path, **save_dict)
+                        save_voxel_npz(npz_path, labels)
                     except Exception as e:
                         console.print(f"[yellow]⚠[/yellow] Failed to save npz for sample {sample_counter+1}: {e}")
                 
@@ -478,29 +471,14 @@ def dynamics_evaluation(
                     if console:
                         console.print(f"[yellow]⚠[/yellow] Failed to save track projection for sample {global_sample_idx+1}, step {step_idx}: {e}")
             
-            # Save npz file at this tracking step if enabled
+            # Save npz at this tracking step (single array key ``voxel``)
             if track_npz_dir:
                 try:
                     npz_path = os.path.join(
                         track_npz_dir,
                         f"dynamics_sample_{global_sample_idx+1:03d}_step_{step_idx:04d}_t_{t_int:04d}.npz"
                     )
-                    # Save labels and metrics (flatten metrics dict into separate arrays)
-                    save_dict = {
-                        "labels": labels,
-                        "sample_idx": np.array([global_sample_idx]),
-                        "step_idx": np.array([step_idx]),
-                        "t": np.array([t_int])
-                    }
-                    # Add each metric as a separate array
-                    for key, value in metrics.items():
-                        if isinstance(value, (int, float, bool)):
-                            save_dict[f"metric_{key}"] = np.array([value])
-                        elif isinstance(value, np.ndarray):
-                            save_dict[f"metric_{key}"] = value
-                        else:
-                            save_dict[f"metric_{key}"] = np.array([str(value)])
-                    np.savez(npz_path, **save_dict)
+                    save_voxel_npz(npz_path, labels)
                     track_npz_count += 1
                 except Exception as e:
                     if console:
@@ -613,28 +591,12 @@ def dynamics_evaluation(
         except Exception as e:
             console.print(f"[yellow]⚠[/yellow] Failed to compute metrics for dynamics sample {sample_idx+1}: {e}")
     
-    # Save npz files for final states
+    # Save npz files for final states (single array key ``voxel``)
     if npz_dir and final_samples:
         for sample_idx, labels in final_samples.items():
             try:
-                # Compute metrics for final state (already computed above, but need for npz)
-                metrics = compute_sample_metrics(labels)
                 npz_path = os.path.join(npz_dir, f"dynamics_sample_{sample_idx+1:03d}.npz")
-                # Save labels and metrics (flatten metrics dict into separate arrays)
-                save_dict = {
-                    "labels": labels,
-                    "sample_idx": np.array([sample_idx]),
-                    "sample_id": f"{sample_idx+1:03d}"
-                }
-                # Add each metric as a separate array
-                for key, value in metrics.items():
-                    if isinstance(value, (int, float, bool)):
-                        save_dict[f"metric_{key}"] = np.array([value])
-                    elif isinstance(value, np.ndarray):
-                        save_dict[f"metric_{key}"] = value
-                    else:
-                        save_dict[f"metric_{key}"] = np.array([str(value)])
-                np.savez(npz_path, **save_dict)
+                save_voxel_npz(npz_path, labels)
             except Exception as e:
                 console.print(f"[yellow]⚠[/yellow] Failed to save npz for dynamics sample {sample_idx+1}: {e}")
     

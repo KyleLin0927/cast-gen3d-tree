@@ -2,7 +2,7 @@
 """
 單樣本 16³ voxel 評估指標（供 eval_16_voxel_diffusion、generate_16_voxel_diffusion 等腳本重用）。
 
-依賴同目錄下 unet_diffusion_16_voxel 中的連通性與佔用率輔助函數。
+依賴上一層目錄（與本腳本同層）的 unet_diffusion_16_voxel 中的連通性與佔用率輔助函數。
 """
 
 from __future__ import annotations
@@ -13,9 +13,10 @@ from typing import Any, Dict
 
 import numpy as np
 
-_script_dir = Path(__file__).resolve().parent
-if str(_script_dir) not in sys.path:
-    sys.path.insert(0, str(_script_dir))
+# utils/ 的上一層即 script_260202（unet_diffusion_16_voxel.py 所在目錄）
+_script_260202 = Path(__file__).resolve().parents[1]
+if str(_script_260202) not in sys.path:
+    sys.path.insert(0, str(_script_260202))
 
 try:
     from unet_diffusion_16_voxel import (

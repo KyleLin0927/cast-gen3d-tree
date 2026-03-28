@@ -45,6 +45,8 @@ from typing import Tuple
 
 import numpy as np
 import torch
+
+from utils.voxel_npz_io import load_voxel_npz, save_voxel_npz
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -233,9 +235,7 @@ class VoxelDataset(Dataset):
             if console:
                 console.print(f"[cyan]Preloading {len(files)} files into RAM...[/cyan]")
             for i, path in enumerate(files):
-                with np.load(path, allow_pickle=False) as data:
-                    key = "arr_0" if "arr_0" in data else list(data.files)[0]
-                    arr = data[key]
+                arr = load_voxel_npz(path)
                 assert arr.shape == (16, 16, 16), f"Expected (16,16,16), got {arr.shape} from {path}"
                 # 優化：使用 int8 而不是 int64，節省記憶體
                 arr_int8 = arr.astype(np.int8)
@@ -322,9 +322,7 @@ class VoxelDataset(Dataset):
             labels = self.data_cache[file_idx].clone().to(torch.int64)
         else:
             path = self.files[file_idx]
-            with np.load(path, allow_pickle=False) as data:
-                key = "arr_0" if "arr_0" in data else list(data.files)[0]
-                arr = data[key]
+            arr = load_voxel_npz(path)
             assert arr.shape == (16, 16, 16), f"Expected (16,16,16), got {arr.shape} from {path}"
             labels = torch.from_numpy(arr.astype(np.int64))
 
@@ -990,7 +988,7 @@ def save_volume_and_projections(vol_logits, out_npz, out_png, title_suffix=""):
     probs = F.softmax(vol_logits, dim=0)
 
     Path(out_npz).parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out_npz, labels)
+    save_voxel_npz(out_npz, labels)
 
     # Generate 3-view projections (參考 train_VQVAE.py)
     max_z = labels.max(axis=0)  # Max projection along Z axis -> XY view
@@ -2183,10 +2181,10 @@ def train_diffusion(args):
                                 # Note: softmax is computed separately below for probability-based metrics
                                 labels_softmax = vol_linear.argmax(dim=0).numpy().astype(np.uint8)
                                 
-                                # Save npz using softmax labels (for compatibility)
+                                # Save npz: single array key ``voxel`` (class labels)
                                 npz_path = base + ".npz"
                                 Path(npz_path).parent.mkdir(parents=True, exist_ok=True)
-                                np.savez_compressed(npz_path, labels_softmax)
+                                save_voxel_npz(npz_path, labels_softmax)
                                 
                                 # Save projection image (softmax then argmax)
                                 save_labels_and_projections(

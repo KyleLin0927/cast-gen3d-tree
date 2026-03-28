@@ -4,7 +4,7 @@
 
 輸出（預設）：
 - projections/{positive,neg_float,neg_easy,neg_hard}/：各類別三視圖 PNG
-- npz/{...}/：同上（--no_npz 可關閉）
+- npz/{...}/：同上，每檔僅含陣列鍵 ``voxel``（--no_npz 可關閉）
 - sample_labels.csv: 每個樣本的 id、seed、樹幹/連通性標籤（見下方欄位）
 - sample_labels_summary.csv: 全體樣本指標加總與平均、標準差等
 - 分類定義（r = --hard_neg_llr_threshold）：
@@ -66,7 +66,8 @@ except ImportError as e:
     print(f"[ERROR] Failed to import from unet_diffusion_16_voxel: {e}")
     sys.exit(1)
 
-from voxel_sample_metrics import (
+from utils.voxel_npz_io import save_voxel_npz
+from utils.voxel_sample_metrics import (
     ALL_SCORER_CATEGORIES,
     CAT_NEG_EASY,
     CAT_NEG_FLOAT,
@@ -171,7 +172,7 @@ def compute_sample_label_row(
     hard_neg_llr_threshold: float = 0.5,
 ) -> Dict[str, Any]:
     """
-    由離散 labels 計算寫入 CSV 的一列（與 voxel_sample_metrics.compute_sample_metrics 同一套指標）。
+    由離散 labels 計算寫入 CSV 的一列（與 utils.voxel_sample_metrics.compute_sample_metrics 同一套指標）。
     largest_log_ratio 與 log_components 一律計算：前者用於 easy/hard，後者用於 positive/neg_easy/neg_hard。
     若關閉 `--omit_optional_csv_columns`，仍會用 log_components 於分類，但不會寫入 CSV 欄位。
     """
@@ -555,24 +556,7 @@ def generate_samples(
 
                     nz = npz_roots.get(cat)
                     if nz:
-                        br = float(row["base_connected_ratio"])
-                        llr = float(row["largest_log_ratio"])
-                        np.savez(
-                            os.path.join(nz, f"{stem}.npz"),
-                            labels=labels,
-                            sample_index=np.array([sid], dtype=np.int32),
-                            category=np.array(row["category"]),
-                            is_main_trunk_broken=np.array(
-                                [int(row["is_main_trunk_broken"])], dtype=np.int8
-                            ),
-                            base_connected_ratio=np.array([br], dtype=np.float32),
-                            largest_log_ratio=np.array([llr], dtype=np.float32),
-                            # Scorer 慣用：y_break=1 表示主幹斷；y_ratio 即 base_connected_ratio
-                            y_break=np.array(
-                                [int(row["is_main_trunk_broken"])], dtype=np.int8
-                            ),
-                            y_ratio=np.array([br], dtype=np.float32),
-                        )
+                        save_voxel_npz(os.path.join(nz, f"{stem}.npz"), labels)
 
                     label_rows.append(row)
                     kept_counts[cat] += 1
