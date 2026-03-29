@@ -60,7 +60,7 @@ sys.path.insert(0, str(script_dir))
 
 # Import model and functions from training script
 try:
-    from unet_diffusion_16_voxel import (
+    from training.script_260202.train_unet_diffusion import (
         UNet3DDiffusion,
         BetaSchedule,
         sample_voxels,

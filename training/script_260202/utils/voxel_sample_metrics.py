@@ -19,7 +19,7 @@ if str(_script_260202) not in sys.path:
     sys.path.insert(0, str(_script_260202))
 
 try:
-    from unet_diffusion_16_voxel import (
+    from training.script_260202.train_unet_diffusion import (
         compute_trunk_breakage,
         compute_occupancy_rates,
         compute_component_counts_26neighbor,
