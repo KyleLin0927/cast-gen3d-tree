@@ -17,8 +17,7 @@
 
 sample_labels.csv 欄位：
 - id, seed, category（positive | neg_float | neg_easy | neg_hard）, is_main_trunk_broken(0/1),
-  base_connected_ratio, base_connected_size, total_log_size, largest_log_ratio；
-  可選：log_components（--omit_optional_csv_columns 可關閉；但分類判斷仍會用到）
+  base_connected_ratio, base_connected_size, total_log_size, largest_log_ratio
 
 專案目錄即 --out_dir：所有輸出寫入該路徑（會自動建立），無需另給實驗名稱。
 
@@ -137,23 +136,20 @@ def compute_sample_label_row(
     labels: np.ndarray,
     sample_id: int,
     run_seed: Optional[int],
-    include_optional: bool = True,
     hard_neg_llr_threshold: float = 0.5,
 ) -> Dict[str, Any]:
     """
     由離散 labels 計算寫入 CSV 的一列（與 utils.voxel_sample_metrics.compute_sample_metrics 同一套指標）。
-    largest_log_ratio 與 log_components 一律計算：前者用於 easy/hard，後者用於 positive/neg_easy/neg_hard。
-    若關閉 `--omit_optional_csv_columns`，仍會用 log_components 於分類，但不會寫入 CSV 欄位。
+    category 仍依連通塊等規則由 compute_sample_metrics 決定；CSV 不寫 log_components。
     """
     m = compute_sample_metrics(labels, hard_neg_llr_threshold=hard_neg_llr_threshold)
     base_sz = int(m["Base_Connected_Size"])
     total_log = int(m["Total_Log_Size"])
     ratio = float(m["Base_Connected_Ratio"])
     llr_store = round(float(m["Largest_Log_Ratio"]), 6) if m["Largest_Log_Ratio"] >= 0 else -1.0
-    log_components = int(m["Components_Log"])
     broken = bool(m["Is_Main_Trunk_Broken"])
 
-    row: Dict[str, Any] = {
+    return {
         "id": sample_id,
         "seed": "" if run_seed is None else int(run_seed),
         "category": m["Scorer_Category"],
@@ -164,18 +160,12 @@ def compute_sample_label_row(
         "largest_log_ratio": llr_store,
     }
 
-    if include_optional:
-        row["log_components"] = log_components
-
-    return row
-
 
 def write_sample_labels_csv(
     rows: List[Dict[str, Any]],
     path: str,
-    include_optional: bool,
 ) -> None:
-    base_fields = [
+    fieldnames = [
         "id",
         "seed",
         "category",
@@ -185,8 +175,6 @@ def write_sample_labels_csv(
         "total_log_size",
         "largest_log_ratio",
     ]
-    optional_fields = ["log_components"]
-    fieldnames = base_fields + (optional_fields if include_optional else [])
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -199,7 +187,6 @@ def write_sample_labels_csv(
 def write_sample_labels_summary_csv(
     rows: List[Dict[str, Any]],
     path: str,
-    include_optional: bool,
     hard_neg_llr_threshold: float,
 ) -> None:
     """由 per-sample 列計算統計，寫成兩欄 CSV（Metric, Value）。"""
@@ -290,56 +277,6 @@ def write_sample_labels_summary_csv(
     llr_all = np.array([float(r["largest_log_ratio"]) for r in rows])
     valid = llr_all >= 0.0
 
-    if include_optional:
-        lc = np.array([float(r["log_components"]) for r in rows])
-        lc_known = lc >= 0.0
-
-        add_section("log_components")
-        lines.append(["mean", f"{float(lc.mean()):.4f}"])
-        lines.append(["std", f"{float(lc.std()):.4f}"])
-        lines.append(["min", str(int(lc.min()))])
-        lines.append(["max", str(int(lc.max()))])
-        if lc_known.any():
-            lc_ok = lc[lc_known]
-            nk = int(lc_known.sum())
-            n_single = int((lc_ok == 1).sum())
-            n_multi = int((lc_ok > 1).sum())
-            n_zero = int((lc_ok == 0).sum())
-            lines.append(["n_samples_known", str(nk)])
-            lines.append(
-                [
-                    "pct_samples_single_log_component",
-                    f"{100.0 * n_single / nk:.4f}",
-                ]
-            )
-            lines.append(
-                [
-                    "pct_samples_multi_log_component",
-                    f"{100.0 * n_multi / nk:.4f}",
-                ]
-            )
-            lines.append(
-                [
-                    "pct_samples_zero_log_components",
-                    f"{100.0 * n_zero / nk:.4f}",
-                ]
-            )
-        if (lc_known & (tls > 0)).any():
-            mask = lc_known & (tls > 0)
-            r_multi = lc[mask] > 1
-            lines.append(
-                [
-                    "pct_multi_component_given_any_log",
-                    f"{100.0 * float(np.mean(r_multi)):.4f}",
-                ]
-            )
-            lines.append(
-                [
-                    "note_pct_multi_given_log",
-                    "among samples with total_log_size>0 and known log_components",
-                ]
-            )
-
     add_section("largest_log_ratio")
     lines.append(["n_valid (>=0)", str(int(valid.sum()))])
     lines.append(["n_invalid (-1 / missing)", str(int((~valid).sum()))])
@@ -418,7 +355,6 @@ def generate_samples(
     filename_prefix: str = "sample",
     sample_verbose: bool = False,
     run_seed: Optional[int] = None,
-    include_optional_csv_columns: bool = True,
     hard_neg_llr_threshold: float = 0.5,
     console: Optional[Console] = None,
 ) -> Tuple[float, List[Dict[str, Any]]]:
@@ -481,7 +417,6 @@ def generate_samples(
                     labels,
                     sample_id=sid,
                     run_seed=run_seed,
-                    include_optional=include_optional_csv_columns,
                     hard_neg_llr_threshold=hard_neg_llr_threshold,
                 )
                 cat = row["category"]
@@ -491,7 +426,7 @@ def generate_samples(
                     save_labels_and_projections(
                         labels,
                         png_path,
-                        title_suffix=f" {stem} [{cat}]",
+                        exp_name=stem,
                     )
 
                 nz = npz_roots.get(cat)
@@ -504,16 +439,13 @@ def generate_samples(
                 progress.update(task, advance=1)
 
     csv_path = os.path.join(out_dir, "sample_labels.csv")
-    write_sample_labels_csv(
-        label_rows, csv_path, include_optional=include_optional_csv_columns
-    )
+    write_sample_labels_csv(label_rows, csv_path)
     console.print(f"[green]✓[/green] Sample labels: {csv_path}")
 
     summary_path = os.path.join(out_dir, "sample_labels_summary.csv")
     write_sample_labels_summary_csv(
         label_rows,
         summary_path,
-        include_optional=include_optional_csv_columns,
         hard_neg_llr_threshold=hard_neg_llr_threshold,
     )
     console.print(f"[green]✓[/green] Summary: {summary_path}")
@@ -605,11 +537,6 @@ def main() -> None:
         "--sample_verbose",
         action="store_true",
         help="Per-step prints from sample_voxels (slow, noisy)",
-    )
-    parser.add_argument(
-        "--omit_optional_csv_columns",
-        action="store_true",
-        help="Do not write log_components in sample_labels.csv",
     )
     parser.add_argument(
         "--hard_neg_llr_threshold",
@@ -704,7 +631,6 @@ def main() -> None:
         "sample_labels_summary_csv": os.path.join(
             os.path.abspath(args.out_dir), "sample_labels_summary.csv"
         ),
-        "omit_optional_csv_columns": str(args.omit_optional_csv_columns),
         # r：neg_hard 門檻 largest_log_ratio >= r（components>1 且接地後才會用到）
         "r": f"{args.hard_neg_llr_threshold:.10g}",
         "hard_neg_llr_threshold": f"{args.hard_neg_llr_threshold:.10g}",
@@ -750,7 +676,6 @@ def main() -> None:
         filename_prefix=args.prefix,
         sample_verbose=args.sample_verbose,
         run_seed=args.seed,
-        include_optional_csv_columns=not args.omit_optional_csv_columns,
         hard_neg_llr_threshold=args.hard_neg_llr_threshold,
         console=console,
     )
