@@ -19,8 +19,10 @@
 
 （若啟用 --save_npz / 軌跡 npz：每檔僅含陣列鍵 ``voxel``；指標見對應 CSV。）
 
+輸出目錄為 ``--out_dir``。圖表／投影圖的實驗標題（metadata 的 ``exp_name``）為 ``out_dir`` 路徑最後一層目錄名；若無法取得（例如根目錄 ``/``），則使用 ``eval_YYYYMMDD_HHMMSS``。
+
 使用方式:
-  python eval_16_voxel_diffusion.py --checkpoint <path/to/checkpoint.pt> --n_samples 100
+  python eval_diffusion_model.py --checkpoint <path/to/checkpoint.pt> --out_dir ./runs/my_eval --n_samples 100
 """
 
 import argparse
@@ -1609,10 +1611,12 @@ def main():
     
     # Output
     parser.add_argument(
-        "--exp_name",
+        "--out_dir",
         type=str,
         required=True,
-        help="Experiment name (used as output directory name, e.g., 'baseline_eval_v1')"
+        help="Output directory for all evaluation artifacts (created if missing). "
+        "Last path component is used as the experiment label for figures and metadata; "
+        "if missing, eval_YYYYMMDD_HHMMSS is used.",
     )
     
     # Misc
@@ -1687,11 +1691,16 @@ def main():
     use_amp = (device.type == "cuda") and (not args.no_amp)
     console.print(f"[cyan]Mixed precision: {use_amp}[/cyan]\n")
     
-    # Use experiment name directly as output directory
-    exp_output_dir = args.exp_name
+    exp_output_dir = os.path.abspath(os.path.expanduser(args.out_dir))
     os.makedirs(exp_output_dir, exist_ok=True)
-    console.print(f"[cyan]Experiment name: {args.exp_name}[/cyan]")
-    console.print(f"[cyan]Output directory: {exp_output_dir}[/cyan]\n")
+    out_dir_leaf = Path(exp_output_dir).name
+    if not out_dir_leaf:
+        out_dir_leaf = f"eval_{eval_start_time.strftime('%Y%m%d_%H%M%S')}"
+    console.print(f"[cyan]Output directory: {exp_output_dir}[/cyan]")
+    console.print(
+        f"[cyan]Experiment label (figures / metadata): {out_dir_leaf}[/cyan] "
+        f"([dim]from last component of --out_dir, or eval_* timestamp if empty[/dim])\n"
+    )
     
     # Helper function for boolean to string
     def bool_to_str(v):
@@ -1703,7 +1712,8 @@ def main():
     
     # Prepare initial metadata
     initial_metadata = {
-        "exp_name": args.exp_name,
+        "exp_name": out_dir_leaf,
+        "out_dir_leaf": out_dir_leaf,
         "evaluation_start_time": eval_start_time.strftime("%Y-%m-%d %H:%M:%S"),
         "execution_cwd": os.getcwd(),
         "execution_command": invocation_command,
@@ -1774,7 +1784,7 @@ def main():
         batch_size=batch_eval_batch_size,
         use_amp=use_amp,
         output_dir=exp_output_dir,
-        exp_name=args.exp_name,
+        exp_name=out_dir_leaf,
         save_projections=not args.no_projections,
         save_npz=args.save_npz,
         log_mask_threshold=args.log_mask_threshold,
@@ -1813,7 +1823,7 @@ def main():
         batch_size=dynamics_batch_size,
         use_amp=use_amp,
         output_dir=exp_output_dir,
-        exp_name=args.exp_name,
+        exp_name=out_dir_leaf,
         save_projections=not args.no_projections,
         save_track_projections=args.save_track_projections,
         save_xt_projections=args.save_xt_projections,

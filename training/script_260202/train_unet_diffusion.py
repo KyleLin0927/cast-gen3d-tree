@@ -19,8 +19,10 @@
   * Occupancy Rate (佔用率) - 生成 voxel 的非空氣比例
   * Component Count (連通數量) - 生成物體的連通組件數量
 
+實驗輸出目錄為 ``--out_dir``（會建立）。W&B / metadata / 歷史 CSV 檔名所用的實驗名稱為該路徑**最後一層目錄名**；若無法取得（例如 ``/``），則使用 ``train_YYYYMMDD_HHMMSS``。
+
 使用方式:
-  python unet_diffusion_16_voxel_wand.py --data_root <path> --use_wandb
+  python train_unet_diffusion.py --data_root <path> --out_dir ./runs/my_exp --use_wandb
 
 需要安裝:
   pip install wandb
@@ -1222,8 +1224,8 @@ def train_diffusion(args):
         # Format: [1, 3, 1, 1, 1] for broadcasting with [B, 3, 16, 16, 16]
         loss_weights = class_weights_base.to(device=device).view(1, 3, 1, 1, 1)
 
-    # Output directory
-    exp_dir = os.path.join(args.out_dir, args.exp_name)
+    # Experiment root = --out_dir (resolved); labeling name = last path component (or train_* timestamp)
+    exp_dir = os.path.abspath(os.path.expanduser(args.out_dir))
     
     # Check if experiment directory already exists and is not empty (unless resuming)
     if not args.resume:
@@ -1232,13 +1234,18 @@ def train_diffusion(args):
                 Panel.fit(
                     "[bold red]ERROR: Experiment Directory Not Empty[/bold red]\n\n"
                     f"[yellow]{exp_dir}[/yellow]\n"
-                    "Use another --exp_name, clean directory, or use --resume.",
+                    "Use another --out_dir (different path / last folder name), clean directory, or use --resume.",
                     border_style="red",
                 )
             )
             raise SystemExit(1)
     
     os.makedirs(exp_dir, exist_ok=True)
+    console.print(f"[cyan]Experiment directory: {exp_dir}[/cyan]")
+    console.print(
+        f"[cyan]Run label (W&B / metadata):[/cyan] {args.exp_name} "
+        f"([dim]from last component of --out_dir[/dim])"
+    )
     ckpt_dir = os.path.join(exp_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
     samples_dir = os.path.join(exp_dir, "samples")
@@ -1296,6 +1303,7 @@ def train_diffusion(args):
     # Note: start_epoch is set correctly after resume check above
     initial_metadata = {
         "exp_name": args.exp_name,
+        "out_dir_leaf": args.exp_name,
         "resumed_from": args.resume if args.resume else "None",
         "start_epoch": start_epoch,
         "end_epoch": args.epochs,
@@ -1306,7 +1314,7 @@ def train_diffusion(args):
         "last_checkpoint_path": os.path.join(ckpt_dir, "last.pt"),
         "samples_directory": samples_dir,
         "data_root": args.data_root,
-        "out_dir": args.out_dir,
+        "out_dir": exp_dir,
         "exp_dir": exp_dir,
         "script_name": current_script,
         "n_train_files": len(train_files),
@@ -2753,8 +2761,16 @@ def main():
     # Data
     parser.add_argument("--data_root", type=str, default=None, help="Path to data directory (with train/val subdirs)")
     parser.add_argument("--data_zip", type=str, default=None, help="Path to zip file containing train/val/test subdirs")
-    parser.add_argument("--out_dir", type=str, default="./outputs", help="Output directory for experiments")
-    parser.add_argument("--exp_name", type=str, default=None, help="Experiment name (default: timestamp)")
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default="./outputs",
+        help=(
+            "Experiment directory (created if missing); checkpoints, samples, and CSVs go here. "
+            "Last path component is used as the run label (W&B name, metadata exp_name, CSV suffixes); "
+            "if missing, train_YYYYMMDD_HHMMSS is used."
+        ),
+    )
 
     # Model
     parser.add_argument("--base_channels", type=int, default=64, help="Base number of channels")
@@ -2848,9 +2864,12 @@ def main():
             console.print(f"[red]Zip path: {args.data_zip}[/red]")
             raise
 
-    # Set default experiment name
-    if args.exp_name is None:
-        args.exp_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_dir_abs = os.path.abspath(os.path.expanduser(args.out_dir))
+    out_dir_leaf = Path(exp_dir_abs).name
+    if not out_dir_leaf:
+        out_dir_leaf = f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # Synthetic field: same role as former --exp_name (W&B, metadata, checkpoint vars(args))
+    args.exp_name = out_dir_leaf
 
     train_diffusion(args)
     

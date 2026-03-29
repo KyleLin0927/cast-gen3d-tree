@@ -25,10 +25,11 @@ sample_labels.csv 欄位：
 - source_name：相對於 ``--out_dir`` 的 POSIX 路徑，優先對應寫出的 ``npz/<category>/<stem>.npz``；若 ``--no_npz`` 則為 ``projections/<category>/<stem>.png``；兩者皆關則為空字串
 （以上對應 utils.voxel_sample_metrics.compute_sample_metrics 回傳之指標，外加 artifact 路徑）
 
-專案目錄即 --out_dir：所有輸出寫入該路徑（會自動建立），無需另給實驗名稱。
+專案目錄即 --out_dir：所有輸出寫入該路徑（會自動建立）。
+實驗名稱與輸出檔名前綴（PNG/NPZ 的 ``<prefix>_<id>``）一律為 ``out_dir`` 路徑的最後一層目錄名稱（例如 ``--out_dir ./runs/exp_001`` → ``exp_001``）。
 
 使用方式:
-  python generate_16_voxel_diffusion.py --checkpoint path/to/model.pt --out_dir ./my_project --exp_name exp_001 --n_samples 50 --basename sample
+  python generate_16_voxel_diffusion.py --checkpoint path/to/model.pt --out_dir ./my_project --n_samples 50
 """
 
 from __future__ import annotations
@@ -599,13 +600,10 @@ def main() -> None:
         "--out_dir",
         type=str,
         required=True,
-        help="Project directory (created if missing); all outputs go here",
-    )
-    parser.add_argument(
-        "--exp_name",
-        type=str,
-        default="",
-        help="Generation experiment name (for metadata / run tracking)",
+        help=(
+            "Project directory (created if missing); all outputs go here. "
+            "Last path component is used as experiment name and output filename prefix."
+        ),
     )
     parser.add_argument("--n_samples", type=int, default=32, help="Number of samples")
     parser.add_argument("--batch_size", type=int, default=10)
@@ -632,16 +630,6 @@ def main() -> None:
         default=None,
         help="Log-mask decode threshold; omit for argmax",
     )
-    # Output file naming: <basename>_<number>.(png|npz)
-    # Keep --prefix for backward compatibility; prefer --basename going forward.
-    parser.add_argument(
-        "--basename",
-        "--prefix",
-        dest="prefix",
-        type=str,
-        default="sample",
-        help="Output filename base. Files are named like <basename>_<number>.* (alias: --prefix)",
-    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--sample_verbose",
@@ -662,6 +650,10 @@ def main() -> None:
 
     args = parser.parse_args()
     t_start = datetime.now()
+
+    out_dir_leaf = Path(args.out_dir).expanduser().resolve().name
+    if not out_dir_leaf:
+        out_dir_leaf = "sample"
 
     if args.seed is not None:
         import random
@@ -702,8 +694,10 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
     console.print(f"[cyan]Project directory:[/cyan] {os.path.abspath(args.out_dir)}")
-    if args.exp_name:
-        console.print(f"[cyan]Experiment name:[/cyan] {args.exp_name}")
+    console.print(
+        f"[cyan]Experiment name / filename prefix:[/cyan] {out_dir_leaf} "
+        f"([dim]from last component of --out_dir[/dim])"
+    )
 
     script_snapshot_path = ""
     if "__file__" in globals():
@@ -717,7 +711,8 @@ def main() -> None:
         "run_start": t_start.strftime("%Y-%m-%d %H:%M:%S"),
         "checkpoint": args.checkpoint,
         "out_dir": os.path.abspath(args.out_dir),
-        "exp_name": args.exp_name if args.exp_name else "None",
+        "exp_name": out_dir_leaf,
+        "out_dir_leaf": out_dir_leaf,
         "command": get_invocation_command(),
         "script_snapshot_py": script_snapshot_path or "None",
         "n_samples": args.n_samples,
@@ -735,8 +730,7 @@ def main() -> None:
         "save_projections": str(not args.no_projections),
         "save_npz": str(save_npz),
         "no_npz": str(args.no_npz),
-        "basename": args.prefix,
-        "prefix": args.prefix,  # backward-compatible key for existing parsers
+        "filename_prefix": out_dir_leaf,
         "sample_labels_csv": os.path.join(os.path.abspath(args.out_dir), "sample_labels.csv"),
         "sample_labels_summary_csv": os.path.join(
             os.path.abspath(args.out_dir), "sample_labels_summary.csv"
@@ -783,7 +777,7 @@ def main() -> None:
         save_projections=not args.no_projections,
         save_npz=save_npz,
         log_mask_threshold=args.log_mask_threshold,
-        filename_prefix=args.prefix,
+        filename_prefix=out_dir_leaf,
         sample_verbose=args.sample_verbose,
         run_seed=args.seed,
         hard_neg_llr_threshold=args.hard_neg_llr_threshold,

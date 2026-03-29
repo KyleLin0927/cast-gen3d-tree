@@ -5,9 +5,11 @@
 使用 utils.voxel_npz_io.load_voxel_npz 與 utils.voxel_sample_metrics.compute_sample_metrics。
 輸出 sample_labels.csv、sample_labels_summary.csv；欄位與兩個 generate 腳本一致，**最後**一欄皆為 ``source_name``：此處為相對於 ``--npz_dir``（掃描根）的原始 .npz 路徑（POSIX 斜線；無法相對化時為檔名）。generate 腳本則為相對於 ``--out_dir`` 的 ``npz/...`` 或 ``projections/...``。
 
+投影圖主標題（``exp_name`` 傳給 ``save_labels_and_projections``）為 ``--out_dir`` 解析後路徑的最後一層目錄名（預設 ``out_dir`` 與 ``--npz_dir`` 相同時即為該目錄名）；若無法取得則為 ``eval_YYYYMMDD_HHMMSS``。
+
 使用方式:
-  python eval_voxel_npz_folder.py --npz_dir /path/to/npz_root [--out_dir /path/to/out]
-  python eval_voxel_npz_folder.py --npz_dir ./npz/positive --recursive
+  python eval_multi_npz.py --npz_dir /path/to/npz_root [--out_dir /path/to/out]
+  python eval_multi_npz.py --npz_dir ./npz/positive --recursive
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import csv
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -464,12 +467,6 @@ def main() -> None:
         default=None,
         help="Directory for PNGs (default: <out_dir>/projections)",
     )
-    parser.add_argument(
-        "--exp_name",
-        type=str,
-        default=None,
-        help="Figure suptitle for projections (default: last component of --out_dir)",
-    )
     args = parser.parse_args()
 
     console = Console()
@@ -488,11 +485,15 @@ def main() -> None:
         )
         os.makedirs(projections_dir, exist_ok=True)
 
-    projection_exp_name = (
-        args.exp_name.strip()
-        if args.exp_name is not None and args.exp_name.strip()
-        else out_dir_abs.name
-    )
+    projection_leaf = out_dir_abs.name
+    if not projection_leaf:
+        projection_leaf = f"eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    projection_exp_name = projection_leaf
+    if save_projections:
+        console.print(
+            f"[cyan]Projection figure title:[/cyan] {projection_exp_name} "
+            f"([dim]from last component of --out_dir[/dim])"
+        )
 
     expected: Optional[Tuple[int, int, int]] = None if args.no_require_16_cube else (16, 16, 16)
 
