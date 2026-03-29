@@ -5,7 +5,7 @@
 輸出（預設）：
 - projections/{positive,neg_float,neg_easy,neg_hard}/：各類別三視圖 PNG
 - npz/{...}/：同上，每檔僅含陣列鍵 ``voxel``（--no_npz 可關閉）
-- sample_labels.csv: 每個樣本的 id、seed、樹幹/連通性標籤（見下方欄位）
+- sample_labels.csv: 每個樣本的 id、seed、分類與 compute_sample_metrics 之完整指標（見下方欄位）
 - sample_labels_summary.csv: 全體樣本指標加總與平均、標準差等
 - 分類定義（r = --hard_neg_llr_threshold）：
   - neg_float：base_connected_size==0（連地板都沒碰到）
@@ -16,8 +16,14 @@
 - generate_16_voxel_diffusion_snapshot_YYYYMMDD_HHMMSS.py：執行當下本腳本完整備份
 
 sample_labels.csv 欄位：
-- id, seed, category（positive | neg_float | neg_easy | neg_hard）, is_main_trunk_broken(0/1),
-  base_connected_ratio, base_connected_size, total_log_size, largest_log_ratio
+- id, seed, category（positive | neg_float | neg_easy | neg_hard）
+- is_main_trunk_broken(0/1), is_broken(0/1)
+- mass, height, log_size, leaf_size
+- base_connected_ratio, base_connected_size, total_log_size, largest_log_ratio（無效時 -1）
+- occupancy_non_air, occupancy_log, occupancy_leaf
+- components_non_air, components_log, components_leaf
+- source_name：相對於 ``--out_dir`` 的 POSIX 路徑，優先 ``npz/<category>/<stem>.npz``；若 ``--no_npz`` 則為 ``projections/<category>/<stem>.png``；兩者皆關則為空字串
+（以上對應 utils.voxel_sample_metrics.compute_sample_metrics 回傳之指標，外加 artifact 路徑）
 
 專案目錄即 --out_dir：所有輸出寫入該路徑（會自動建立）。
 實驗名稱與輸出檔名前綴（PNG/NPZ 的 ``<prefix>_<id>``）一律為 ``out_dir`` 路徑的最後一層目錄名稱（例如 ``--out_dir ./runs/exp_001`` → ``exp_001``）。
@@ -140,25 +146,32 @@ def compute_sample_label_row(
     hard_neg_llr_threshold: float = 0.5,
 ) -> Dict[str, Any]:
     """
-    由離散 labels 計算寫入 CSV 的一列（與 utils.voxel_sample_metrics.compute_sample_metrics 同一套指標）。
-    category 仍依連通塊等規則由 compute_sample_metrics 決定；CSV 不寫 log_components。
+    由離散 labels 計算寫入 CSV 的一列；欄位涵蓋 compute_sample_metrics 目前回傳的所有指標。
     """
     m = compute_sample_metrics(labels, hard_neg_llr_threshold=hard_neg_llr_threshold)
-    base_sz = int(m["Base_Connected_Size"])
-    total_log = int(m["Total_Log_Size"])
-    ratio = float(m["Base_Connected_Ratio"])
-    llr_store = round(float(m["Largest_Log_Ratio"]), 6) if m["Largest_Log_Ratio"] >= 0 else -1.0
-    broken = bool(m["Is_Main_Trunk_Broken"])
+    llr = m["Largest_Log_Ratio"]
+    llr_store = round(float(llr), 6) if llr >= 0 else -1.0
 
     return {
         "id": sample_id,
         "seed": "" if run_seed is None else int(run_seed),
         "category": m["Scorer_Category"],
-        "is_main_trunk_broken": 1 if broken else 0,
-        "base_connected_ratio": round(ratio, 6),
-        "base_connected_size": base_sz,
-        "total_log_size": total_log,
+        "is_main_trunk_broken": 1 if m["Is_Main_Trunk_Broken"] else 0,
+        "is_broken": 1 if m["Is_Broken"] else 0,
+        "mass": int(m["Mass"]),
+        "height": int(m["Height"]),
+        "log_size": int(m["Log_Size"]),
+        "leaf_size": int(m["Leaf_Size"]),
+        "base_connected_ratio": round(float(m["Base_Connected_Ratio"]), 6),
+        "base_connected_size": int(m["Base_Connected_Size"]),
+        "total_log_size": int(m["Total_Log_Size"]),
         "largest_log_ratio": llr_store,
+        "occupancy_non_air": round(float(m["Occupancy_Non_Air"]), 6),
+        "occupancy_log": round(float(m["Occupancy_Log"]), 6),
+        "occupancy_leaf": round(float(m["Occupancy_Leaf"]), 6),
+        "components_non_air": int(m["Components_Non_Air"]),
+        "components_log": int(m["Components_Log"]),
+        "components_leaf": int(m["Components_Leaf"]),
     }
 
 
@@ -171,10 +184,22 @@ def write_sample_labels_csv(
         "seed",
         "category",
         "is_main_trunk_broken",
+        "is_broken",
+        "mass",
+        "height",
+        "log_size",
+        "leaf_size",
         "base_connected_ratio",
         "base_connected_size",
         "total_log_size",
         "largest_log_ratio",
+        "occupancy_non_air",
+        "occupancy_log",
+        "occupancy_leaf",
+        "components_non_air",
+        "components_log",
+        "components_leaf",
+        "source_name",
     ]
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -237,6 +262,14 @@ def write_sample_labels_summary_csv(
     lines.append(["broken_rate_pct", f"{100.0 * n_broken / n:.4f}"])
     lines.append(["intact_rate_pct", f"{100.0 * n_intact / n:.4f}"])
 
+    broken_flag = np.array([int(r["is_broken"]) for r in rows], dtype=np.float64)
+    n_bf = int(broken_flag.sum())
+    add_section("Broken flag (is_broken)")
+    lines.append(["broken_count", str(n_bf)])
+    lines.append(["intact_count", str(n - n_bf)])
+    lines.append(["broken_rate_pct", f"{100.0 * n_bf / n:.4f}"])
+    lines.append(["intact_rate_pct", f"{100.0 * (n - n_bf) / n:.4f}"])
+
     sum_tls = float(tls.sum())
     sum_bcs = float(bcs.sum())
     pooled_ratio = (sum_bcs / sum_tls) if sum_tls > 0 else 0.0
@@ -274,6 +307,76 @@ def write_sample_labels_summary_csv(
     lines.append(["std", f"{float(tls.std()):.4f}"])
     lines.append(["min", str(int(tls.min()))])
     lines.append(["max", str(int(tls.max()))])
+
+    mass = np.array([float(r["mass"]) for r in rows])
+    add_section("mass")
+    lines.append(["mean", f"{float(mass.mean()):.4f}"])
+    lines.append(["std", f"{float(mass.std()):.4f}"])
+    lines.append(["min", str(int(mass.min()))])
+    lines.append(["max", str(int(mass.max()))])
+
+    height = np.array([float(r["height"]) for r in rows])
+    add_section("height")
+    lines.append(["mean", f"{float(height.mean()):.4f}"])
+    lines.append(["std", f"{float(height.std()):.4f}"])
+    lines.append(["min", str(int(height.min()))])
+    lines.append(["max", str(int(height.max()))])
+
+    log_sz = np.array([float(r["log_size"]) for r in rows])
+    add_section("log_size")
+    lines.append(["mean", f"{float(log_sz.mean()):.4f}"])
+    lines.append(["std", f"{float(log_sz.std()):.4f}"])
+    lines.append(["min", str(int(log_sz.min()))])
+    lines.append(["max", str(int(log_sz.max()))])
+
+    leaf_sz = np.array([float(r["leaf_size"]) for r in rows])
+    add_section("leaf_size")
+    lines.append(["mean", f"{float(leaf_sz.mean()):.4f}"])
+    lines.append(["std", f"{float(leaf_sz.std()):.4f}"])
+    lines.append(["min", str(int(leaf_sz.min()))])
+    lines.append(["max", str(int(leaf_sz.max()))])
+
+    occ_na = np.array([float(r["occupancy_non_air"]) for r in rows])
+    add_section("occupancy_non_air")
+    lines.append(["mean", f"{float(occ_na.mean()):.6f}"])
+    lines.append(["std", f"{float(occ_na.std()):.6f}"])
+    lines.append(["min", f"{float(occ_na.min()):.6f}"])
+    lines.append(["max", f"{float(occ_na.max()):.6f}"])
+
+    occ_lg = np.array([float(r["occupancy_log"]) for r in rows])
+    add_section("occupancy_log")
+    lines.append(["mean", f"{float(occ_lg.mean()):.6f}"])
+    lines.append(["std", f"{float(occ_lg.std()):.6f}"])
+    lines.append(["min", f"{float(occ_lg.min()):.6f}"])
+    lines.append(["max", f"{float(occ_lg.max()):.6f}"])
+
+    occ_lf = np.array([float(r["occupancy_leaf"]) for r in rows])
+    add_section("occupancy_leaf")
+    lines.append(["mean", f"{float(occ_lf.mean()):.6f}"])
+    lines.append(["std", f"{float(occ_lf.std()):.6f}"])
+    lines.append(["min", f"{float(occ_lf.min()):.6f}"])
+    lines.append(["max", f"{float(occ_lf.max()):.6f}"])
+
+    comp_na = np.array([float(r["components_non_air"]) for r in rows])
+    add_section("components_non_air")
+    lines.append(["mean", f"{float(comp_na.mean()):.4f}"])
+    lines.append(["std", f"{float(comp_na.std()):.4f}"])
+    lines.append(["min", str(int(comp_na.min()))])
+    lines.append(["max", str(int(comp_na.max()))])
+
+    comp_lg = np.array([float(r["components_log"]) for r in rows])
+    add_section("components_log")
+    lines.append(["mean", f"{float(comp_lg.mean()):.4f}"])
+    lines.append(["std", f"{float(comp_lg.std()):.4f}"])
+    lines.append(["min", str(int(comp_lg.min()))])
+    lines.append(["max", str(int(comp_lg.max()))])
+
+    comp_lf = np.array([float(r["components_leaf"]) for r in rows])
+    add_section("components_leaf")
+    lines.append(["mean", f"{float(comp_lf.mean()):.4f}"])
+    lines.append(["std", f"{float(comp_lf.std()):.4f}"])
+    lines.append(["min", str(int(comp_lf.min()))])
+    lines.append(["max", str(int(comp_lf.max()))])
 
     llr_all = np.array([float(r["largest_log_ratio"]) for r in rows])
     valid = llr_all >= 0.0
@@ -462,6 +565,13 @@ def generate_samples(
                     nz = npz_roots.get(cat)
                     if nz:
                         save_voxel_npz(os.path.join(nz, f"{stem}.npz"), labels)
+
+                    if save_npz:
+                        row["source_name"] = f"npz/{cat}/{stem}.npz"
+                    elif save_projections and pr:
+                        row["source_name"] = f"projections/{cat}/{stem}.png"
+                    else:
+                        row["source_name"] = ""
 
                     label_rows.append(row)
                     kept_counts[cat] += 1
