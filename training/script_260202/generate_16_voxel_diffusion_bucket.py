@@ -57,7 +57,7 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir))
 
 try:
-    from training.script_260202.train_unet_diffusion import (
+    from train_unet_diffusion import (
         BetaSchedule,
         UNet3DDiffusion,
         centered_to_onehot,
