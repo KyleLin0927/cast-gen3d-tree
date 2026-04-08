@@ -57,7 +57,7 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir))
 
 try:
-    from training.script_260202.train_unet_diffusion import (
+    from train_unet_diffusion import (
         BetaSchedule,
         UNet3DDiffusion,
         centered_to_onehot,
@@ -444,6 +444,137 @@ def fmt_secs(s: float) -> str:
     return f"{m:02d}m {s:02d}s"
 
 
+def load_scorer(checkpoint_path: str, device: torch.device) -> nn.Module:
+    console = Console()
+    console.print(f"[cyan]Loading scorer checkpoint: {checkpoint_path}[/cyan]")
+    scorer_ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    try:
+        from train_scorer import TopologyScorer3D
+    except ImportError as e:
+        raise ImportError(
+            "Failed to import `TopologyScorer3D` from `train_scorer.py`."
+        ) from e
+
+    scorer = TopologyScorer3D().to(device)
+    # `train_scorer.py` saves in two possible formats:
+    # 1) best/bundled checkpoint: {"model_state_dict": ..., "epoch": ..., ...}
+    # 2) periodic checkpoint: plain state_dict (when using torch.save(model.state_dict(), ...))
+    if isinstance(scorer_ckpt, dict) and "model_state_dict" in scorer_ckpt:
+        state_dict = scorer_ckpt["model_state_dict"]
+    else:
+        state_dict = scorer_ckpt
+
+    if not isinstance(state_dict, dict):
+        raise TypeError(
+            "Unsupported scorer checkpoint format. Expected dict-like state_dict, "
+            f"but got type={type(scorer_ckpt).__name__}"
+        )
+
+    # Strict load to catch accidental mismatch; adjust to strict=False only if you see missing keys.
+    scorer.load_state_dict(state_dict, strict=True)
+    scorer.eval()
+    console.print(f"[green]✓[/green] Scorer loaded: {checkpoint_path}")
+    if isinstance(scorer_ckpt, dict) and "epoch" in scorer_ckpt:
+        console.print(
+            f"[green]✓[/green] Scorer checkpoint epoch: {scorer_ckpt.get('epoch', 'unknown')}"
+        )
+    return scorer
+
+
+@torch.no_grad()
+def sample_guided_voxels(
+    denoiser_model: nn.Module,
+    scorer_model: nn.Module,
+    betas: BetaSchedule,
+    shape: Tuple[int, ...],
+    device: torch.device,
+    guidance_scale: float = 50.0,
+    lambda_ratio: float = 10.0,
+    t_start: int = 900,
+    t_end: int = 400,
+    n_steps: Optional[int] = None,
+    use_amp: bool = False,
+) -> torch.Tensor:
+    """
+    Guided DDPM sampling where a scorer provides gradient-based guidance.
+
+    Guidance is applied only for timesteps in [min(t_start,t_end), max(t_start,t_end)] (inclusive).
+    """
+    T = betas.T
+    if n_steps is None:
+        n_steps = T
+
+    B, C, H, W, D = shape
+    if (C, H, W, D) != (3, 16, 16, 16):
+        raise ValueError(f"Expected shape=(B,3,16,16,16), got {shape}")
+
+    guidance_lo = int(min(t_start, t_end))
+    guidance_hi = int(max(t_start, t_end))
+    guidance_lo = max(0, guidance_lo)
+    guidance_hi = min(T - 1, guidance_hi)
+
+    # x_T ~ N(0, I)
+    x = torch.randn(shape, device=device)
+
+    # Match `sample_voxels()` timestep selection behavior.
+    if n_steps < T:
+        timesteps = torch.linspace(T - 1, 0, n_steps, dtype=torch.long, device=device)
+    else:
+        timesteps = torch.arange(T - 1, -1, -1, device=device)
+
+    for t_int_tensor in timesteps:
+        t_int = t_int_tensor.item() if isinstance(t_int_tensor, torch.Tensor) else int(t_int_tensor)
+        t = torch.full((B,), t_int, device=device, dtype=torch.long)
+
+        # ----------------------------
+        # Scorer guidance intervention
+        # ----------------------------
+        if guidance_scale > 0.0 and guidance_lo <= t_int <= guidance_hi:
+            with torch.enable_grad():
+                x = x.detach().requires_grad_(True)
+                pred_break_logits, pred_ratio = scorer_model(x, t)
+
+                # Minimize break + maximize connectivity ratio.
+                energy = pred_break_logits.sum() - lambda_ratio * pred_ratio.sum()
+                grad = torch.autograd.grad(energy, x)[0]
+
+                x = x - guidance_scale * grad
+                x = x.detach()
+
+        # ----------------------------
+        # Standard DDPM reverse step
+        # ----------------------------
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            eps_pred = denoiser_model(x, t)
+
+        beta_t = betas.beta[t_int]
+        alpha_t = betas.alpha[t_int]
+        alpha_bar_t = betas.alpha_bar[t_int]
+        sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
+
+        pred_x0 = (x - sqrt_one_minus_alpha_bar_t * eps_pred) / torch.sqrt(alpha_bar_t)
+        pred_x0 = pred_x0.clamp(-1.0, 1.0)
+
+        if t_int > 0:
+            alpha_bar_prev = betas.alpha_bar[t_int - 1]
+        else:
+            alpha_bar_prev = torch.tensor(1.0, device=device)
+
+        coef1 = torch.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar_t)
+        coef2 = torch.sqrt(alpha_t) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
+        posterior_mean = coef1 * pred_x0 + coef2 * x
+
+        if t_int > 0:
+            posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
+            noise = torch.randn_like(x)
+            x = posterior_mean + torch.sqrt(posterior_var) * noise
+        else:
+            x = posterior_mean
+
+    return x
+
+
 def generate_samples(
     model: nn.Module,
     betas: BetaSchedule,
@@ -460,6 +591,11 @@ def generate_samples(
     sample_verbose: bool = False,
     run_seed: Optional[int] = None,
     hard_neg_llr_threshold: float = 0.5,
+    scorer_model: Optional[nn.Module] = None,
+    guidance_scale: float = 50.0,
+    t_start: int = 900,
+    t_end: int = 400,
+    guidance_lambda_ratio: float = 10.0,
     console: Optional[Console] = None,
 ) -> Tuple[float, List[Dict[str, Any]]]:
     if console is None:
@@ -498,17 +634,32 @@ def generate_samples(
         for batch_start in range(0, n_samples, batch_size):
             b = min(batch_size, n_samples - batch_start)
             with torch.no_grad():
-                x_0 = sample_voxels(
-                    model,
-                    betas,
-                    shape=(b, 3, 16, 16, 16),
-                    device=device,
-                    n_steps=n_steps,
-                    use_amp=use_amp,
-                    track_every=None,
-                    track_callback=None,
-                    verbose=sample_verbose,
-                )
+                if scorer_model is not None:
+                    x_0 = sample_guided_voxels(
+                        denoiser_model=model,
+                        scorer_model=scorer_model,
+                        betas=betas,
+                        shape=(b, 3, 16, 16, 16),
+                        device=device,
+                        guidance_scale=guidance_scale,
+                        lambda_ratio=guidance_lambda_ratio,
+                        t_start=t_start,
+                        t_end=t_end,
+                        n_steps=n_steps,
+                        use_amp=use_amp,
+                    )
+                else:
+                    x_0 = sample_voxels(
+                        model,
+                        betas,
+                        shape=(b, 3, 16, 16, 16),
+                        device=device,
+                        n_steps=n_steps,
+                        use_amp=use_amp,
+                        track_every=None,
+                        track_callback=None,
+                        verbose=sample_verbose,
+                    )
 
             for i in range(b):
                 x_0_onehot = centered_to_onehot(x_0[i])
@@ -647,6 +798,36 @@ def main() -> None:
             "neg_float: base_connected_size==0. Default R: 0.5"
         ),
     )
+    parser.add_argument(
+        "--scorer_ckpt",
+        type=str,
+        default=None,
+        help="If set, use scorer-guided sampling (requires TopologyScorer3D checkpoint).",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=50.0,
+        help="Scorer guidance strength w (only used with --scorer_ckpt).",
+    )
+    parser.add_argument(
+        "--lambda_ratio",
+        type=float,
+        default=10.0,
+        help="Scorer guidance energy weight: minimize break - lambda_ratio * ratio (only used with --scorer_ckpt).",
+    )
+    parser.add_argument(
+        "--t_start",
+        type=int,
+        default=900,
+        help="Guidance start timestep (inclusive).",
+    )
+    parser.add_argument(
+        "--t_end",
+        type=int,
+        default=400,
+        help="Guidance end timestep (inclusive).",
+    )
 
     args = parser.parse_args()
     t_start = datetime.now()
@@ -691,6 +872,15 @@ def main() -> None:
         device
     )
     console.print(f"[cyan]Schedule: T={T}, {beta_schedule}[/cyan]")
+
+    scorer_model: Optional[nn.Module] = None
+    guidance_lambda_ratio = args.lambda_ratio
+    if args.scorer_ckpt:
+        scorer_model = load_scorer(args.scorer_ckpt, device)
+        console.print(
+            f"[green]✓[/green] Guided sampling enabled: scale={args.guidance_scale} "
+            f"window t={args.t_start}..{args.t_end} (lambda_ratio={guidance_lambda_ratio})"
+        )
 
     os.makedirs(args.out_dir, exist_ok=True)
     console.print(f"[cyan]Project directory:[/cyan] {os.path.abspath(args.out_dir)}")
@@ -738,6 +928,11 @@ def main() -> None:
         # r：neg_hard 門檻 largest_log_ratio >= r（components>1 且接地後才會用到）
         "r": f"{args.hard_neg_llr_threshold:.10g}",
         "hard_neg_llr_threshold": f"{args.hard_neg_llr_threshold:.10g}",
+        "scorer_ckpt": args.scorer_ckpt if args.scorer_ckpt else "None",
+        "guidance_scale": f"{args.guidance_scale:.10g}",
+        "guidance_t_start": str(args.t_start),
+        "guidance_t_end": str(args.t_end),
+        "guidance_lambda_ratio": f"{guidance_lambda_ratio:.10g}",
         "projections_root": os.path.join(os.path.abspath(args.out_dir), "projections"),
         "npz_root": os.path.join(os.path.abspath(args.out_dir), "npz"),
         "projections_positive_dir": os.path.join(
@@ -781,6 +976,11 @@ def main() -> None:
         sample_verbose=args.sample_verbose,
         run_seed=args.seed,
         hard_neg_llr_threshold=args.hard_neg_llr_threshold,
+        scorer_model=scorer_model,
+        guidance_scale=args.guidance_scale,
+        t_start=args.t_start,
+        t_end=args.t_end,
+        guidance_lambda_ratio=guidance_lambda_ratio,
         console=console,
     )
 
