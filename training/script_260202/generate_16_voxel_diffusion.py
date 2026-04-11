@@ -6,7 +6,9 @@
 - projections/{positive,neg_float,neg_easy,neg_hard}/：各類別三視圖 PNG
 - npz/{...}/：同上，每檔僅含陣列鍵 ``voxel``（--no_npz 可關閉）
 - sample_labels.csv: 每個樣本的 id、seed、分類與 compute_sample_metrics 之完整指標（見下方欄位）
-- sample_labels_summary.csv: 全體樣本指標加總與平均、標準差等
+- sample_labels_summary.csv: 全體樣本指標加總與平均、標準差等；並含與
+  ``eval_diffusion_model.compute_summary_statistics`` 對齊的扁平鍵（``avg_*``、成功率等），
+  方便與 ``simple_summary.csv`` 或 aggregate 流程對照
 - 分類定義（r = --hard_neg_llr_threshold）：
   - neg_float：base_connected_size==0（連地板都沒碰到）
   - positive：base_connected_size>0，且全樹只有 1 個連通塊（log_components==1；Absolute Connectivity）
@@ -380,32 +382,89 @@ def write_sample_labels_summary_csv(
 
     llr_all = np.array([float(r["largest_log_ratio"]) for r in rows])
     valid = llr_all >= 0.0
+    v_llr = llr_all[valid] if bool(valid.any()) else np.array([], dtype=np.float64)
+
+    add_section("Flat summary keys (eval_diffusion_model.compute_summary_statistics)")
+    succ_llr = np.array(
+        [
+            (float(r["largest_log_ratio"]) >= 0.0)
+            and bool(np.isclose(float(r["largest_log_ratio"]), 1.0, atol=1e-6))
+            for r in rows
+        ],
+        dtype=np.float64,
+    )
+    lines.append(["success_rate_pct_LLR_eq_1", f"{100.0 * float(succ_llr.mean()):.4f}"])
+    lines.append(["failure_rate_pct_LLR_ne_1", f"{100.0 * float(1.0 - succ_llr.mean()):.4f}"])
+    lines.append(["broken_rate_pct_Is_Broken", f"{100.0 * float(broken_flag.mean()):.4f}"])
+    lines.append(["avg_mass", f"{float(mass.mean()):.6f}"])
+    lines.append(["std_mass", f"{float(mass.std()):.6f}"])
+    lines.append(["avg_height", f"{float(height.mean()):.6f}"])
+    lines.append(["std_height", f"{float(height.std()):.6f}"])
+    lines.append(["avg_log_size", f"{float(log_sz.mean()):.6f}"])
+    lines.append(["std_log_size", f"{float(log_sz.std()):.6f}"])
+    lines.append(["avg_leaf_size", f"{float(leaf_sz.mean()):.6f}"])
+    lines.append(["std_leaf_size", f"{float(leaf_sz.std()):.6f}"])
+    lines.append(["avg_base_connected_size", f"{float(bcs.mean()):.6f}"])
+    lines.append(["std_base_connected_size", f"{float(bcs.std()):.6f}"])
+    mask_tl = tls > 0
+    lines.append(["n_samples_total_log_size_gt_0", str(int(mask_tl.sum()))])
+    if bool(mask_tl.any()):
+        br_over_log = (bcs[mask_tl] / tls[mask_tl]).astype(np.float64)
+        lines.append(["avg_base_connected_ratio_total_log_gt_0", f"{float(br_over_log.mean()):.6f}"])
+        lines.append(["std_base_connected_ratio_total_log_gt_0", f"{float(br_over_log.std()):.6f}"])
+    else:
+        lines.append(["avg_base_connected_ratio_total_log_gt_0", "0.000000"])
+        lines.append(["std_base_connected_ratio_total_log_gt_0", "0.000000"])
+    if v_llr.size > 0:
+        lines.append(["avg_largest_log_ratio_valid_only", f"{float(v_llr.mean()):.6f}"])
+        lines.append(["std_largest_log_ratio_valid_only", f"{float(v_llr.std()):.6f}"])
+    else:
+        lines.append(["avg_largest_log_ratio_valid_only", "-1.000000"])
+        lines.append(["std_largest_log_ratio_valid_only", "0.000000"])
+    lines.append(["avg_occupancy_non_air", f"{float(occ_na.mean()):.6f}"])
+    lines.append(["std_occupancy_non_air", f"{float(occ_na.std()):.6f}"])
+    lines.append(["avg_occupancy_log", f"{float(occ_lg.mean()):.6f}"])
+    lines.append(["std_occupancy_log", f"{float(occ_lg.std()):.6f}"])
+    lines.append(["avg_occupancy_leaf", f"{float(occ_lf.mean()):.6f}"])
+    lines.append(["std_occupancy_leaf", f"{float(occ_lf.std()):.6f}"])
+    lines.append(["avg_components_non_air", f"{float(comp_na.mean()):.6f}"])
+    lines.append(["std_components_non_air", f"{float(comp_na.std()):.6f}"])
+    lines.append(["avg_components_log", f"{float(comp_lg.mean()):.6f}"])
+    lines.append(["std_components_log", f"{float(comp_lg.std()):.6f}"])
+    lines.append(["avg_components_leaf", f"{float(comp_lf.mean()):.6f}"])
+    lines.append(["std_components_leaf", f"{float(comp_lf.std()):.6f}"])
+    lines.append(
+        [
+            "note_flat_keys",
+            "mirrors eval_diffusion_model.compute_summary_statistics; "
+            "base_connected_ratio here is mean over samples with total_log_size>0 only",
+        ]
+    )
 
     add_section("largest_log_ratio")
     lines.append(["n_valid (>=0)", str(int(valid.sum()))])
     lines.append(["n_invalid (-1 / missing)", str(int((~valid).sum()))])
-    if valid.any():
-        v = llr_all[valid]
-        lines.append(["mean (valid only)", f"{float(v.mean()):.6f}"])
-        lines.append(["std (valid only)", f"{float(v.std()):.6f}"])
-        lines.append(["min (valid only)", f"{float(v.min()):.6f}"])
-        lines.append(["max (valid only)", f"{float(v.max()):.6f}"])
+    if v_llr.size > 0:
+        lines.append(["mean (valid only)", f"{float(v_llr.mean()):.6f}"])
+        lines.append(["std (valid only)", f"{float(v_llr.std()):.6f}"])
+        lines.append(["min (valid only)", f"{float(v_llr.min()):.6f}"])
+        lines.append(["max (valid only)", f"{float(v_llr.max()):.6f}"])
         lines.append(
             [
                 "pct_samples_largest_log_ratio_ge_0.95",
-                f"{100.0 * float(np.mean(v >= 0.95)):.4f}",
+                f"{100.0 * float(np.mean(v_llr >= 0.95)):.4f}",
             ]
         )
         lines.append(
             [
                 "pct_samples_largest_log_ratio_ge_0.99",
-                f"{100.0 * float(np.mean(v >= 0.99)):.4f}",
+                f"{100.0 * float(np.mean(v_llr >= 0.99)):.4f}",
             ]
         )
         lines.append(
             [
                 f"pct_samples_largest_log_ratio_ge_r (r={hard_neg_llr_threshold:.6f})",
-                f"{100.0 * float(np.mean(v >= hard_neg_llr_threshold)):.4f}",
+                f"{100.0 * float(np.mean(v_llr >= hard_neg_llr_threshold)):.4f}",
             ]
         )
         lines.append(
