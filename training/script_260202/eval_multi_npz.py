@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-對資料夾內已存在的 voxel .npz 批次計算指標。
+對資料夾內已存在的 voxel .npz 批次計算指標（預設遞迴掃描子資料夾內的 .npz）。
 
 使用 utils.voxel_npz_io.load_voxel_npz 與 utils.voxel_sample_metrics.compute_sample_metrics。
 輸出 sample_labels.csv、sample_labels_summary.csv；欄位與兩個 generate 腳本一致，**最後**一欄皆為 ``source_name``：此處為相對於 ``--npz_dir``（掃描根）的原始 .npz 路徑（POSIX 斜線；無法相對化時為檔名）。generate 腳本則為相對於 ``--out_dir`` 的 ``npz/...`` 或 ``projections/...``。
@@ -9,7 +9,7 @@
 
 使用方式:
   python eval_multi_npz.py --npz_dir /path/to/npz_root [--out_dir /path/to/out]
-  python eval_multi_npz.py --npz_dir ./npz/positive --recursive
+  python eval_multi_npz.py --npz_dir /path/to/npz_root --shallow  # 僅掃描該目錄，不含子資料夾
 """
 
 from __future__ import annotations
@@ -342,7 +342,7 @@ def write_sample_labels_summary_csv(
 
 
 def source_name_for_csv(file_path: Path, scan_root: Path) -> str:
-    """路徑相對於掃描根目錄（供 --recursive 時區分子資料夾）；失敗則為檔名。"""
+    """路徑相對於掃描根目錄（含子資料夾內檔案時可區分路徑）；失敗則為檔名。"""
     root = scan_root.resolve()
     p = file_path.resolve()
     try:
@@ -434,9 +434,14 @@ def main() -> None:
         help="Output directory for CSVs (default: same as --npz_dir)",
     )
     parser.add_argument(
+        "--shallow",
+        action="store_true",
+        help="Only scan immediate directory (default: include all *.npz under subdirectories)",
+    )
+    parser.add_argument(
         "--recursive",
         action="store_true",
-        help="Include all *.npz under subdirectories (sorted by path)",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--no_require_16_cube",
@@ -499,7 +504,7 @@ def main() -> None:
 
     t0 = time.time()
     scan_root = npz_root.resolve()
-    paths = discover_npz_paths(npz_root, args.recursive)
+    paths = discover_npz_paths(npz_root, recursive=not args.shallow)
     if not paths:
         console.print(f"[yellow]No .npz files found under[/yellow] {scan_root}")
         rows: List[Dict[str, Any]] = []
