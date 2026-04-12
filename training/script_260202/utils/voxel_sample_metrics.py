@@ -47,16 +47,13 @@ ALL_SCORER_CATEGORIES = (
 def classify_scorer_category(
     base_connected_size: int,
     log_components: int,
-    largest_log_ratio: float,
-    hard_neg_llr_threshold: float = 0.5,
 ) -> str:
     """
     分類依 scorer 設定：
     1) neg_float: 連地板都沒碰到（base_connected_size==0）
     2) positive: 有碰到地板且全樹只有 1 個連通塊（log_components==1；Absolute Connectivity）
-    3) neg_hard / neg_easy: 在 base_connected_size>0 且 components>1 時用 log_components 數量區分
-
-    largest_log_ratio / hard_neg_llr_threshold 保留參數供與 CLI 對齊與未來擴充（目前分類邏輯未使用）。
+    3) neg_hard / neg_easy: 在 base_connected_size>0 且 log_components>1 時，
+       log_components==2 為 neg_hard，否則為 neg_easy。
     """
     if base_connected_size == 0:
         return CAT_NEG_FLOAT
@@ -69,14 +66,12 @@ def classify_scorer_category(
 
 def compute_sample_metrics(
     labels: np.ndarray,
-    hard_neg_llr_threshold: float = 0.5,
 ) -> Dict[str, Any]:
     """
     計算單個樣本的所有指標。
 
     Args:
         labels: [16, 16, 16] numpy array with class labels (0=air, 1=log, 2=leaf)
-        hard_neg_llr_threshold: 傳入 classify_scorer_category（與 generate CLI --hard_neg_llr_threshold 對齊）
 
     Returns:
         dict，鍵名含：
@@ -98,14 +93,11 @@ def compute_sample_metrics(
     total_log = int(trunk_info["total_wood_size"])
     base_connected_ratio = (float(base_sz) / float(total_log)) if total_log > 0 else 0.0
 
-    llr_store = round(float(largest_log_ratio), 6) if largest_log_ratio >= 0 else -1.0
     log_components = int(comp_counts["log"])
 
     scorer_category = classify_scorer_category(
         base_connected_size=base_sz,
         log_components=log_components,
-        largest_log_ratio=llr_store,
-        hard_neg_llr_threshold=hard_neg_llr_threshold,
     )
 
     mass = int((labels != 0).sum())

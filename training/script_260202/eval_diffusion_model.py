@@ -14,7 +14,16 @@
 - dynamics_summary.csv: 前幾個樣本的統計摘要（層次 C）
 - dynamics_trace.csv: 前幾個樣本的完整軌跡（層次 C）
 - dynamics_divergence_plot.png: 可視化圖表
+- plot_data_csv/: 與 dynamics_divergence_plot 四個子圖對應之原始數據 CSV（各一檔）
+  - dynamics_divergence_subplot_01_mass.csv
+  - dynamics_divergence_subplot_02_failure_rate.csv
+  - dynamics_divergence_subplot_03_base_connected_ratio.csv
+  - dynamics_divergence_subplot_04_largest_log_ratio.csv
 - dynamics_timing_distribution_plot.png: t_emerge / t_lockin 分布圖
+- plot_data_csv/dynamics_timing_distribution_subplot_01_t_emerge.csv（每樣本）
+- plot_data_csv/dynamics_timing_distribution_subplot_01_t_emerge_histogram.csv（bins=30）
+- plot_data_csv/dynamics_timing_distribution_subplot_02_t_lockin.csv（每樣本）
+- plot_data_csv/dynamics_timing_distribution_subplot_02_t_lockin_histogram.csv（bins=30）
 - dynamics_xt/: x_t 三視圖目錄（使用 --save_xt_projections 時生成）
 
 （若啟用 --save_npz / 軌跡 npz：每檔僅含陣列鍵 ``voxel``；指標見對應 CSV。）
@@ -126,6 +135,15 @@ def decode_probs_to_labels(probs: torch.Tensor, log_mask_threshold: Optional[flo
     return labels
 
 
+def is_success_sample(metrics: Dict, atol: float = 1e-6) -> bool:
+    """
+    Success criterion: Largest_Log_Ratio == 1 (within tolerance).
+    Any value != 1 (or invalid <0) is treated as failure.
+    """
+    ratio = float(metrics.get("Largest_Log_Ratio", -1.0))
+    return ratio >= 0.0 and bool(np.isclose(ratio, 1.0, atol=atol))
+
+
 def compute_t_emerge_and_t_lockin(sample_trace_data: List[Dict]) -> Tuple[Optional[int], Optional[int]]:
     """
     計算 t_emerge 和 t_lockin。
@@ -211,6 +229,127 @@ def load_model(checkpoint_path: str, device: torch.device) -> Tuple[nn.Module, D
     return model, checkpoint
 
 
+def load_scorer(checkpoint_path: str, device: torch.device) -> nn.Module:
+    """Load TopologyScorer3D checkpoint used for guided sampling."""
+    console = Console()
+    console.print(f"[cyan]Loading scorer checkpoint: {checkpoint_path}[/cyan]")
+    scorer_ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    try:
+        from train_scorer import TopologyScorer3D
+    except ImportError as e:
+        raise ImportError(
+            "Failed to import `TopologyScorer3D` from `train_scorer.py`."
+        ) from e
+
+    scorer = TopologyScorer3D().to(device)
+    if isinstance(scorer_ckpt, dict) and "model_state_dict" in scorer_ckpt:
+        state_dict = scorer_ckpt["model_state_dict"]
+    else:
+        state_dict = scorer_ckpt
+
+    if not isinstance(state_dict, dict):
+        raise TypeError(
+            "Unsupported scorer checkpoint format. Expected dict-like state_dict, "
+            f"but got type={type(scorer_ckpt).__name__}"
+        )
+
+    scorer.load_state_dict(state_dict, strict=True)
+    scorer.eval()
+    console.print(f"[green]✓[/green] Scorer loaded: {checkpoint_path}")
+    if isinstance(scorer_ckpt, dict) and "epoch" in scorer_ckpt:
+        console.print(
+            f"[green]✓[/green] Scorer checkpoint epoch: {scorer_ckpt.get('epoch', 'unknown')}"
+        )
+    return scorer
+
+
+@torch.no_grad()
+def sample_guided_voxels(
+    denoiser_model: nn.Module,
+    scorer_model: nn.Module,
+    betas: BetaSchedule,
+    shape: Tuple[int, ...],
+    device: torch.device,
+    guidance_scale: float = 50.0,
+    lambda_ratio: float = 10.0,
+    t_start: int = 900,
+    t_end: int = 400,
+    n_steps: Optional[int] = None,
+    use_amp: bool = False,
+    track_every: Optional[int] = None,
+    track_callback=None,
+) -> torch.Tensor:
+    """
+    Guided DDPM sampling with scorer-based gradient intervention.
+    Guidance is applied only for timesteps in [min(t_start,t_end), max(t_start,t_end)].
+    """
+    T = betas.T
+    if n_steps is None:
+        n_steps = T
+
+    B, C, H, W, D = shape
+    if (C, H, W, D) != (3, 16, 16, 16):
+        raise ValueError(f"Expected shape=(B,3,16,16,16), got {shape}")
+
+    guidance_lo = int(min(t_start, t_end))
+    guidance_hi = int(max(t_start, t_end))
+    guidance_lo = max(0, guidance_lo)
+    guidance_hi = min(T - 1, guidance_hi)
+
+    x = torch.randn(shape, device=device)
+
+    if n_steps < T:
+        timesteps = torch.linspace(T - 1, 0, n_steps, dtype=torch.long, device=device)
+    else:
+        timesteps = torch.arange(T - 1, -1, -1, device=device)
+
+    for i, t_int_tensor in enumerate(timesteps):
+        t_int = t_int_tensor.item() if isinstance(t_int_tensor, torch.Tensor) else int(t_int_tensor)
+        t = torch.full((B,), t_int, device=device, dtype=torch.long)
+
+        if guidance_scale > 0.0 and guidance_lo <= t_int <= guidance_hi:
+            with torch.enable_grad():
+                x = x.detach().requires_grad_(True)
+                pred_break_logits, pred_ratio = scorer_model(x, t)
+                energy = pred_break_logits.sum() - lambda_ratio * pred_ratio.sum()
+                grad = torch.autograd.grad(energy, x)[0]
+                x = (x - guidance_scale * grad).detach()
+
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            eps_pred = denoiser_model(x, t)
+
+        beta_t = betas.beta[t_int]
+        alpha_t = betas.alpha[t_int]
+        alpha_bar_t = betas.alpha_bar[t_int]
+        sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
+
+        pred_x0 = (x - sqrt_one_minus_alpha_bar_t * eps_pred) / torch.sqrt(alpha_bar_t)
+        pred_x0 = pred_x0.clamp(-1.0, 1.0)
+
+        if t_int > 0:
+            alpha_bar_prev = betas.alpha_bar[t_int - 1]
+        else:
+            alpha_bar_prev = torch.tensor(1.0, device=device)
+
+        coef1 = torch.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar_t)
+        coef2 = torch.sqrt(alpha_t) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
+        posterior_mean = coef1 * pred_x0 + coef2 * x
+
+        if t_int > 0:
+            posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
+            noise = torch.randn_like(x)
+            x = posterior_mean + torch.sqrt(posterior_var) * noise
+        else:
+            x = posterior_mean
+
+        if track_every is not None and track_callback is not None and i % track_every == 0:
+            for sample_idx in range(B):
+                track_callback(sample_idx, i, t_int, x[sample_idx], pred_x0[sample_idx])
+
+    return x
+
+
 def batch_evaluation(
     model: nn.Module,
     betas: BetaSchedule,
@@ -224,6 +363,11 @@ def batch_evaluation(
     save_projections: bool = True,
     save_npz: bool = False,
     log_mask_threshold: Optional[float] = None,
+    scorer_model: Optional[nn.Module] = None,
+    guidance_scale: float = 50.0,
+    t_start: int = 900,
+    t_end: int = 400,
+    guidance_lambda_ratio: float = 10.0,
     console: Optional[Console] = None,
 ) -> Tuple[List[Dict], float]:
     """
@@ -288,16 +432,33 @@ def batch_evaluation(
             
             # Generate batch of samples
             with torch.no_grad():
-                x_0_batch = sample_voxels(
-                    model,
-                    betas,
-                    shape=(current_batch_size, 3, 16, 16, 16),
-                    device=device,
-                    n_steps=n_steps,
-                    use_amp=use_amp,
-                    track_every=None,  # No tracking for batch evaluation
-                    track_callback=None,
-                )  # [current_batch_size, 3, 16, 16, 16] in [-1,1]
+                if scorer_model is not None:
+                    x_0_batch = sample_guided_voxels(
+                        denoiser_model=model,
+                        scorer_model=scorer_model,
+                        betas=betas,
+                        shape=(current_batch_size, 3, 16, 16, 16),
+                        device=device,
+                        guidance_scale=guidance_scale,
+                        lambda_ratio=guidance_lambda_ratio,
+                        t_start=t_start,
+                        t_end=t_end,
+                        n_steps=n_steps,
+                        use_amp=use_amp,
+                        track_every=None,
+                        track_callback=None,
+                    )
+                else:
+                    x_0_batch = sample_voxels(
+                        model,
+                        betas,
+                        shape=(current_batch_size, 3, 16, 16, 16),
+                        device=device,
+                        n_steps=n_steps,
+                        use_amp=use_amp,
+                        track_every=None,  # No tracking for batch evaluation
+                        track_callback=None,
+                    )  # [current_batch_size, 3, 16, 16, 16] in [-1,1]
             
             # Process each sample in the batch
             for i in range(current_batch_size):
@@ -361,6 +522,11 @@ def dynamics_evaluation(
     save_xt_projections: bool = False,
     save_npz: bool = False,
     log_mask_threshold: Optional[float] = None,
+    scorer_model: Optional[nn.Module] = None,
+    guidance_scale: float = 50.0,
+    t_start: int = 900,
+    t_end: int = 400,
+    guidance_lambda_ratio: float = 10.0,
     console: Optional[Console] = None,
 ) -> Tuple[List[Dict], float]:
     """
@@ -531,16 +697,33 @@ def dynamics_evaluation(
             track_callback = make_track_callback(batch_start)
             
             with torch.no_grad():
-                x_0_batch = sample_voxels(
-                    model,
-                    betas,
-                    shape=(current_batch_size, 3, 16, 16, 16),
-                    device=device,
-                    n_steps=n_steps,
-                    use_amp=use_amp,
-                    track_every=track_every,
-                    track_callback=track_callback,
-                )
+                if scorer_model is not None:
+                    x_0_batch = sample_guided_voxels(
+                        denoiser_model=model,
+                        scorer_model=scorer_model,
+                        betas=betas,
+                        shape=(current_batch_size, 3, 16, 16, 16),
+                        device=device,
+                        guidance_scale=guidance_scale,
+                        lambda_ratio=guidance_lambda_ratio,
+                        t_start=t_start,
+                        t_end=t_end,
+                        n_steps=n_steps,
+                        use_amp=use_amp,
+                        track_every=track_every,
+                        track_callback=track_callback,
+                    )
+                else:
+                    x_0_batch = sample_voxels(
+                        model,
+                        betas,
+                        shape=(current_batch_size, 3, 16, 16, 16),
+                        device=device,
+                        n_steps=n_steps,
+                        use_amp=use_amp,
+                        track_every=track_every,
+                        track_callback=track_callback,
+                    )
             
             # Save final state labels for projection and npz
             if projections_dir or npz_dir:
@@ -745,8 +928,10 @@ def compute_summary_statistics(batch_metrics: List[Dict]) -> Dict:
     if n == 0:
         return {}
     
-    # Breakage rate (main trunk)
-    breakage_rate = np.mean([1.0 if m['Is_Main_Trunk_Broken'] else 0.0 for m in batch_metrics]) * 100.0
+    # Success/failure rate by largest_log_ratio==1.
+    success_flags = [1.0 if is_success_sample(m) else 0.0 for m in batch_metrics]
+    success_rate = np.mean(success_flags) * 100.0
+    failure_rate = 100.0 - success_rate
     
     # Disconnected wood rate (any disconnected wood components)
     broken_rate = np.mean([1.0 if m['Is_Broken'] else 0.0 for m in batch_metrics]) * 100.0
@@ -754,9 +939,6 @@ def compute_summary_statistics(batch_metrics: List[Dict]) -> Dict:
     # Average mass
     avg_mass = np.mean([m['Mass'] for m in batch_metrics])
     std_mass = np.std([m['Mass'] for m in batch_metrics])
-    
-    # Success rate (not broken)
-    success_rate = (1.0 - breakage_rate / 100.0) * 100.0
     
     # Average height
     avg_height = np.mean([m['Height'] for m in batch_metrics])
@@ -800,7 +982,9 @@ def compute_summary_statistics(batch_metrics: List[Dict]) -> Dict:
     
     return {
         'n_samples': n,
-        'breakage_rate': breakage_rate,
+        # Keep breakage_rate key for backward compatibility; now it means failure rate by LLR!=1.
+        'breakage_rate': failure_rate,
+        'failure_rate': failure_rate,
         'broken_rate': broken_rate,
         'success_rate': success_rate,
         'avg_mass': avg_mass,
@@ -879,8 +1063,8 @@ def save_summary(summary: Dict, output_dir: str, console: Optional[Console] = No
         ["Metric", "Value"],
         ["Number of Samples", summary['n_samples']],
         ["", ""],  # Empty row for separation
-        ["Breakage Analysis", ""],
-        ["Main Trunk Breakage Rate (%)", f"{summary['breakage_rate']:.2f}"],
+        ["Success / Failure Analysis (Largest_Log_Ratio == 1)", ""],
+        ["Failure Rate (%) [Largest_Log_Ratio != 1]", f"{summary['failure_rate']:.2f}"],
         ["Success Rate (%)", f"{summary['success_rate']:.2f}"],
         ["Any Wood Disconnection Rate (%)", f"{summary['broken_rate']:.2f}"],
         ["Average Base-Connected Ratio", f"{summary['avg_base_connected_ratio']:.4f}"],
@@ -948,8 +1132,8 @@ def save_dynamics_summary(summary: Dict, output_dir: str, console: Optional[Cons
         ["Metric", "Value"],
         ["Number of Samples", summary['n_samples']],
         ["", ""],
-        ["Breakage Analysis", ""],
-        ["Main Trunk Breakage Rate (%)", f"{summary['breakage_rate']:.2f}"],
+        ["Success / Failure Analysis (Largest_Log_Ratio == 1)", ""],
+        ["Failure Rate (%) [Largest_Log_Ratio != 1]", f"{summary['failure_rate']:.2f}"],
         ["Success Rate (%)", f"{summary['success_rate']:.2f}"],
         ["Any Wood Disconnection Rate (%)", f"{summary['broken_rate']:.2f}"],
         ["Average Base-Connected Ratio", f"{summary['avg_base_connected_ratio']:.4f}"],
@@ -1069,6 +1253,18 @@ def save_dynamics_trace(trace_data: List[Dict], output_dir: str, console: Option
     console.print(f"[green]✓[/green] Saved dynamics trace: {csv_path} ({len(trace_data)} tracking points)")
 
 
+def _csv_float_cell(x: object) -> object:
+    if x is None:
+        return ""
+    try:
+        xf = float(x)
+    except (TypeError, ValueError):
+        return x
+    if math.isnan(xf):
+        return ""
+    return x
+
+
 def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples: int = 5, console: Optional[Console] = None):
     """
     繪製 divergence 圖表：顯示不同樣本在採樣過程中的指標變化。
@@ -1087,6 +1283,8 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
         return
     
     os.makedirs(output_dir, exist_ok=True)
+    plot_data_dir = os.path.join(output_dir, "plot_data_csv")
+    os.makedirs(plot_data_dir, exist_ok=True)
     png_path = os.path.join(output_dir, "dynamics_divergence_plot.png")
     
     # Group by sample_idx
@@ -1108,7 +1306,7 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
     # Create figure with subplots (2 rows, 2 cols = 4 plots)
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     
-    # Determine final state (is_main_trunk_broken) for each sample
+    # Determine final success state by Largest_Log_Ratio==1 for each sample
     # This is used for averaging in Plot 3 and Plot 4
     sample_final_states = {}
     for sid in samples.keys():
@@ -1116,7 +1314,7 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
         # Get final state (lowest t value, which is the final state)
         if data:
             final_data = min(data, key=lambda x: x['t'])
-            sample_final_states[sid] = final_data.get('Is_Main_Trunk_Broken', False)
+            sample_final_states[sid] = is_success_sample(final_data)
     
     # If n_dynamics_samples > 10, randomly select 10 samples to plot
     samples_to_plot = sorted(samples.keys())
@@ -1125,10 +1323,13 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
     
     # Plot 1: Mass over time
     ax1 = axes[0, 0]
+    mass_rows: List[Dict[str, object]] = []
     for sid in samples_to_plot:
         data = samples[sid]
         ts = [r['t'] for r in data]
         masses = [r['Mass'] for r in data]
+        for t_i, m_i in zip(ts, masses):
+            mass_rows.append({"timestep": t_i, "sample_idx": sid, "mass": m_i})
         ax1.plot(ts, masses, label=f'Sample {sid+1}', alpha=0.7, linewidth=1.5)
     ax1.set_xlabel('Timestep (t)')
     ax1.set_ylabel('Mass (non-air voxels)')
@@ -1136,68 +1337,140 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     ax1.invert_xaxis()  # t decreases from 1000 to 0
+
+    mass_csv = os.path.join(plot_data_dir, "dynamics_divergence_subplot_01_mass.csv")
+    with open(mass_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["timestep", "sample_idx", "mass"])
+        w.writeheader()
+        for row in mass_rows:
+            w.writerow(row)
     
-    # Plot 2: Is_Main_Trunk_Broken over time (as fraction)
+    # Plot 2: Failure rate (Largest_Log_Ratio != 1) over time
     ax2 = axes[0, 1]
-    # Aggregate main trunk breakage rate across ALL dynamics samples per timestep
+    # Aggregate failure rate across ALL dynamics samples per timestep
     total_counts_by_t = {}
-    broken_counts_by_t = {}
-    total_counts_broken_group_by_t = {}
-    broken_counts_broken_group_by_t = {}
-    total_counts_unbroken_group_by_t = {}
-    broken_counts_unbroken_group_by_t = {}
+    failed_counts_by_t = {}
+    total_counts_failed_group_by_t = {}
+    failed_counts_failed_group_by_t = {}
+    total_counts_success_group_by_t = {}
+    failed_counts_success_group_by_t = {}
     for sid, data in samples.items():
-        is_final_broken = sample_final_states.get(sid, False)
+        is_final_success = sample_final_states.get(sid, False)
         for r in data:
             t_val = r['t']
             total_counts_by_t[t_val] = total_counts_by_t.get(t_val, 0) + 1
-            if r.get('Is_Main_Trunk_Broken', False):
-                broken_counts_by_t[t_val] = broken_counts_by_t.get(t_val, 0) + 1
+            is_failed_now = not is_success_sample(r)
+            if is_failed_now:
+                failed_counts_by_t[t_val] = failed_counts_by_t.get(t_val, 0) + 1
             else:
-                broken_counts_by_t.setdefault(t_val, broken_counts_by_t.get(t_val, 0))
+                failed_counts_by_t.setdefault(t_val, failed_counts_by_t.get(t_val, 0))
             
-            # Split by final state group (broken vs unbroken)
-            if is_final_broken:
-                total_counts_broken_group_by_t[t_val] = total_counts_broken_group_by_t.get(t_val, 0) + 1
-                if r.get('Is_Main_Trunk_Broken', False):
-                    broken_counts_broken_group_by_t[t_val] = broken_counts_broken_group_by_t.get(t_val, 0) + 1
+            # Split by final state group (failed vs successful)
+            if not is_final_success:
+                total_counts_failed_group_by_t[t_val] = total_counts_failed_group_by_t.get(t_val, 0) + 1
+                if is_failed_now:
+                    failed_counts_failed_group_by_t[t_val] = failed_counts_failed_group_by_t.get(t_val, 0) + 1
                 else:
-                    broken_counts_broken_group_by_t.setdefault(
-                        t_val, broken_counts_broken_group_by_t.get(t_val, 0)
+                    failed_counts_failed_group_by_t.setdefault(
+                        t_val, failed_counts_failed_group_by_t.get(t_val, 0)
                     )
             else:
-                total_counts_unbroken_group_by_t[t_val] = total_counts_unbroken_group_by_t.get(t_val, 0) + 1
-                if r.get('Is_Main_Trunk_Broken', False):
-                    broken_counts_unbroken_group_by_t[t_val] = broken_counts_unbroken_group_by_t.get(t_val, 0) + 1
+                total_counts_success_group_by_t[t_val] = total_counts_success_group_by_t.get(t_val, 0) + 1
+                if is_failed_now:
+                    failed_counts_success_group_by_t[t_val] = failed_counts_success_group_by_t.get(t_val, 0) + 1
                 else:
-                    broken_counts_unbroken_group_by_t.setdefault(
-                        t_val, broken_counts_unbroken_group_by_t.get(t_val, 0)
+                    failed_counts_success_group_by_t.setdefault(
+                        t_val, failed_counts_success_group_by_t.get(t_val, 0)
                     )
     if total_counts_by_t:
         sorted_ts = sorted(total_counts_by_t.keys(), reverse=True)
         rates = []
-        rates_broken_group = []
-        rates_unbroken_group = []
+        rates_failed_group = []
+        rates_success_group = []
         for t_val in sorted_ts:
             total = total_counts_by_t[t_val]
-            broken = broken_counts_by_t.get(t_val, 0)
-            rate = broken / total if total > 0 else 0.0
+            failed = failed_counts_by_t.get(t_val, 0)
+            rate = failed / total if total > 0 else 0.0
             rates.append(rate)
             
-            total_b = total_counts_broken_group_by_t.get(t_val, 0)
-            broken_b = broken_counts_broken_group_by_t.get(t_val, 0)
-            rates_broken_group.append((broken_b / total_b) if total_b > 0 else np.nan)
+            total_f = total_counts_failed_group_by_t.get(t_val, 0)
+            failed_f = failed_counts_failed_group_by_t.get(t_val, 0)
+            rates_failed_group.append((failed_f / total_f) if total_f > 0 else np.nan)
             
-            total_u = total_counts_unbroken_group_by_t.get(t_val, 0)
-            broken_u = broken_counts_unbroken_group_by_t.get(t_val, 0)
-            rates_unbroken_group.append((broken_u / total_u) if total_u > 0 else np.nan)
+            total_s = total_counts_success_group_by_t.get(t_val, 0)
+            failed_s = failed_counts_success_group_by_t.get(t_val, 0)
+            rates_success_group.append((failed_s / total_s) if total_s > 0 else np.nan)
         
-        ax2.plot(sorted_ts, rates, color='purple', linewidth=2.2, label='Breakage Rate (All)')
-        ax2.plot(sorted_ts, rates_broken_group, color='red', linewidth=2.0, linestyle='--', label='Breakage Rate (Broken)')
-        ax2.plot(sorted_ts, rates_unbroken_group, color='green', linewidth=2.0, linestyle='--', label='Breakage Rate (Unbroken)')
+        ax2.plot(sorted_ts, rates, color='purple', linewidth=2.2, label='Failure Rate (All)')
+        ax2.plot(sorted_ts, rates_failed_group, color='red', linewidth=2.0, linestyle='--', label='Failure Rate (Failed Group)')
+        ax2.plot(sorted_ts, rates_success_group, color='green', linewidth=2.0, linestyle='--', label='Failure Rate (Success Group)')
+
+        fail_rows: List[Dict[str, object]] = []
+        for t_val, rate, rf, rs in zip(
+            sorted_ts, rates, rates_failed_group, rates_success_group
+        ):
+            total = total_counts_by_t[t_val]
+            failed = failed_counts_by_t.get(t_val, 0)
+            total_f = total_counts_failed_group_by_t.get(t_val, 0)
+            failed_f = failed_counts_failed_group_by_t.get(t_val, 0)
+            total_s = total_counts_success_group_by_t.get(t_val, 0)
+            failed_s = failed_counts_success_group_by_t.get(t_val, 0)
+            fail_rows.append(
+                {
+                    "timestep": t_val,
+                    "n_total_tracked": total,
+                    "n_failed_llr_neq_1": failed,
+                    "failure_rate_all": _csv_float_cell(rate),
+                    "n_total_final_failed_group": total_f,
+                    "n_failed_llr_neq_1_final_failed_group": failed_f,
+                    "failure_rate_final_failed_group": _csv_float_cell(rf),
+                    "n_total_final_success_group": total_s,
+                    "n_failed_llr_neq_1_final_success_group": failed_s,
+                    "failure_rate_final_success_group": _csv_float_cell(rs),
+                }
+            )
+        fail_csv = os.path.join(plot_data_dir, "dynamics_divergence_subplot_02_failure_rate.csv")
+        with open(fail_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "timestep",
+                    "n_total_tracked",
+                    "n_failed_llr_neq_1",
+                    "failure_rate_all",
+                    "n_total_final_failed_group",
+                    "n_failed_llr_neq_1_final_failed_group",
+                    "failure_rate_final_failed_group",
+                    "n_total_final_success_group",
+                    "n_failed_llr_neq_1_final_success_group",
+                    "failure_rate_final_success_group",
+                ],
+            )
+            w.writeheader()
+            w.writerows(fail_rows)
+    else:
+        fail_csv = os.path.join(plot_data_dir, "dynamics_divergence_subplot_02_failure_rate.csv")
+        with open(fail_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "timestep",
+                    "n_total_tracked",
+                    "n_failed_llr_neq_1",
+                    "failure_rate_all",
+                    "n_total_final_failed_group",
+                    "n_failed_llr_neq_1_final_failed_group",
+                    "failure_rate_final_failed_group",
+                    "n_total_final_success_group",
+                    "n_failed_llr_neq_1_final_success_group",
+                    "failure_rate_final_success_group",
+                ],
+            )
+            w.writeheader()
+
     ax2.set_xlabel('Timestep (t)')
-    ax2.set_ylabel('Main Trunk Breakage Rate')
-    ax2.set_title('Main Trunk Breakage Rate During Sampling (All Dynamics Samples)')
+    ax2.set_ylabel('Failure Rate (Largest_Log_Ratio != 1)')
+    ax2.set_title('Failure Rate During Sampling (All Dynamics Samples)')
     ax2.set_ylim([0, 1.05])
     ax2.legend()
     ax2.grid(True, alpha=0.3)
@@ -1208,8 +1481,8 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
     
     # Collect all data for averaging (use all samples)
     all_ratios_by_t = {}  # {t: [ratios]}
-    broken_ratios_by_t = {}  # {t: [ratios]}
-    unbroken_ratios_by_t = {}  # {t: [ratios]}
+    failed_ratios_by_t = {}  # {t: [ratios]}
+    success_ratios_by_t = {}  # {t: [ratios]}
     
     # First pass: collect all data for averaging
     for sid in sorted(samples.keys()):
@@ -1229,17 +1502,17 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
                 base_connected_ratios.append(ratio)
             
             # Collect data for averaging (all samples)
-            is_broken = sample_final_states.get(sid, False)
+            is_success = sample_final_states.get(sid, False)
             for t, ratio in zip(ts, base_connected_ratios):
                 if t not in all_ratios_by_t:
                     all_ratios_by_t[t] = []
-                    broken_ratios_by_t[t] = []
-                    unbroken_ratios_by_t[t] = []
+                    failed_ratios_by_t[t] = []
+                    success_ratios_by_t[t] = []
                 all_ratios_by_t[t].append(ratio)
-                if is_broken:
-                    broken_ratios_by_t[t].append(ratio)
+                if not is_success:
+                    failed_ratios_by_t[t].append(ratio)
                 else:
-                    unbroken_ratios_by_t[t].append(ratio)
+                    success_ratios_by_t[t].append(ratio)
     
     # Second pass: plot only selected samples
     for sid in samples_to_plot:
@@ -1265,12 +1538,60 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
     if all_ratios_by_t:
         sorted_ts = sorted(all_ratios_by_t.keys(), reverse=True)
         avg_all = [np.mean(all_ratios_by_t[t]) for t in sorted_ts]
-        avg_broken = [np.mean(broken_ratios_by_t[t]) if broken_ratios_by_t[t] else np.nan for t in sorted_ts]
-        avg_unbroken = [np.mean(unbroken_ratios_by_t[t]) if unbroken_ratios_by_t[t] else np.nan for t in sorted_ts]
+        avg_failed = [np.mean(failed_ratios_by_t[t]) if failed_ratios_by_t[t] else np.nan for t in sorted_ts]
+        avg_success = [np.mean(success_ratios_by_t[t]) if success_ratios_by_t[t] else np.nan for t in sorted_ts]
         
         ax3.plot(sorted_ts, avg_all, label='Avg (All)', color='black', linewidth=2.5, linestyle='-', alpha=0.9)
-        ax3.plot(sorted_ts, avg_broken, label='Avg (Broken)', color='red', linewidth=2.5, linestyle='--', alpha=0.9)
-        ax3.plot(sorted_ts, avg_unbroken, label='Avg (Unbroken)', color='green', linewidth=2.5, linestyle='--', alpha=0.9)
+        ax3.plot(sorted_ts, avg_failed, label='Avg (Failed)', color='red', linewidth=2.5, linestyle='--', alpha=0.9)
+        ax3.plot(sorted_ts, avg_success, label='Avg (Success)', color='green', linewidth=2.5, linestyle='--', alpha=0.9)
+
+        sample_bcr_by_t: Dict[int, Dict[int, float]] = {}
+        for sid in samples_to_plot:
+            fd = [r for r in samples[sid] if r["t"] <= t_threshold]
+            d: Dict[int, float] = {}
+            for r in fd:
+                total_log_size = r.get("Total_Log_Size", r.get("Log_Size", 0))
+                ratio = (
+                    float(r["Base_Connected_Size"]) / float(total_log_size)
+                    if total_log_size > 0
+                    else 0.0
+                )
+                d[int(r["t"])] = ratio
+            sample_bcr_by_t[sid] = d
+
+        bcr_fieldnames = (
+            ["timestep", "t_plot_threshold"]
+            + [f"sample_{sid}_base_connected_ratio" for sid in samples_to_plot]
+            + ["avg_all", "avg_failed", "avg_success"]
+        )
+        bcr_rows: List[Dict[str, object]] = []
+        for t_i, a_all, a_f, a_s in zip(sorted_ts, avg_all, avg_failed, avg_success):
+            row: Dict[str, object] = {
+                "timestep": t_i,
+                "t_plot_threshold": t_threshold,
+                "avg_all": a_all,
+                "avg_failed": _csv_float_cell(a_f),
+                "avg_success": _csv_float_cell(a_s),
+            }
+            for sid in samples_to_plot:
+                v = sample_bcr_by_t[sid].get(t_i)
+                row[f"sample_{sid}_base_connected_ratio"] = "" if v is None else v
+            bcr_rows.append(row)
+        bcr_csv = os.path.join(plot_data_dir, "dynamics_divergence_subplot_03_base_connected_ratio.csv")
+        with open(bcr_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=bcr_fieldnames)
+            w.writeheader()
+            w.writerows(bcr_rows)
+    else:
+        bcr_fieldnames = (
+            ["timestep", "t_plot_threshold"]
+            + [f"sample_{sid}_base_connected_ratio" for sid in samples_to_plot]
+            + ["avg_all", "avg_failed", "avg_success"]
+        )
+        bcr_csv = os.path.join(plot_data_dir, "dynamics_divergence_subplot_03_base_connected_ratio.csv")
+        with open(bcr_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=bcr_fieldnames)
+            w.writeheader()
     
     ax3.set_xlabel('Timestep (t)')
     ax3.set_ylabel('Base Connected Ratio')
@@ -1285,8 +1606,8 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
     
     # Collect all data for averaging (use all samples)
     all_ratios_by_t = {}  # {t: [ratios]}
-    broken_ratios_by_t = {}  # {t: [ratios]}
-    unbroken_ratios_by_t = {}  # {t: [ratios]}
+    failed_ratios_by_t = {}  # {t: [ratios]}
+    success_ratios_by_t = {}  # {t: [ratios]}
     
     # First pass: collect all data for averaging
     for sid in sorted(samples.keys()):
@@ -1304,17 +1625,17 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
                     valid_ts.append(r['t'])
             if largest_log_ratios:  # Only process if there's valid data
                 # Collect data for averaging (all samples)
-                is_broken = sample_final_states.get(sid, False)
+                is_success = sample_final_states.get(sid, False)
                 for t, ratio in zip(valid_ts, largest_log_ratios):
                     if t not in all_ratios_by_t:
                         all_ratios_by_t[t] = []
-                        broken_ratios_by_t[t] = []
-                        unbroken_ratios_by_t[t] = []
+                        failed_ratios_by_t[t] = []
+                        success_ratios_by_t[t] = []
                     all_ratios_by_t[t].append(ratio)
-                    if is_broken:
-                        broken_ratios_by_t[t].append(ratio)
+                    if not is_success:
+                        failed_ratios_by_t[t].append(ratio)
                     else:
-                        unbroken_ratios_by_t[t].append(ratio)
+                        success_ratios_by_t[t].append(ratio)
     
     # Second pass: plot only selected samples
     for sid in samples_to_plot:
@@ -1337,12 +1658,56 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
     if all_ratios_by_t:
         sorted_ts = sorted(all_ratios_by_t.keys(), reverse=True)
         avg_all = [np.mean(all_ratios_by_t[t]) for t in sorted_ts]
-        avg_broken = [np.mean(broken_ratios_by_t[t]) if broken_ratios_by_t[t] else np.nan for t in sorted_ts]
-        avg_unbroken = [np.mean(unbroken_ratios_by_t[t]) if unbroken_ratios_by_t[t] else np.nan for t in sorted_ts]
+        avg_failed = [np.mean(failed_ratios_by_t[t]) if failed_ratios_by_t[t] else np.nan for t in sorted_ts]
+        avg_success = [np.mean(success_ratios_by_t[t]) if success_ratios_by_t[t] else np.nan for t in sorted_ts]
         
         ax4.plot(sorted_ts, avg_all, label='Avg (All)', color='black', linewidth=2.5, linestyle='-', alpha=0.9)
-        ax4.plot(sorted_ts, avg_broken, label='Avg (Broken)', color='red', linewidth=2.5, linestyle='--', alpha=0.9)
-        ax4.plot(sorted_ts, avg_unbroken, label='Avg (Unbroken)', color='green', linewidth=2.5, linestyle='--', alpha=0.9)
+        ax4.plot(sorted_ts, avg_failed, label='Avg (Failed)', color='red', linewidth=2.5, linestyle='--', alpha=0.9)
+        ax4.plot(sorted_ts, avg_success, label='Avg (Success)', color='green', linewidth=2.5, linestyle='--', alpha=0.9)
+
+        sample_llr_by_t: Dict[int, Dict[int, float]] = {}
+        for sid in samples_to_plot:
+            fd = [r for r in samples[sid] if r["t"] <= t_threshold]
+            d: Dict[int, float] = {}
+            for r in fd:
+                ratio = float(r.get("Largest_Log_Ratio", -1.0))
+                if ratio >= 0.0:
+                    d[int(r["t"])] = ratio
+            sample_llr_by_t[sid] = d
+
+        llr_fieldnames = (
+            ["timestep", "t_plot_threshold"]
+            + [f"sample_{sid}_largest_log_ratio" for sid in samples_to_plot]
+            + ["avg_all", "avg_failed", "avg_success"]
+        )
+        llr_rows: List[Dict[str, object]] = []
+        for t_i, a_all, a_f, a_s in zip(sorted_ts, avg_all, avg_failed, avg_success):
+            row = {
+                "timestep": t_i,
+                "t_plot_threshold": t_threshold,
+                "avg_all": a_all,
+                "avg_failed": _csv_float_cell(a_f),
+                "avg_success": _csv_float_cell(a_s),
+            }
+            for sid in samples_to_plot:
+                v = sample_llr_by_t[sid].get(t_i)
+                row[f"sample_{sid}_largest_log_ratio"] = "" if v is None else v
+            llr_rows.append(row)
+        llr_csv = os.path.join(plot_data_dir, "dynamics_divergence_subplot_04_largest_log_ratio.csv")
+        with open(llr_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=llr_fieldnames)
+            w.writeheader()
+            w.writerows(llr_rows)
+    else:
+        llr_fieldnames = (
+            ["timestep", "t_plot_threshold"]
+            + [f"sample_{sid}_largest_log_ratio" for sid in samples_to_plot]
+            + ["avg_all", "avg_failed", "avg_success"]
+        )
+        llr_csv = os.path.join(plot_data_dir, "dynamics_divergence_subplot_04_largest_log_ratio.csv")
+        with open(llr_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=llr_fieldnames)
+            w.writeheader()
     
     ax4.set_xlabel('Timestep (t)')
     ax4.set_ylabel('Largest Log Ratio')
@@ -1357,6 +1722,7 @@ def plot_divergence(trace_data: List[Dict], output_dir: str, n_dynamics_samples:
     plt.close()
     
     console.print(f"[green]✓[/green] Saved divergence plot: {png_path}")
+    console.print(f"[green]✓[/green] Divergence plot data CSV: [cyan]{plot_data_dir}/[/cyan]")
 
 
 def plot_timing_distributions(trace_data: List[Dict], output_dir: str, console: Optional[Console] = None):
@@ -1371,6 +1737,8 @@ def plot_timing_distributions(trace_data: List[Dict], output_dir: str, console: 
         return
     
     os.makedirs(output_dir, exist_ok=True)
+    plot_data_dir = os.path.join(output_dir, "plot_data_csv")
+    os.makedirs(plot_data_dir, exist_ok=True)
     png_path = os.path.join(output_dir, "dynamics_timing_distribution_plot.png")
     
     # Group by sample_idx
@@ -1381,48 +1749,125 @@ def plot_timing_distributions(trace_data: List[Dict], output_dir: str, console: 
             samples[sid] = []
         samples[sid].append(row)
     
-    # Determine final state (is_main_trunk_broken) for each sample
+    # Determine final success state by Largest_Log_Ratio==1 for each sample
     sample_final_states = {}
     for sid in samples.keys():
         data = samples[sid]
         if data:
             final_data = min(data, key=lambda x: x['t'])
-            sample_final_states[sid] = final_data.get('Is_Main_Trunk_Broken', False)
+            sample_final_states[sid] = is_success_sample(final_data)
     
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
     
     # Histogram 1: t_emerge
     ax1 = axes[0]
-    t_emerge_broken = []
-    t_emerge_unbroken = []
+    t_emerge_failed = []
+    t_emerge_success = []
+    emerge_sample_rows: List[Dict[str, object]] = []
     for sid in sorted(samples.keys()):
         sample_trace = samples[sid]
         t_emerge, _ = compute_t_emerge_and_t_lockin(sample_trace)
+        is_succ = bool(sample_final_states.get(sid, False))
+        grp = "success" if is_succ else "failed"
+        emerge_sample_rows.append(
+            {
+                "sample_idx": sid,
+                "final_group": grp,
+                "t_emerge": int(t_emerge) if t_emerge is not None else "",
+                "found": 1 if t_emerge is not None else 0,
+            }
+        )
         if t_emerge is not None:
-            if sample_final_states.get(sid, False):
-                t_emerge_broken.append(t_emerge)
+            if is_succ:
+                t_emerge_success.append(t_emerge)
             else:
-                t_emerge_unbroken.append(t_emerge)
+                t_emerge_failed.append(t_emerge)
+
+    emerge_csv = os.path.join(plot_data_dir, "dynamics_timing_distribution_subplot_01_t_emerge.csv")
+    with open(emerge_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["sample_idx", "final_group", "t_emerge", "found"],
+        )
+        w.writeheader()
+        w.writerows(emerge_sample_rows)
+
+    def _write_timing_histogram_csv(
+        path: str,
+        vals_failed: List[int],
+        vals_success: List[int],
+        n_bins: int = 30,
+    ) -> None:
+        vf = np.asarray(vals_failed, dtype=np.float64)
+        vs = np.asarray(vals_success, dtype=np.float64)
+        parts = [a for a in (vf, vs) if a.size > 0]
+        if not parts:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "bin_index",
+                        "bin_left",
+                        "bin_right",
+                        "count_failed",
+                        "count_success",
+                    ],
+                )
+                w.writeheader()
+            return
+        combined = np.concatenate(parts)
+        bin_edges = np.histogram_bin_edges(combined, bins=n_bins)
+        nf, _ = np.histogram(vf, bins=bin_edges) if vf.size else np.zeros(len(bin_edges) - 1, dtype=np.int64)
+        ns, _ = np.histogram(vs, bins=bin_edges) if vs.size else np.zeros(len(bin_edges) - 1, dtype=np.int64)
+        rows_h: List[Dict[str, object]] = []
+        for i in range(len(bin_edges) - 1):
+            rows_h.append(
+                {
+                    "bin_index": i,
+                    "bin_left": float(bin_edges[i]),
+                    "bin_right": float(bin_edges[i + 1]),
+                    "count_failed": int(nf[i]),
+                    "count_success": int(ns[i]),
+                }
+            )
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "bin_index",
+                    "bin_left",
+                    "bin_right",
+                    "count_failed",
+                    "count_success",
+                ],
+            )
+            w.writeheader()
+            w.writerows(rows_h)
+
+    emerge_hist_csv = os.path.join(
+        plot_data_dir, "dynamics_timing_distribution_subplot_01_t_emerge_histogram.csv"
+    )
+    _write_timing_histogram_csv(emerge_hist_csv, t_emerge_failed, t_emerge_success, n_bins=30)
     
-    if t_emerge_broken or t_emerge_unbroken:
+    if t_emerge_failed or t_emerge_success:
         data_to_plot = []
         labels = []
         colors = []
-        if t_emerge_broken:
-            data_to_plot.append(t_emerge_broken)
-            labels.append('Broken')
+        if t_emerge_failed:
+            data_to_plot.append(t_emerge_failed)
+            labels.append('Failed')
             colors.append('red')
-        if t_emerge_unbroken:
-            data_to_plot.append(t_emerge_unbroken)
-            labels.append('Unbroken')
+        if t_emerge_success:
+            data_to_plot.append(t_emerge_success)
+            labels.append('Success')
             colors.append('green')
         ax1.hist(data_to_plot, bins=30, edgecolor='black', alpha=0.65, label=labels, color=colors)
-        if t_emerge_broken:
-            mean_b = float(np.mean(t_emerge_broken))
-            ax1.axvline(mean_b, color='red', linestyle='--', linewidth=2.0, label='Broken mean')
-        if t_emerge_unbroken:
-            mean_u = float(np.mean(t_emerge_unbroken))
-            ax1.axvline(mean_u, color='green', linestyle='--', linewidth=2.0, label='Unbroken mean')
+        if t_emerge_failed:
+            mean_f = float(np.mean(t_emerge_failed))
+            ax1.axvline(mean_f, color='red', linestyle='--', linewidth=2.0, label='Failed mean')
+        if t_emerge_success:
+            mean_s = float(np.mean(t_emerge_success))
+            ax1.axvline(mean_s, color='green', linestyle='--', linewidth=2.0, label='Success mean')
         ax1.set_xlabel('t_emerge (Timestep)')
         ax1.set_ylabel('Frequency')
         ax1.set_title('Distribution of t_emerge (Tree Emergence Time)')
@@ -1435,36 +1880,61 @@ def plot_timing_distributions(trace_data: List[Dict], output_dir: str, console: 
     
     # Histogram 2: t_lockin
     ax2 = axes[1]
-    t_lockin_broken = []
-    t_lockin_unbroken = []
+    t_lockin_failed = []
+    t_lockin_success = []
+    lockin_sample_rows: List[Dict[str, object]] = []
     for sid in sorted(samples.keys()):
         sample_trace = samples[sid]
         _, t_lockin = compute_t_emerge_and_t_lockin(sample_trace)
+        is_succ = bool(sample_final_states.get(sid, False))
+        grp = "success" if is_succ else "failed"
+        lockin_sample_rows.append(
+            {
+                "sample_idx": sid,
+                "final_group": grp,
+                "t_lockin": int(t_lockin) if t_lockin is not None else "",
+                "found": 1 if t_lockin is not None else 0,
+            }
+        )
         if t_lockin is not None:
-            if sample_final_states.get(sid, False):
-                t_lockin_broken.append(t_lockin)
+            if is_succ:
+                t_lockin_success.append(t_lockin)
             else:
-                t_lockin_unbroken.append(t_lockin)
+                t_lockin_failed.append(t_lockin)
+
+    lockin_csv = os.path.join(plot_data_dir, "dynamics_timing_distribution_subplot_02_t_lockin.csv")
+    with open(lockin_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["sample_idx", "final_group", "t_lockin", "found"],
+        )
+        w.writeheader()
+        w.writerows(lockin_sample_rows)
+
+    lockin_hist_csv = os.path.join(
+        plot_data_dir, "dynamics_timing_distribution_subplot_02_t_lockin_histogram.csv"
+    )
+    _write_timing_histogram_csv(lockin_hist_csv, t_lockin_failed, t_lockin_success, n_bins=30)
     
-    if t_lockin_broken or t_lockin_unbroken:
+    if t_lockin_failed or t_lockin_success:
         data_to_plot = []
         labels = []
         colors = []
-        if t_lockin_broken:
-            data_to_plot.append(t_lockin_broken)
-            labels.append('Broken')
+        if t_lockin_failed:
+            data_to_plot.append(t_lockin_failed)
+            labels.append('Failed')
             colors.append('red')
-        if t_lockin_unbroken:
-            data_to_plot.append(t_lockin_unbroken)
-            labels.append('Unbroken')
+        if t_lockin_success:
+            data_to_plot.append(t_lockin_success)
+            labels.append('Success')
             colors.append('green')
         ax2.hist(data_to_plot, bins=30, edgecolor='black', alpha=0.65, label=labels, color=colors)
-        if t_lockin_broken:
-            mean_b = float(np.mean(t_lockin_broken))
-            ax2.axvline(mean_b, color='red', linestyle='--', linewidth=2.0, label='Broken mean')
-        if t_lockin_unbroken:
-            mean_u = float(np.mean(t_lockin_unbroken))
-            ax2.axvline(mean_u, color='green', linestyle='--', linewidth=2.0, label='Unbroken mean')
+        if t_lockin_failed:
+            mean_f = float(np.mean(t_lockin_failed))
+            ax2.axvline(mean_f, color='red', linestyle='--', linewidth=2.0, label='Failed mean')
+        if t_lockin_success:
+            mean_s = float(np.mean(t_lockin_success))
+            ax2.axvline(mean_s, color='green', linestyle='--', linewidth=2.0, label='Success mean')
         ax2.set_xlabel('t_lockin (Timestep)')
         ax2.set_ylabel('Frequency')
         ax2.set_title('Distribution of t_lockin (Trunk State Lock-in Time)')
@@ -1480,6 +1950,7 @@ def plot_timing_distributions(trace_data: List[Dict], output_dir: str, console: 
     plt.close()
     
     console.print(f"[green]✓[/green] Saved timing distribution plot: {png_path}")
+    console.print(f"[green]✓[/green] Timing distribution plot data CSV: [cyan]{plot_data_dir}/[/cyan]")
 
 
 def fmt_secs(s: float) -> str:
@@ -1633,6 +2104,36 @@ def main():
         default=None,
         help="Use threshold-based log mask decoding (e.g., 0.4/0.5/0.6). If not set, use argmax decoding."
     )
+    parser.add_argument(
+        "--scorer_ckpt",
+        type=str,
+        default=None,
+        help="If set, use scorer-guided sampling (requires TopologyScorer3D checkpoint).",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=50.0,
+        help="Scorer guidance strength w (only used with --scorer_ckpt).",
+    )
+    parser.add_argument(
+        "--lambda_ratio",
+        type=float,
+        default=10.0,
+        help="Scorer guidance energy weight: minimize break - lambda_ratio * ratio (only used with --scorer_ckpt).",
+    )
+    parser.add_argument(
+        "--t_start",
+        type=int,
+        default=900,
+        help="Guidance start timestep (inclusive).",
+    )
+    parser.add_argument(
+        "--t_end",
+        type=int,
+        default=400,
+        help="Guidance end timestep (inclusive).",
+    )
     
     args = parser.parse_args()
     
@@ -1642,12 +2143,19 @@ def main():
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
         if torch.cuda.is_available():
+            # Set CuBLAS workspace config early to reduce non-determinism warnings on CUDA>=10.2.
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
             torch.cuda.manual_seed_all(args.seed)
             # Make cuDNN behavior deterministic when possible.
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
-        # Enforce deterministic algorithms where PyTorch supports it.
-        torch.use_deterministic_algorithms(True, warn_only=True)
+        # For scorer-guided sampling we run backward inside sampling steps; some CUDA ops
+        # (e.g. max_pool3d backward) are inherently non-deterministic and flood warnings.
+        # Keep strict deterministic mode for unguided eval; relax for guided eval.
+        if args.scorer_ckpt:
+            torch.use_deterministic_algorithms(False)
+        else:
+            torch.use_deterministic_algorithms(True, warn_only=True)
     
     console = Console()
     console.print("[bold]16x16x16 Voxel Diffusion Model Evaluation[/bold]\n")
@@ -1686,6 +2194,15 @@ def main():
     
     # Create beta schedule
     betas = BetaSchedule(T=T, schedule=beta_schedule, beta_start=beta_start, beta_end=beta_end).to(device)
+
+    scorer_model: Optional[nn.Module] = None
+    guidance_lambda_ratio = args.lambda_ratio
+    if args.scorer_ckpt:
+        scorer_model = load_scorer(args.scorer_ckpt, device)
+        console.print(
+            f"[green]✓[/green] Guided sampling enabled: scale={args.guidance_scale} "
+            f"window t={args.t_start}..{args.t_end} (lambda_ratio={guidance_lambda_ratio})"
+        )
     
     # Mixed precision
     use_amp = (device.type == "cuda") and (not args.no_amp)
@@ -1746,6 +2263,11 @@ def main():
         "save_npz": bool_to_str(args.save_npz),
         "label_decoding_mode": "argmax" if args.log_mask_threshold is None else "log_mask_threshold",
         "log_mask_threshold": args.log_mask_threshold if args.log_mask_threshold is not None else "None",
+        "scorer_ckpt": args.scorer_ckpt if args.scorer_ckpt else "None",
+        "guidance_scale": f"{args.guidance_scale:.10g}",
+        "guidance_t_start": str(args.t_start),
+        "guidance_t_end": str(args.t_end),
+        "guidance_lambda_ratio": f"{guidance_lambda_ratio:.10g}",
         # New standardized output filenames
         "simple_eval_csv": os.path.join(exp_output_dir, "simple_result.csv"),
         "simple_summary_csv": os.path.join(exp_output_dir, "simple_summary.csv"),
@@ -1753,7 +2275,20 @@ def main():
         "dynamics_summary_csv": os.path.join(exp_output_dir, "dynamics_summary.csv"),
         "dynamics_trace_csv": os.path.join(exp_output_dir, "dynamics_trace.csv"),
         "dynamics_divergence_plot_png": os.path.join(exp_output_dir, "dynamics_divergence_plot.png"),
+        "plot_data_csv_dir": os.path.join(exp_output_dir, "plot_data_csv"),
         "dynamics_timing_distribution_plot_png": os.path.join(exp_output_dir, "dynamics_timing_distribution_plot.png"),
+        "timing_plot_data_t_emerge_csv": os.path.join(
+            exp_output_dir, "plot_data_csv", "dynamics_timing_distribution_subplot_01_t_emerge.csv"
+        ),
+        "timing_plot_data_t_emerge_histogram_csv": os.path.join(
+            exp_output_dir, "plot_data_csv", "dynamics_timing_distribution_subplot_01_t_emerge_histogram.csv"
+        ),
+        "timing_plot_data_t_lockin_csv": os.path.join(
+            exp_output_dir, "plot_data_csv", "dynamics_timing_distribution_subplot_02_t_lockin.csv"
+        ),
+        "timing_plot_data_t_lockin_histogram_csv": os.path.join(
+            exp_output_dir, "plot_data_csv", "dynamics_timing_distribution_subplot_02_t_lockin_histogram.csv"
+        ),
         "dynamics_xt_dir": os.path.join(exp_output_dir, "dynamics_xt"),
         # Backward-compat keys pointing to new paths
         "eval_batch_csv": os.path.join(exp_output_dir, "simple_result.csv"),
@@ -1788,6 +2323,11 @@ def main():
         save_projections=not args.no_projections,
         save_npz=args.save_npz,
         log_mask_threshold=args.log_mask_threshold,
+        scorer_model=scorer_model,
+        guidance_scale=args.guidance_scale,
+        t_start=args.t_start,
+        t_end=args.t_end,
+        guidance_lambda_ratio=guidance_lambda_ratio,
         console=console,
     )
     
@@ -1800,7 +2340,7 @@ def main():
     
     # Print summary to console
     console.print("\n[bold]Summary Statistics:[/bold]")
-    console.print(f"  Main Trunk Breakage Rate: {summary['breakage_rate']:.2f}%")
+    console.print(f"  Failure Rate (Largest_Log_Ratio != 1): {summary['failure_rate']:.2f}%")
     console.print(f"  Broken Rate: {summary['broken_rate']:.2f}%")
     console.print(f"  Success Rate: {summary['success_rate']:.2f}%")
     console.print(f"  Avg Mass: {summary['avg_mass']:.1f} ± {summary['std_mass']:.1f} voxels")
@@ -1829,6 +2369,11 @@ def main():
         save_xt_projections=args.save_xt_projections,
         save_npz=args.save_npz,
         log_mask_threshold=args.log_mask_threshold,
+        scorer_model=scorer_model,
+        guidance_scale=args.guidance_scale,
+        t_start=args.t_start,
+        t_end=args.t_end,
+        guidance_lambda_ratio=guidance_lambda_ratio,
         console=console,
     )
     
@@ -1866,6 +2411,7 @@ def main():
         "dynamics_evaluation_time_per_sample_secs": dynamics_eval_time / args.n_dynamics_samples if args.n_dynamics_samples > 0 else 0.0,
         # Summary statistics
         "breakage_rate": summary['breakage_rate'],
+        "failure_rate": summary['failure_rate'],
         "broken_rate": summary['broken_rate'],
         "success_rate": summary['success_rate'],
         "avg_mass": summary['avg_mass'],
@@ -1891,6 +2437,7 @@ def main():
         # Dynamics final-state summary statistics
         "dynamics_n_samples": dynamics_summary.get('n_samples', 0),
         "dynamics_breakage_rate": dynamics_summary.get('breakage_rate', 0.0),
+        "dynamics_failure_rate": dynamics_summary.get('failure_rate', 0.0),
         "dynamics_broken_rate": dynamics_summary.get('broken_rate', 0.0),
         "dynamics_success_rate": dynamics_summary.get('success_rate', 0.0),
         "dynamics_avg_base_connected_ratio": dynamics_summary.get('avg_base_connected_ratio', 0.0),

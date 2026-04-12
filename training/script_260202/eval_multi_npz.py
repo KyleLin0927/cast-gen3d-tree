@@ -50,10 +50,9 @@ def compute_sample_label_row(
     labels: np.ndarray,
     sample_id: int,
     run_seed: Optional[int],
-    hard_neg_llr_threshold: float = 0.5,
 ) -> Dict[str, Any]:
     """與 generate_16_voxel_diffusion_bucket.compute_sample_label_row 相同。"""
-    m = compute_sample_metrics(labels, hard_neg_llr_threshold=hard_neg_llr_threshold)
+    m = compute_sample_metrics(labels)
     llr = m["Largest_Log_Ratio"]
     llr_store = round(float(llr), 6) if llr >= 0 else -1.0
 
@@ -118,7 +117,6 @@ def write_sample_labels_csv(
 def write_sample_labels_summary_csv(
     rows: List[Dict[str, Any]],
     path: str,
-    hard_neg_llr_threshold: float,
 ) -> None:
     """與 generate_16_voxel_diffusion_bucket.write_sample_labels_summary_csv 相同。"""
     lines: List[List[str]] = [["Metric", "Value"]]
@@ -140,7 +138,6 @@ def write_sample_labels_summary_csv(
 
     if n == 0:
         add_section("Scorer-style categories (scorer bucketing)")
-        lines.append(["hard_neg_llr_threshold_r", f"{hard_neg_llr_threshold:.6f}"])
         lines.append(
             [
                 "note",
@@ -307,21 +304,8 @@ def write_sample_labels_summary_csv(
                 f"{100.0 * float(np.mean(v >= 0.99)):.4f}",
             ]
         )
-        lines.append(
-            [
-                f"pct_samples_largest_log_ratio_ge_r (r={hard_neg_llr_threshold:.6f})",
-                f"{100.0 * float(np.mean(v >= hard_neg_llr_threshold)):.4f}",
-            ]
-        )
-        lines.append(
-            [
-                "note_pct_ge_r",
-                "among samples with valid largest_log_ratio only (aligns with neg_hard llr>=r)",
-            ]
-        )
 
     add_section("Scorer-style categories (scorer bucketing)")
-    lines.append(["hard_neg_llr_threshold_r", f"{hard_neg_llr_threshold:.6f}"])
     lines.append(
         [
             "note",
@@ -368,7 +352,6 @@ def evaluate_folder(
     scan_root: Path,
     expected_shape: Optional[Tuple[int, int, int]],
     run_seed: Optional[int],
-    hard_neg_llr_threshold: float,
     save_projections: bool,
     projections_dir: Optional[str],
     projection_exp_name: str,
@@ -391,7 +374,6 @@ def evaluate_folder(
             labels,
             sample_id=i + 1,
             run_seed=run_seed,
-            hard_neg_llr_threshold=hard_neg_llr_threshold,
         )
         src = source_name_for_csv(p, scan_root)
         row["source_name"] = src
@@ -447,13 +429,6 @@ def main() -> None:
         "--no_require_16_cube",
         action="store_true",
         help="Do not require shape (16, 16, 16)",
-    )
-    parser.add_argument(
-        "--hard_neg_llr_threshold",
-        type=float,
-        default=0.5,
-        metavar="R",
-        help="Same as generate_16_voxel_diffusion --hard_neg_llr_threshold (default: 0.5)",
     )
     parser.add_argument(
         "--seed",
@@ -515,7 +490,6 @@ def main() -> None:
             scan_root=scan_root,
             expected_shape=expected,
             run_seed=args.seed,
-            hard_neg_llr_threshold=args.hard_neg_llr_threshold,
             save_projections=save_projections,
             projections_dir=projections_dir,
             projection_exp_name=projection_exp_name,
@@ -529,7 +503,6 @@ def main() -> None:
     write_sample_labels_summary_csv(
         rows,
         csv_summary,
-        hard_neg_llr_threshold=args.hard_neg_llr_threshold,
     )
 
     elapsed = time.time() - t0

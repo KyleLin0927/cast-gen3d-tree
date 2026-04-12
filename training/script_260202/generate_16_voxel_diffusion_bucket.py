@@ -7,12 +7,12 @@
 - npz/{...}/：同上，每檔僅含陣列鍵 ``voxel``（--no_npz 可關閉）
 - sample_labels.csv: 每個樣本的 id、seed、分類與 compute_sample_metrics 之完整指標（見下方欄位）
 - sample_labels_summary.csv: 全體樣本指標加總與平均、標準差等
-- 分類定義（r = --hard_neg_llr_threshold）：
+- 分類定義：
   - neg_float：base_connected_size==0（連地板都沒碰到）
   - positive：base_connected_size>0，且全樹只有 1 個連通塊（log_components==1；Absolute Connectivity）
   - neg_hard：base_connected_size>0，且 log_components==2
   - neg_easy：base_connected_size>0，且 log_components>2
-- metadata.csv / metadata_flat.csv：重現用參數（含 r / hard_neg_llr_threshold）
+- metadata.csv / metadata_flat.csv：重現用參數
 - generate_16_voxel_diffusion_snapshot_YYYYMMDD_HHMMSS.py：執行當下本腳本完整備份
 
 sample_labels.csv 欄位：
@@ -143,12 +143,11 @@ def compute_sample_label_row(
     labels: np.ndarray,
     sample_id: int,
     run_seed: Optional[int],
-    hard_neg_llr_threshold: float = 0.5,
 ) -> Dict[str, Any]:
     """
     由離散 labels 計算寫入 CSV 的一列；欄位涵蓋 compute_sample_metrics 目前回傳的所有指標。
     """
-    m = compute_sample_metrics(labels, hard_neg_llr_threshold=hard_neg_llr_threshold)
+    m = compute_sample_metrics(labels)
     llr = m["Largest_Log_Ratio"]
     llr_store = round(float(llr), 6) if llr >= 0 else -1.0
 
@@ -213,7 +212,6 @@ def write_sample_labels_csv(
 def write_sample_labels_summary_csv(
     rows: List[Dict[str, Any]],
     path: str,
-    hard_neg_llr_threshold: float,
 ) -> None:
     """由 per-sample 列計算統計，寫成兩欄 CSV（Metric, Value）。"""
     lines: List[List[str]] = [["Metric", "Value"]]
@@ -235,7 +233,6 @@ def write_sample_labels_summary_csv(
 
     if n == 0:
         add_section("Scorer-style categories (scorer bucketing)")
-        lines.append(["hard_neg_llr_threshold_r", f"{hard_neg_llr_threshold:.6f}"])
         lines.append(
             [
                 "note",
@@ -402,21 +399,8 @@ def write_sample_labels_summary_csv(
                 f"{100.0 * float(np.mean(v >= 0.99)):.4f}",
             ]
         )
-        lines.append(
-            [
-                f"pct_samples_largest_log_ratio_ge_r (r={hard_neg_llr_threshold:.6f})",
-                f"{100.0 * float(np.mean(v >= hard_neg_llr_threshold)):.4f}",
-            ]
-        )
-        lines.append(
-            [
-                "note_pct_ge_r",
-                "among samples with valid largest_log_ratio only (aligns with neg_hard llr>=r)",
-            ]
-        )
 
     add_section("Scorer-style categories (scorer bucketing)")
-    lines.append(["hard_neg_llr_threshold_r", f"{hard_neg_llr_threshold:.6f}"])
     lines.append(
         [
             "note",
@@ -459,7 +443,6 @@ def generate_samples(
     filename_prefix: str = "sample",
     sample_verbose: bool = False,
     run_seed: Optional[int] = None,
-    hard_neg_llr_threshold: float = 0.5,
     console: Optional[Console] = None,
 ) -> Tuple[float, List[Dict[str, Any]]]:
     if console is None:
@@ -541,7 +524,6 @@ def generate_samples(
                         labels,
                         sample_id=sid,
                         run_seed=run_seed,
-                        hard_neg_llr_threshold=hard_neg_llr_threshold,
                     )
                     cat = row["category"]
                     if kept_counts[cat] >= targets[cat]:
@@ -594,7 +576,6 @@ def generate_samples(
     write_sample_labels_summary_csv(
         label_rows,
         summary_path,
-        hard_neg_llr_threshold=hard_neg_llr_threshold,
     )
     console.print(f"[green]✓[/green] Summary: {summary_path}")
 
@@ -620,10 +601,6 @@ def generate_samples(
             if npz_roots[c]:
                 console.print(f"    [dim]→[/dim] [cyan]npz/{c}/[/cyan]")
     cat_counts = {c: sum(1 for r in label_rows if r.get("category") == c) for c in ALL_SCORER_CATEGORIES}
-    console.print(
-        f"[cyan]hard_neg_llr_threshold r=[/cyan]{hard_neg_llr_threshold:.6f} "
-        f"([dim]neg_hard: broken, base_sz>0, valid llr>=r[/dim])"
-    )
     console.print("[bold]Category counts:[/bold] " + ", ".join(f"{k}={v}" for k, v in cat_counts.items()))
     console.print("[bold]Category targets:[/bold] " + ", ".join(f"{k}={targets[k]}" for k in ALL_SCORER_CATEGORIES))
     console.print(f"[dim]Attempts sampled (including skipped due to full bucket): {idx_attempt}[/dim]")
@@ -678,18 +655,6 @@ def main() -> None:
         action="store_true",
         help="Per-step prints from sample_voxels (slow, noisy)",
     )
-    parser.add_argument(
-        "--hard_neg_llr_threshold",
-        type=float,
-        default=0.5,
-        metavar="R",
-        help=(
-            "neg_hard: base_connected_size>0, log_components>1, valid largest_log_ratio >= R. "
-            "neg_easy: base_connected_size>0, log_components>1, llr invalid or < R. "
-            "neg_float: base_connected_size==0. Default R: 0.5"
-        ),
-    )
-
     args = parser.parse_args()
     t_start = datetime.now()
 
@@ -718,9 +683,6 @@ def main() -> None:
     console.print(f"[cyan]AMP: {use_amp}[/cyan]")
     save_npz = not args.no_npz
     console.print(f"[cyan]Save NPZ:[/cyan] {save_npz}")
-    console.print(
-        f"[cyan]hard_neg_llr_threshold (r):[/cyan] {args.hard_neg_llr_threshold:.6f}"
-    )
     console.print(
         "[cyan]Targets:[/cyan] "
         f"positive={args.n_pos}, neg_float={args.n_float}, neg_easy={args.n_easy}, neg_hard={args.n_hard}"
@@ -785,9 +747,6 @@ def main() -> None:
         "sample_labels_summary_csv": os.path.join(
             os.path.abspath(args.out_dir), "sample_labels_summary.csv"
         ),
-        # r：neg_hard 門檻 largest_log_ratio >= r（components>1 且接地後才會用到）
-        "r": f"{args.hard_neg_llr_threshold:.10g}",
-        "hard_neg_llr_threshold": f"{args.hard_neg_llr_threshold:.10g}",
         "projections_root": os.path.join(os.path.abspath(args.out_dir), "projections"),
         "npz_root": os.path.join(os.path.abspath(args.out_dir), "npz"),
         "projections_positive_dir": os.path.join(
@@ -836,7 +795,6 @@ def main() -> None:
         filename_prefix=out_dir_leaf,
         sample_verbose=args.sample_verbose,
         run_seed=args.seed,
-        hard_neg_llr_threshold=args.hard_neg_llr_threshold,
         console=console,
     )
 
