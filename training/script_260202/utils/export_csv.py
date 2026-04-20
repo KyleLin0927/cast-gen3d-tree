@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Generate `sample_labels_summary.csv` from per-sample label rows.
+Per-run CSV helpers: per-sample label tables (e.g. ``sample_labels.csv`` /
+``simple_label.csv``), per-timestep dynamics label traces (``dynamics_label_trace.csv``),
+and two-column summaries (``sample_labels_summary.csv`` / ``simple_label_summary.csv``).
 
-（由 ``utils.export_csv`` 集中維護，供 generate / eval 腳本共用。）
+供 generate / eval 等腳本共用。
 """
 
 from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -19,7 +21,141 @@ from .voxel_sample_metrics import (
     CAT_NEG_FLOAT,
     CAT_NEG_HARD,
     CAT_POSITIVE,
+    compute_sample_metrics,
 )
+
+# Header order for ``sample_labels.csv`` (must match ``compute_sample_label_row`` keys + ``source_name``).
+SAMPLE_LABELS_CSV_FIELDNAMES: Tuple[str, ...] = (
+    "id",
+    "seed",
+    "category",
+    "is_main_trunk_broken",
+    "is_broken",
+    "largest_log_ratio",
+    "mass",
+    "height",
+    "base_connected_ratio",
+    "base_connected_size",
+    "log_size",
+    "leaf_size",
+    "occupancy_non_air",
+    "occupancy_log",
+    "occupancy_leaf",
+    "components_non_air",
+    "components_log",
+    "components_leaf",
+    "source_name",
+)
+
+# Per-timestep dynamics trace: same label columns as ``SAMPLE_LABELS_CSV_FIELDNAMES`` with leading
+# ``sample_idx`` (1-based, 與 dynamics_trace.csv 一致), ``step_idx``, ``t``.
+DYNAMICS_LABEL_TRACE_CSV_FIELDNAMES: Tuple[str, ...] = (
+    "sample_idx",
+    "step_idx",
+    "t",
+) + SAMPLE_LABELS_CSV_FIELDNAMES
+
+
+def sample_label_row_from_metrics(
+    m: Dict[str, Any],
+    sample_id: int,
+    run_seed: Optional[int],
+) -> Dict[str, Any]:
+    """
+    由 ``compute_sample_metrics`` 回傳的 dict 組出與 ``compute_sample_label_row`` 相同鍵的一列
+    （不含 ``source_name``；由呼叫端填入）。可用於已算過 metrics、手邊沒有 labels 陣列的情境。
+    """
+    llr = m["Largest_Log_Ratio"]
+    llr_store = round(float(llr), 6) if llr >= 0 else -1.0
+
+    return {
+        "id": sample_id,
+        "seed": "" if run_seed is None else int(run_seed),
+        "category": m["Scorer_Category"],
+        "is_main_trunk_broken": 1 if m["Is_Main_Trunk_Broken"] else 0,
+        "is_broken": 1 if m["Is_Broken"] else 0,
+        "largest_log_ratio": llr_store,
+        "mass": int(m["Mass"]),
+        "height": int(m["Height"]),
+        "base_connected_ratio": round(float(m["Base_Connected_Ratio"]), 6),
+        "base_connected_size": int(m["Base_Connected_Size"]),
+        "log_size": int(m["Log_Size"]),
+        "leaf_size": int(m["Leaf_Size"]),
+        "occupancy_non_air": round(float(m["Occupancy_Non_Air"]), 6),
+        "occupancy_log": round(float(m["Occupancy_Log"]), 6),
+        "occupancy_leaf": round(float(m["Occupancy_Leaf"]), 6),
+        "components_non_air": int(m["Components_Non_Air"]),
+        "components_log": int(m["Components_Log"]),
+        "components_leaf": int(m["Components_Leaf"]),
+    }
+
+
+def compute_sample_label_row(
+    labels: np.ndarray,
+    sample_id: int,
+    run_seed: Optional[int],
+) -> Dict[str, Any]:
+    """
+    由離散 labels 計算寫入 per-sample label CSV 的一列（不含 ``source_name``；由呼叫端填入）。
+    """
+    return sample_label_row_from_metrics(compute_sample_metrics(labels), sample_id, run_seed)
+
+
+def write_sample_labels_csv(
+    rows: List[Dict[str, Any]],
+    path: str,
+) -> None:
+    """寫入 ``sample_labels.csv``；欄位順序見 ``SAMPLE_LABELS_CSV_FIELDNAMES``。"""
+    fieldnames = list(SAMPLE_LABELS_CSV_FIELDNAMES)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            out = {k: r.get(k, "") for k in fieldnames}
+            w.writerow(out)
+
+
+def write_dynamics_label_trace_csv(
+    trace_data: List[Dict[str, Any]],
+    path: str,
+    *,
+    run_seed: Optional[int],
+    save_npz: bool,
+    save_track_projections: bool,
+) -> None:
+    """
+    寫入 ``dynamics_label_trace.csv``：每個追蹤點一列，欄位為 ``DYNAMICS_LABEL_TRACE_CSV_FIELDNAMES``。
+
+    ``trace_data`` 元素須與 ``eval_diffusion_model`` 軌跡列相同（含 0-based ``sample_idx``、
+    ``step_idx``、``t`` 及 ``compute_sample_metrics`` 風格鍵名）。
+
+    ``source_name``：若有寫出對應軌跡檔，為相對路徑
+    ``dynamics_track_npz/dynamics_sample_XXX_step_YYYY_t_ZZZZ.npz`` 或
+    ``dynamics_track_projections/...png``；否則空字串。
+    """
+    fieldnames = list(DYNAMICS_LABEL_TRACE_CSV_FIELDNAMES)
+    skip = {"sample_idx", "step_idx", "t"}
+    sorted_trace = sorted(trace_data, key=lambda x: (x.get("sample_idx", 0), x.get("step_idx", 0)))
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        for tr in sorted_trace:
+            sid0 = int(tr.get("sample_idx", 0))
+            sid1 = sid0 + 1
+            step_idx = int(tr.get("step_idx", 0))
+            t_int = int(tr.get("t", 0))
+            m = {k: v for k, v in tr.items() if k not in skip}
+            base = sample_label_row_from_metrics(m, sample_id=sid1, run_seed=run_seed)
+            if save_npz:
+                src = f"dynamics_track_npz/dynamics_sample_{sid1:03d}_step_{step_idx:04d}_t_{t_int:04d}.npz"
+            elif save_track_projections:
+                src = f"dynamics_track_projections/dynamics_sample_{sid1:03d}_step_{step_idx:04d}_t_{t_int:04d}.png"
+            else:
+                src = ""
+            row = {"sample_idx": sid1, "step_idx": step_idx, "t": t_int, **base, "source_name": src}
+            w.writerow({k: row.get(k, "") for k in fieldnames})
 
 
 def write_sample_labels_summary_csv(
@@ -72,7 +208,6 @@ def write_sample_labels_summary_csv(
     broken = np.array([int(r["is_main_trunk_broken"]) for r in rows], dtype=np.float64)
     br = np.array([float(r["base_connected_ratio"]) for r in rows])
     bcs = np.array([float(r["base_connected_size"]) for r in rows])
-    tls = np.array([float(r["total_log_size"]) for r in rows])
 
     n_broken = int(broken.sum())
     n_intact = n - n_broken

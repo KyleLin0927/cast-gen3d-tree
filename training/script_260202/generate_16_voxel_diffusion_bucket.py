@@ -14,13 +14,13 @@
   - neg_hard：base_connected_size>0，且 log_components==2
   - neg_easy：base_connected_size>0，且 log_components>2
 - metadata.csv / metadata_flat.csv：重現用參數
-- generate_16_voxel_diffusion_snapshot_YYYYMMDD_HHMMSS.py：執行當下本腳本完整備份
+- generate_16_voxel_diffusion_bucket_snapshot_YYYYMMDD_HHMMSS.py：執行當下本腳本完整備份
 
-sample_labels.csv 欄位：
+sample_labels.csv 欄位（與 ``generate_16_voxel_diffusion.py`` 相同，順序如下）：
 - id, seed, category（positive | neg_float | neg_easy | neg_hard）
-- is_main_trunk_broken(0/1), is_broken(0/1)
-- mass, height, log_size, leaf_size
-- base_connected_ratio, base_connected_size, total_log_size, largest_log_ratio（無效時 -1）
+- is_main_trunk_broken(0/1), is_broken(0/1), largest_log_ratio（無效時 -1）
+- mass, height
+- base_connected_ratio, base_connected_size, log_size, leaf_size
 - occupancy_non_air, occupancy_log, occupancy_leaf
 - components_non_air, components_log, components_leaf
 - source_name：相對於 ``--out_dir`` 的 POSIX 路徑，優先 ``npz/<category>/<stem>.npz``；若 ``--no_npz`` 則為 ``projections/<category>/<stem>.png``；兩者皆關則為空字串
@@ -70,14 +70,17 @@ except ImportError as e:
 
 from utils.voxel_label_projections import save_labels_and_projections
 from utils.voxel_npz_io import save_voxel_npz
-from utils.export_csv import write_sample_labels_summary_csv
+from utils.export_csv import (
+    compute_sample_label_row,
+    write_sample_labels_csv,
+    write_sample_labels_summary_csv,
+)
 from utils.voxel_sample_metrics import (
     ALL_SCORER_CATEGORIES,
     CAT_NEG_EASY,
     CAT_NEG_FLOAT,
     CAT_NEG_HARD,
     CAT_POSITIVE,
-    compute_sample_metrics,
 )
 
 
@@ -139,76 +142,6 @@ def save_metadata(metadata: Dict, output_dir: str, console: Console) -> None:
         dw.writeheader()
         dw.writerow(metadata)
     console.print(f"[green]✓[/green] metadata: [cyan]{kv_path}[/cyan]")
-
-
-def compute_sample_label_row(
-    labels: np.ndarray,
-    sample_id: int,
-    run_seed: Optional[int],
-) -> Dict[str, Any]:
-    """
-    由離散 labels 計算寫入 CSV 的一列；欄位涵蓋 compute_sample_metrics 目前回傳的所有指標。
-    """
-    m = compute_sample_metrics(labels)
-    llr = m["Largest_Log_Ratio"]
-    llr_store = round(float(llr), 6) if llr >= 0 else -1.0
-
-    return {
-        "id": sample_id,
-        "seed": "" if run_seed is None else int(run_seed),
-        "category": m["Scorer_Category"],
-        "is_main_trunk_broken": 1 if m["Is_Main_Trunk_Broken"] else 0,
-        "is_broken": 1 if m["Is_Broken"] else 0,
-        "mass": int(m["Mass"]),
-        "height": int(m["Height"]),
-        "log_size": int(m["Log_Size"]),
-        "leaf_size": int(m["Leaf_Size"]),
-        "base_connected_ratio": round(float(m["Base_Connected_Ratio"]), 6),
-        "base_connected_size": int(m["Base_Connected_Size"]),
-        "total_log_size": int(m["Total_Log_Size"]),
-        "largest_log_ratio": llr_store,
-        "occupancy_non_air": round(float(m["Occupancy_Non_Air"]), 6),
-        "occupancy_log": round(float(m["Occupancy_Log"]), 6),
-        "occupancy_leaf": round(float(m["Occupancy_Leaf"]), 6),
-        "components_non_air": int(m["Components_Non_Air"]),
-        "components_log": int(m["Components_Log"]),
-        "components_leaf": int(m["Components_Leaf"]),
-    }
-
-
-def write_sample_labels_csv(
-    rows: List[Dict[str, Any]],
-    path: str,
-) -> None:
-    fieldnames = [
-        "id",
-        "seed",
-        "category",
-        "is_main_trunk_broken",
-        "is_broken",
-        "mass",
-        "height",
-        "log_size",
-        "leaf_size",
-        "base_connected_ratio",
-        "base_connected_size",
-        "total_log_size",
-        "largest_log_ratio",
-        "occupancy_non_air",
-        "occupancy_log",
-        "occupancy_leaf",
-        "components_non_air",
-        "components_log",
-        "components_leaf",
-        "source_name",
-    ]
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        w.writeheader()
-        for r in rows:
-            out = {k: r.get(k, "") for k in fieldnames}
-            w.writerow(out)
 
 
 def fmt_secs(s: float) -> str:

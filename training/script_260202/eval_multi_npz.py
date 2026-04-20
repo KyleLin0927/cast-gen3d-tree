@@ -2,7 +2,7 @@
 """
 對資料夾內已存在的 voxel .npz 批次計算指標（預設遞迴掃描子資料夾內的 .npz）。
 
-使用 utils.voxel_npz_io.load_voxel_npz 與 utils.voxel_sample_metrics.compute_sample_metrics。
+使用 utils.voxel_npz_io.load_voxel_npz；每列指標與 CSV 寫入由 ``utils.export_csv`` 統一產生。
 輸出 sample_labels.csv、sample_labels_summary.csv；欄位與兩個 generate 腳本一致，**最後**一欄皆為 ``source_name``：此處為相對於 ``--npz_dir``（掃描根）的原始 .npz 路徑（POSIX 斜線；無法相對化時為檔名）。generate 腳本則為相對於 ``--out_dir`` 的 ``npz/...`` 或 ``projections/...``。
 
 投影圖主標題（``exp_name`` 傳給 ``save_labels_and_projections``）為 ``--out_dir`` 解析後路徑的最後一層目錄名（預設 ``out_dir`` 與 ``--npz_dir`` 相同時即為該目錄名）；若無法取得則為 ``eval_YYYYMMDD_HHMMSS``。
@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import os
 import sys
 import time
@@ -34,78 +33,13 @@ from rich.console import Console
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir))
 
-from utils.export_csv import write_sample_labels_summary_csv
+from utils.export_csv import (
+    compute_sample_label_row,
+    write_sample_labels_csv,
+    write_sample_labels_summary_csv,
+)
 from utils.voxel_label_projections import save_labels_and_projections
 from utils.voxel_npz_io import load_voxel_npz
-from utils.voxel_sample_metrics import compute_sample_metrics
-
-
-def compute_sample_label_row(
-    labels: np.ndarray,
-    sample_id: int,
-    run_seed: Optional[int],
-) -> Dict[str, Any]:
-    """與 generate_16_voxel_diffusion_bucket.compute_sample_label_row 相同。"""
-    m = compute_sample_metrics(labels)
-    llr = m["Largest_Log_Ratio"]
-    llr_store = round(float(llr), 6) if llr >= 0 else -1.0
-
-    return {
-        "id": sample_id,
-        "seed": "" if run_seed is None else int(run_seed),
-        "category": m["Scorer_Category"],
-        "is_main_trunk_broken": 1 if m["Is_Main_Trunk_Broken"] else 0,
-        "is_broken": 1 if m["Is_Broken"] else 0,
-        "mass": int(m["Mass"]),
-        "height": int(m["Height"]),
-        "log_size": int(m["Log_Size"]),
-        "leaf_size": int(m["Leaf_Size"]),
-        "base_connected_ratio": round(float(m["Base_Connected_Ratio"]), 6),
-        "base_connected_size": int(m["Base_Connected_Size"]),
-        "total_log_size": int(m["Total_Log_Size"]),
-        "largest_log_ratio": llr_store,
-        "occupancy_non_air": round(float(m["Occupancy_Non_Air"]), 6),
-        "occupancy_log": round(float(m["Occupancy_Log"]), 6),
-        "occupancy_leaf": round(float(m["Occupancy_Leaf"]), 6),
-        "components_non_air": int(m["Components_Non_Air"]),
-        "components_log": int(m["Components_Log"]),
-        "components_leaf": int(m["Components_Leaf"]),
-    }
-
-
-def write_sample_labels_csv(
-    rows: List[Dict[str, Any]],
-    path: str,
-) -> None:
-    fieldnames = [
-        "id",
-        "seed",
-        "category",
-        "is_main_trunk_broken",
-        "is_broken",
-        "mass",
-        "height",
-        "log_size",
-        "leaf_size",
-        "base_connected_ratio",
-        "base_connected_size",
-        "total_log_size",
-        "largest_log_ratio",
-        "occupancy_non_air",
-        "occupancy_log",
-        "occupancy_leaf",
-        "components_non_air",
-        "components_log",
-        "components_leaf",
-        "source_name",
-    ]
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        w.writeheader()
-        for r in rows:
-            out = {k: r.get(k, "") for k in fieldnames}
-            w.writerow(out)
 
 
 def source_name_for_csv(file_path: Path, scan_root: Path) -> str:
