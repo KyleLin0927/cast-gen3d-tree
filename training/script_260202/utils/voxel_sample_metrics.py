@@ -2,7 +2,8 @@
 """
 單樣本 16³ voxel 評估指標（供 eval_16_voxel_diffusion、generate_16_voxel_diffusion 等腳本重用）。
 
-依賴上一層目錄（與本腳本同層）的 unet_diffusion_16_voxel 中的連通性與佔用率輔助函數。
+依賴同層 ``train_unet_diffusion`` 中的連通性與佔用率輔助函數（請勿在 ``train_unet_diffusion``
+載入過程中經由 ``utils`` 套件根 ``__init__`` 間接 import 本模組，否則會造成循環匯入）。
 """
 
 from __future__ import annotations
@@ -27,8 +28,9 @@ try:
     )
 except ImportError as e:
     raise ImportError(
-        f"Failed to import from unet_diffusion_16_voxel: {e}. "
-        "Ensure unet_diffusion_16_voxel.py is in the same directory."
+        f"Failed to import metric helpers from train_unet_diffusion: {e}. "
+        "If this mentions a circular import, avoid importing utils.export_csv (or the whole "
+        "utils package in a way that loads it) before train_unet_diffusion has finished loading."
     ) from e
 
 # Scorer 分桶（與 generate_16_voxel_diffusion 一致）
