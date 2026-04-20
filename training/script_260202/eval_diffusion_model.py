@@ -3,21 +3,16 @@
 評估 16x16x16 Voxel Diffusion 模型
 
 分層記錄評估數據：
-- 層次 A：每個樣本的最終狀態指標（用於畫直方圖）
-- 層次 B：整批樣本的統計摘要（用於報告）
-- 層次 C：前幾個樣本的完整動力學軌跡（用於畫 divergence 圖）
+- 層次 A：每個樣本的最終狀態指標（寫入 ``simple_label*.csv``，供後續分析）
+- 層次 B：整批樣本的統計摘要（寫入 ``simple_label_summary.csv`` 與 metadata；不再產生獨立的 batch 摘要 CSV）
+- 層次 C：前幾個樣本的完整動力學軌跡（寫入 ``dynamics_label_trace.csv``，並用於畫圖）
 
 輸出文件：
-- simple_result.csv: 每個樣本的指標（層次 A）
 - simple_label.csv / simple_label_summary.csv: 與 generate 腳本 ``sample_labels*.csv`` 相同欄位與格式
   （由 ``utils.export_csv`` 寫入；``source_name`` 相對於 ``--out_dir``，對應 ``simple_npz/`` 或 ``simple_projections/``）
-- simple_summary.csv: 統計摘要（層次 B）
-- dynamics_result.csv: 前幾個樣本的最終結果（層次 C）
 - dynamics_label.csv / dynamics_label_summary.csv: 與 ``simple_label*.csv`` 相同欄位與格式（層次 C 最終態）；
   ``source_name`` 相對於 ``--out_dir``，對應 ``dynamics_npz/`` 或 ``dynamics_projections/``
-- dynamics_summary.csv: 前幾個樣本的統計摘要（層次 C）
-- dynamics_trace.csv: 前幾個樣本的完整軌跡（層次 C）
-- dynamics_label_trace.csv: 同上軌跡每點一列，欄位為 label 格式（前綴 ``sample_idx, step_idx, t``，
+- dynamics_label_trace.csv: 動力學軌跡每點一列，欄位為 label 格式（前綴 ``sample_idx, step_idx, t``，
   其餘與 ``sample_labels.csv`` 一致；``source_name`` 對應 ``dynamics_track_npz/`` 或 ``dynamics_track_projections/``）
 - dynamics_divergence_plot.png: 可視化圖表
 - plot_data_csv/: 與 dynamics_divergence_plot 四個子圖對應之原始數據 CSV（各一檔）
@@ -841,32 +836,6 @@ def _save_xt_projections_impl(x_t: torch.Tensor, out_png: str, title_suffix: str
     save_labels_and_projections(labels, out_png, title_suffix=title_suffix, exp_name=exp_name)
 
 
-def save_batch_results(batch_metrics: List[Dict], output_dir: str, console: Optional[Console] = None):
-    """
-    保存批量評估結果到 CSV。
-    
-    Args:
-        batch_metrics: List of metrics dicts
-        output_dir: output directory
-        console: rich console
-    """
-    if console is None:
-        console = Console()
-    
-    os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, "simple_result.csv")
-    
-    # Define fieldnames (ID first, then other metrics)
-    fieldnames = ['ID'] + [k for k in batch_metrics[0].keys() if k != 'ID']
-    
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(batch_metrics)
-    
-    console.print(f"[green]✓[/green] Saved batch results: {csv_path} ({len(batch_metrics)} samples)")
-
-
 def save_simple_label_outputs(
     batch_metrics: List[Dict],
     output_dir: str,
@@ -912,7 +881,7 @@ def save_dynamics_label_outputs(
 ) -> None:
     """
     寫入 dynamics_label.csv / dynamics_label_summary.csv（欄位與 simple_label / generate sample_labels 一致）。
-    ``dynamics_result.csv`` 每列的 ``ID``（例如 ``001``）用於對齊檔名 ``dynamics_sample_001.*``。
+    每列 ``id``（例如 ``1``）與 metrics 內 ``ID``（例如 ``001``）對齊檔名 ``dynamics_sample_001.*``。
     """
     if console is None:
         console = Console()
@@ -938,71 +907,6 @@ def save_dynamics_label_outputs(
     write_sample_labels_summary_csv(rows, summary_path)
     console.print(f"[green]✓[/green] Saved dynamics labels: {labels_path} ({len(rows)} samples)")
     console.print(f"[green]✓[/green] Saved dynamics label summary: {summary_path}")
-
-
-def save_dynamics_samples(dynamics_metrics: List[Dict], output_dir: str, console: Optional[Console] = None):
-    """
-    保存動力學追蹤樣本的最終結果到 CSV。
-    
-    Args:
-        dynamics_metrics: List of metrics dicts for final states of dynamics samples
-        output_dir: output directory
-        console: rich console
-    """
-    if console is None:
-        console = Console()
-    
-    if not dynamics_metrics:
-        console.print("[yellow]⚠[/yellow] No dynamics sample metrics to save")
-        return
-    
-    os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, "dynamics_result.csv")
-    
-    # Define fieldnames with specific order (t_emerge and t_lockin after Is_Broken)
-    base_fields = ['ID']
-    metric_field_order = [
-        'Is_Main_Trunk_Broken',
-        'Is_Broken',
-        't_emerge',  # After Is_Broken
-        't_lockin',  # After Is_Broken
-        'Mass',
-        'Height',
-        'Log_Size',
-        'Leaf_Size',
-        'Base_Connected_Size',
-        'Base_Connected_Ratio',
-        'Scorer_Category',
-        'Largest_Log_Ratio',
-        'Occupancy_Non_Air',
-        'Occupancy_Log',
-        'Occupancy_Leaf',
-        'Components_Non_Air',
-        'Components_Log',
-        'Components_Leaf',
-    ]
-    
-    # Get all keys from data
-    all_keys = set()
-    for row in dynamics_metrics:
-        all_keys.update(row.keys())
-    
-    # Build fieldnames: base fields + ordered metric fields + any remaining fields
-    fieldnames = base_fields.copy()
-    for field in metric_field_order:
-        if field in all_keys:
-            fieldnames.append(field)
-    
-    # Add any remaining fields that weren't in the ordered list
-    remaining_fields = sorted([k for k in all_keys if k not in fieldnames])
-    fieldnames.extend(remaining_fields)
-    
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(dynamics_metrics)
-    
-    console.print(f"[green]✓[/green] Saved dynamics samples results: {csv_path} ({len(dynamics_metrics)} samples)")
 
 
 def compute_summary_statistics(batch_metrics: List[Dict]) -> Dict:
@@ -1118,7 +1022,7 @@ def compute_summary_statistics(batch_metrics: List[Dict]) -> Dict:
 
 def compute_dynamics_summary_statistics(dynamics_metrics: List[Dict]) -> Dict:
     """
-    計算 dynamics 最終狀態的統計摘要（基於 dynamics_result.csv 同一批資料）。
+    計算 dynamics 最終狀態的統計摘要（與 ``dynamics_label.csv`` 同一批 metrics dict）。
     
     Args:
         dynamics_metrics: List of metrics dicts for final states of dynamics samples
@@ -1148,246 +1052,6 @@ def compute_dynamics_summary_statistics(dynamics_metrics: List[Dict]) -> Dict:
     })
     
     return summary
-
-
-def save_summary(
-    summary: Dict,
-    output_dir: str,
-    console: Optional[Console] = None,
-    exp_name: Optional[str] = None,
-):
-    """
-    保存統計摘要到 CSV 文件。
-    
-    Args:
-        summary: summary statistics dict
-        output_dir: output directory
-        console: rich console
-        exp_name: experiment label shown as the first title row (same as figure ``exp_name``)
-    """
-    if console is None:
-        console = Console()
-    
-    os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, "simple_summary.csv")
-
-    title = (exp_name or "").strip()
-    rows: List[List[str]] = []
-    if title:
-        rows.append([title, ""])
-        rows.append(["", ""])
-    
-    # Prepare CSV rows
-    rows.extend([
-        ["Metric", "Value"],
-        ["Number of Samples", summary['n_samples']],
-        ["", ""],  # Empty row for separation
-        ["Success / Failure Analysis (Largest_Log_Ratio == 1)", ""],
-        ["Success Rate (%)", f"{summary['success_rate']:.2f}"],
-        ["", ""],
-        ["Category sample counts", ""],
-        ["positive (n_samples)", str(summary.get("n_cat_positive", 0))],
-        ["negative floating (n_samples)", str(summary.get("n_cat_neg_float", 0))],
-        ["negative easy (n_samples)", str(summary.get("n_cat_neg_easy", 0))],
-        ["negative hard (n_samples)", str(summary.get("n_cat_neg_hard", 0))],
-        ["", ""],  # Empty row for separation
-        ["Size Statistics", ""],
-        ["Avg Mass (voxels)", f"{summary['avg_mass']:.1f}"],
-        ["Std Mass (voxels)", f"{summary['std_mass']:.1f}"],
-        ["Avg Height", f"{summary['avg_height']:.1f}"],
-        ["Std Height", f"{summary['std_height']:.1f}"],
-        ["Avg Log Size (voxels)", f"{summary['avg_log_size']:.1f}"],
-        ["Std Log Size (voxels)", f"{summary['std_log_size']:.1f}"],
-        ["Avg Leaf Size (voxels)", f"{summary['avg_leaf_size']:.1f}"],
-        ["Std Leaf Size (voxels)", f"{summary['std_leaf_size']:.1f}"],
-        ["Avg Base Connected Size (voxels)", f"{summary['avg_base_connected_size']:.1f}"],
-        ["Std Base Connected Size (voxels)", f"{summary['std_base_connected_size']:.1f}"],
-        ["Avg Base Connected Ratio", f"{summary['avg_base_connected_ratio']:.4f}"],
-        ["Std Base Connected Ratio", f"{summary['std_base_connected_ratio']:.4f}"],
-    ])
-    
-    # Add largest log ratio if available
-    if summary['avg_largest_log_ratio'] >= 0:
-        rows.append(["Avg Largest Log Ratio", f"{summary['avg_largest_log_ratio']:.4f}"])
-    
-    rows.extend([
-        ["", ""],  # Empty row for separation
-        ["Occupancy Rates", ""],
-        ["Non-Air", f"{summary['avg_occupancy_non_air']:.4f}"],
-        ["Log", f"{summary['avg_occupancy_log']:.4f}"],
-        ["Leaf", f"{summary['avg_occupancy_leaf']:.4f}"],
-        ["", ""],  # Empty row for separation
-        ["Component Counts", ""],
-        ["Non-Air", f"{summary['avg_components_non_air']:.2f}"],
-        ["Log", f"{summary['avg_components_log']:.2f}"],
-        ["Leaf", f"{summary['avg_components_leaf']:.2f}"],
-    ])
-    
-    # Write CSV file
-    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerows(rows)
-    
-    console.print(f"[green]✓[/green] Saved summary: {csv_path}")
-
-
-def save_dynamics_summary(
-    summary: Dict,
-    output_dir: str,
-    console: Optional[Console] = None,
-    exp_name: Optional[str] = None,
-):
-    """
-    保存 dynamics 統計摘要到 CSV 文件。
-    
-    Args:
-        summary: dynamics summary statistics dict
-        output_dir: output directory
-        console: rich console
-        exp_name: experiment label shown as the first title row (same as figure ``exp_name``)
-    """
-    if console is None:
-        console = Console()
-    
-    if not summary:
-        console.print("[yellow]⚠[/yellow] No dynamics summary to save")
-        return
-    
-    os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, "dynamics_summary.csv")
-
-    title = (exp_name or "").strip()
-    rows: List[List[str]] = []
-    if title:
-        rows.append([title, ""])
-        rows.append(["", ""])
-    
-    rows.extend([
-        ["Metric", "Value"],
-        ["Number of Samples", summary['n_samples']],
-        ["", ""],
-        ["Success / Failure Analysis (Largest_Log_Ratio == 1)", ""],
-        ["Success Rate (%)", f"{summary['success_rate']:.2f}"],
-        ["", ""],
-        ["Category sample counts", ""],
-        ["positive (n_samples)", str(summary.get("n_cat_positive", 0))],
-        ["negative floating (n_samples)", str(summary.get("n_cat_neg_float", 0))],
-        ["negative easy (n_samples)", str(summary.get("n_cat_neg_easy", 0))],
-        ["negative hard (n_samples)", str(summary.get("n_cat_neg_hard", 0))],
-        ["", ""],
-        ["Size Statistics", ""],
-        ["Avg Mass (voxels)", f"{summary['avg_mass']:.1f}"],
-        ["Std Mass (voxels)", f"{summary['std_mass']:.1f}"],
-        ["Avg Height", f"{summary['avg_height']:.1f}"],
-        ["Std Height", f"{summary['std_height']:.1f}"],
-        ["Avg Log Size (voxels)", f"{summary['avg_log_size']:.1f}"],
-        ["Std Log Size (voxels)", f"{summary['std_log_size']:.1f}"],
-        ["Avg Leaf Size (voxels)", f"{summary['avg_leaf_size']:.1f}"],
-        ["Std Leaf Size (voxels)", f"{summary['std_leaf_size']:.1f}"],
-        ["Avg Base Connected Size (voxels)", f"{summary['avg_base_connected_size']:.1f}"],
-        ["Std Base Connected Size (voxels)", f"{summary['std_base_connected_size']:.1f}"],
-        ["Avg Base Connected Ratio", f"{summary['avg_base_connected_ratio']:.4f}"],
-        ["Std Base Connected Ratio", f"{summary['std_base_connected_ratio']:.4f}"],
-        ["", ""],
-        ["t_emerge/t_lockin Statistics", ""],
-        ["t_emerge Found Samples", summary['n_t_emerge_found']],
-        ["t_emerge Missing Rate", f"{summary['t_emerge_missing_rate']:.4f}"],
-        ["Avg t_emerge", f"{summary['avg_t_emerge']:.2f}" if summary['avg_t_emerge'] >= 0 else "N/A"],
-        ["Std t_emerge", f"{summary['std_t_emerge']:.2f}" if summary['std_t_emerge'] >= 0 else "N/A"],
-        ["t_lockin Found Samples", summary['n_t_lockin_found']],
-        ["t_lockin Missing Rate", f"{summary['t_lockin_missing_rate']:.4f}"],
-        ["Avg t_lockin", f"{summary['avg_t_lockin']:.2f}" if summary['avg_t_lockin'] >= 0 else "N/A"],
-        ["Std t_lockin", f"{summary['std_t_lockin']:.2f}" if summary['std_t_lockin'] >= 0 else "N/A"],
-    ])
-    
-    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerows(rows)
-    
-    console.print(f"[green]✓[/green] Saved dynamics summary: {csv_path}")
-
-
-def save_dynamics_trace(trace_data: List[Dict], output_dir: str, console: Optional[Console] = None):
-    """
-    保存動力學軌跡到 CSV。
-    
-    Args:
-        trace_data: List of dynamics metrics dicts
-        output_dir: output directory
-        console: rich console
-    """
-    if console is None:
-        console = Console()
-    
-    os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, "dynamics_trace.csv")
-    
-    if not trace_data:
-        console.print("[yellow]⚠[/yellow] No trace data to save")
-        return
-    
-    # Sort trace_data: first by sample_idx, then by step_idx
-    sorted_trace_data = sorted(trace_data, key=lambda x: (x.get('sample_idx', 0), x.get('step_idx', 0)))
-    
-    # Convert sample_idx from 0-based to 1-based for CSV output (to match file naming)
-    csv_data = []
-    for row in sorted_trace_data:
-        csv_row = row.copy()
-        # Convert sample_idx from 0-based to 1-based
-        if 'sample_idx' in csv_row:
-            csv_row['sample_idx'] = csv_row['sample_idx'] + 1
-        csv_data.append(csv_row)
-    
-    # Define fieldnames with specific order
-    # Base fields first
-    base_fields = ['sample_idx', 'step_idx', 't']
-    
-    # Define the order of metric fields (Base_Connected_Ratio before Largest_Log_Ratio)
-    metric_field_order = [
-        'Is_Main_Trunk_Broken',
-        'Is_Broken',
-        'Mass',
-        'Height',
-        'Log_Size',
-        'Leaf_Size',
-        'Base_Connected_Size',
-        'Base_Connected_Ratio',  # Before Largest_Log_Ratio
-        'Scorer_Category',
-        'Largest_Log_Ratio',
-        'Occupancy_Non_Air',
-        'Occupancy_Log',
-        'Occupancy_Leaf',
-        'Components_Non_Air',
-        'Components_Log',
-        'Components_Leaf',
-    ]
-    
-    # Remove Total_Log_Size from data before saving
-    for row in csv_data:
-        if 'Total_Log_Size' in row:
-            del row['Total_Log_Size']
-    
-    # Get all keys from data
-    all_keys = set()
-    for row in csv_data:
-        all_keys.update(row.keys())
-    
-    # Build fieldnames: base fields + ordered metric fields + any remaining fields
-    fieldnames = base_fields.copy()
-    for field in metric_field_order:
-        if field in all_keys:
-            fieldnames.append(field)
-    
-    # Add any remaining fields that weren't in the ordered list
-    remaining_fields = sorted([k for k in all_keys if k not in fieldnames])
-    fieldnames.extend(remaining_fields)
-    
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(csv_data)
-    
-    console.print(f"[green]✓[/green] Saved dynamics trace: {csv_path} ({len(trace_data)} tracking points)")
 
 
 def _csv_float_cell(x: object) -> object:
@@ -2405,16 +2069,11 @@ def main():
         "guidance_t_start": str(args.t_start),
         "guidance_t_end": str(args.t_end),
         "guidance_lambda_ratio": f"{guidance_lambda_ratio:.10g}",
-        # New standardized output filenames
-        "simple_eval_csv": os.path.join(exp_output_dir, "simple_result.csv"),
+        # Standardized output filenames
         "simple_label_csv": os.path.join(exp_output_dir, "simple_label.csv"),
         "simple_label_summary_csv": os.path.join(exp_output_dir, "simple_label_summary.csv"),
-        "simple_summary_csv": os.path.join(exp_output_dir, "simple_summary.csv"),
-        "dynamics_result_csv": os.path.join(exp_output_dir, "dynamics_result.csv"),
         "dynamics_label_csv": os.path.join(exp_output_dir, "dynamics_label.csv"),
         "dynamics_label_summary_csv": os.path.join(exp_output_dir, "dynamics_label_summary.csv"),
-        "dynamics_summary_csv": os.path.join(exp_output_dir, "dynamics_summary.csv"),
-        "dynamics_trace_csv": os.path.join(exp_output_dir, "dynamics_trace.csv"),
         "dynamics_label_trace_csv": os.path.join(exp_output_dir, "dynamics_label_trace.csv"),
         "dynamics_divergence_plot_png": os.path.join(exp_output_dir, "dynamics_divergence_plot.png"),
         "plot_data_csv_dir": os.path.join(exp_output_dir, "plot_data_csv"),
@@ -2432,9 +2091,6 @@ def main():
             exp_output_dir, "plot_data_csv", "dynamics_timing_distribution_subplot_02_t_lockin_histogram.csv"
         ),
         "dynamics_xt_dir": os.path.join(exp_output_dir, "dynamics_xt"),
-        # Backward-compat keys pointing to new paths
-        "eval_batch_csv": os.path.join(exp_output_dir, "simple_result.csv"),
-        "eval_summary_csv": os.path.join(exp_output_dir, "simple_summary.csv"),
         "divergence_plot_png": os.path.join(exp_output_dir, "dynamics_divergence_plot.png"),
     }
     
@@ -2473,8 +2129,7 @@ def main():
         console=console,
     )
     
-    # Save batch results (Level A)
-    save_batch_results(batch_metrics, exp_output_dir, console)
+    # Label-format batch outputs (Level A)
     save_simple_label_outputs(
         batch_metrics,
         exp_output_dir,
@@ -2484,9 +2139,8 @@ def main():
         console=console,
     )
 
-    # Compute and save summary (Level B)
+    # Batch summary for console + metadata (Level B)
     summary = compute_summary_statistics(batch_metrics)
-    save_summary(summary, exp_output_dir, console, exp_name=out_dir_leaf)
     
     # Print summary to console
     console.print("\n[bold]Summary Statistics:[/bold]")
@@ -2527,8 +2181,7 @@ def main():
         console=console,
     )
     
-    # Save dynamics samples final results (Level C - final states)
-    save_dynamics_samples(dynamics_final_metrics, exp_output_dir, console)
+    # Dynamics final states as label CSV (Level C)
     save_dynamics_label_outputs(
         dynamics_final_metrics,
         exp_output_dir,
@@ -2538,12 +2191,9 @@ def main():
         console=console,
     )
 
-    # Compute and save dynamics summary (Level C - summary)
+    # Dynamics summary for metadata (Level C)
     dynamics_summary = compute_dynamics_summary_statistics(dynamics_final_metrics)
-    save_dynamics_summary(dynamics_summary, exp_output_dir, console, exp_name=out_dir_leaf)
-    
-    # Save dynamics trace (Level C)
-    save_dynamics_trace(trace_data, exp_output_dir, console)
+
     label_trace_path = os.path.join(exp_output_dir, "dynamics_label_trace.csv")
     write_dynamics_label_trace_csv(
         trace_data,
