@@ -84,7 +84,13 @@ except ImportError as e:
 
 from utils.voxel_label_projections import save_labels_and_projections
 from utils.voxel_npz_io import save_voxel_npz
-from utils.voxel_sample_metrics import compute_sample_metrics
+from utils.voxel_sample_metrics import (
+    CAT_NEG_EASY,
+    CAT_NEG_FLOAT,
+    CAT_NEG_HARD,
+    CAT_POSITIVE,
+    compute_sample_metrics,
+)
 
 
 def compute_dynamics_metrics(labels: np.ndarray, t_int: int) -> Dict:
@@ -926,7 +932,13 @@ def compute_summary_statistics(batch_metrics: List[Dict]) -> Dict:
     """
     n = len(batch_metrics)
     if n == 0:
-        return {}
+        return {
+            "n_samples": 0,
+            "n_cat_positive": 0,
+            "n_cat_neg_float": 0,
+            "n_cat_neg_easy": 0,
+            "n_cat_neg_hard": 0,
+        }
     
     # Success/failure rate by largest_log_ratio==1.
     success_flags = [1.0 if is_success_sample(m) else 0.0 for m in batch_metrics]
@@ -979,6 +991,12 @@ def compute_summary_statistics(batch_metrics: List[Dict]) -> Dict:
     avg_comp_non_air = np.mean([m['Components_Non_Air'] for m in batch_metrics])
     avg_comp_log = np.mean([m['Components_Log'] for m in batch_metrics])
     avg_comp_leaf = np.mean([m['Components_Leaf'] for m in batch_metrics])
+
+    cats = [m.get("Scorer_Category", "") for m in batch_metrics]
+    n_cat_positive = sum(1 for x in cats if x == CAT_POSITIVE)
+    n_cat_neg_float = sum(1 for x in cats if x == CAT_NEG_FLOAT)
+    n_cat_neg_easy = sum(1 for x in cats if x == CAT_NEG_EASY)
+    n_cat_neg_hard = sum(1 for x in cats if x == CAT_NEG_HARD)
     
     return {
         'n_samples': n,
@@ -1006,6 +1024,10 @@ def compute_summary_statistics(batch_metrics: List[Dict]) -> Dict:
         'avg_components_non_air': avg_comp_non_air,
         'avg_components_log': avg_comp_log,
         'avg_components_leaf': avg_comp_leaf,
+        'n_cat_positive': n_cat_positive,
+        'n_cat_neg_float': n_cat_neg_float,
+        'n_cat_neg_easy': n_cat_neg_easy,
+        'n_cat_neg_hard': n_cat_neg_hard,
     }
 
 
@@ -1043,7 +1065,12 @@ def compute_dynamics_summary_statistics(dynamics_metrics: List[Dict]) -> Dict:
     return summary
 
 
-def save_summary(summary: Dict, output_dir: str, console: Optional[Console] = None):
+def save_summary(
+    summary: Dict,
+    output_dir: str,
+    console: Optional[Console] = None,
+    exp_name: Optional[str] = None,
+):
     """
     保存統計摘要到 CSV 文件。
     
@@ -1051,23 +1078,33 @@ def save_summary(summary: Dict, output_dir: str, console: Optional[Console] = No
         summary: summary statistics dict
         output_dir: output directory
         console: rich console
+        exp_name: experiment label shown as the first title row (same as figure ``exp_name``)
     """
     if console is None:
         console = Console()
     
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, "simple_summary.csv")
+
+    title = (exp_name or "").strip()
+    rows: List[List[str]] = []
+    if title:
+        rows.append([title, ""])
+        rows.append(["", ""])
     
     # Prepare CSV rows
-    rows = [
+    rows.extend([
         ["Metric", "Value"],
         ["Number of Samples", summary['n_samples']],
         ["", ""],  # Empty row for separation
         ["Success / Failure Analysis (Largest_Log_Ratio == 1)", ""],
-        ["Failure Rate (%) [Largest_Log_Ratio != 1]", f"{summary['failure_rate']:.2f}"],
         ["Success Rate (%)", f"{summary['success_rate']:.2f}"],
-        ["Any Wood Disconnection Rate (%)", f"{summary['broken_rate']:.2f}"],
-        ["Average Base-Connected Ratio", f"{summary['avg_base_connected_ratio']:.4f}"],
+        ["", ""],
+        ["Category sample counts", ""],
+        ["positive (n_samples)", str(summary.get("n_cat_positive", 0))],
+        ["negative floating (n_samples)", str(summary.get("n_cat_neg_float", 0))],
+        ["negative easy (n_samples)", str(summary.get("n_cat_neg_easy", 0))],
+        ["negative hard (n_samples)", str(summary.get("n_cat_neg_hard", 0))],
         ["", ""],  # Empty row for separation
         ["Size Statistics", ""],
         ["Avg Mass (voxels)", f"{summary['avg_mass']:.1f}"],
@@ -1082,7 +1119,7 @@ def save_summary(summary: Dict, output_dir: str, console: Optional[Console] = No
         ["Std Base Connected Size (voxels)", f"{summary['std_base_connected_size']:.1f}"],
         ["Avg Base Connected Ratio", f"{summary['avg_base_connected_ratio']:.4f}"],
         ["Std Base Connected Ratio", f"{summary['std_base_connected_ratio']:.4f}"],
-    ]
+    ])
     
     # Add largest log ratio if available
     if summary['avg_largest_log_ratio'] >= 0:
@@ -1109,7 +1146,12 @@ def save_summary(summary: Dict, output_dir: str, console: Optional[Console] = No
     console.print(f"[green]✓[/green] Saved summary: {csv_path}")
 
 
-def save_dynamics_summary(summary: Dict, output_dir: str, console: Optional[Console] = None):
+def save_dynamics_summary(
+    summary: Dict,
+    output_dir: str,
+    console: Optional[Console] = None,
+    exp_name: Optional[str] = None,
+):
     """
     保存 dynamics 統計摘要到 CSV 文件。
     
@@ -1117,6 +1159,7 @@ def save_dynamics_summary(summary: Dict, output_dir: str, console: Optional[Cons
         summary: dynamics summary statistics dict
         output_dir: output directory
         console: rich console
+        exp_name: experiment label shown as the first title row (same as figure ``exp_name``)
     """
     if console is None:
         console = Console()
@@ -1127,16 +1170,25 @@ def save_dynamics_summary(summary: Dict, output_dir: str, console: Optional[Cons
     
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, "dynamics_summary.csv")
+
+    title = (exp_name or "").strip()
+    rows: List[List[str]] = []
+    if title:
+        rows.append([title, ""])
+        rows.append(["", ""])
     
-    rows = [
+    rows.extend([
         ["Metric", "Value"],
         ["Number of Samples", summary['n_samples']],
         ["", ""],
         ["Success / Failure Analysis (Largest_Log_Ratio == 1)", ""],
-        ["Failure Rate (%) [Largest_Log_Ratio != 1]", f"{summary['failure_rate']:.2f}"],
         ["Success Rate (%)", f"{summary['success_rate']:.2f}"],
-        ["Any Wood Disconnection Rate (%)", f"{summary['broken_rate']:.2f}"],
-        ["Average Base-Connected Ratio", f"{summary['avg_base_connected_ratio']:.4f}"],
+        ["", ""],
+        ["Category sample counts", ""],
+        ["positive (n_samples)", str(summary.get("n_cat_positive", 0))],
+        ["negative floating (n_samples)", str(summary.get("n_cat_neg_float", 0))],
+        ["negative easy (n_samples)", str(summary.get("n_cat_neg_easy", 0))],
+        ["negative hard (n_samples)", str(summary.get("n_cat_neg_hard", 0))],
         ["", ""],
         ["Size Statistics", ""],
         ["Avg Mass (voxels)", f"{summary['avg_mass']:.1f}"],
@@ -1161,7 +1213,7 @@ def save_dynamics_summary(summary: Dict, output_dir: str, console: Optional[Cons
         ["t_lockin Missing Rate", f"{summary['t_lockin_missing_rate']:.4f}"],
         ["Avg t_lockin", f"{summary['avg_t_lockin']:.2f}" if summary['avg_t_lockin'] >= 0 else "N/A"],
         ["Std t_lockin", f"{summary['std_t_lockin']:.2f}" if summary['std_t_lockin'] >= 0 else "N/A"],
-    ]
+    ])
     
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -2336,7 +2388,7 @@ def main():
     
     # Compute and save summary (Level B)
     summary = compute_summary_statistics(batch_metrics)
-    save_summary(summary, exp_output_dir, console)
+    save_summary(summary, exp_output_dir, console, exp_name=out_dir_leaf)
     
     # Print summary to console
     console.print("\n[bold]Summary Statistics:[/bold]")
@@ -2382,7 +2434,7 @@ def main():
     
     # Compute and save dynamics summary (Level C - summary)
     dynamics_summary = compute_dynamics_summary_statistics(dynamics_final_metrics)
-    save_dynamics_summary(dynamics_summary, exp_output_dir, console)
+    save_dynamics_summary(dynamics_summary, exp_output_dir, console, exp_name=out_dir_leaf)
     
     # Save dynamics trace (Level C)
     save_dynamics_trace(trace_data, exp_output_dir, console)
