@@ -9,10 +9,16 @@
 
 輸出文件：
 - simple_result.csv: 每個樣本的指標（層次 A）
+- simple_label.csv / simple_label_summary.csv: 與 generate 腳本 ``sample_labels*.csv`` 相同欄位與格式
+  （由 ``utils.export_csv`` 寫入；``source_name`` 相對於 ``--out_dir``，對應 ``simple_npz/`` 或 ``simple_projections/``）
 - simple_summary.csv: 統計摘要（層次 B）
 - dynamics_result.csv: 前幾個樣本的最終結果（層次 C）
+- dynamics_label.csv / dynamics_label_summary.csv: 與 ``simple_label*.csv`` 相同欄位與格式（層次 C 最終態）；
+  ``source_name`` 相對於 ``--out_dir``，對應 ``dynamics_npz/`` 或 ``dynamics_projections/``
 - dynamics_summary.csv: 前幾個樣本的統計摘要（層次 C）
 - dynamics_trace.csv: 前幾個樣本的完整軌跡（層次 C）
+- dynamics_label_trace.csv: 同上軌跡每點一列，欄位為 label 格式（前綴 ``sample_idx, step_idx, t``，
+  其餘與 ``sample_labels.csv`` 一致；``source_name`` 對應 ``dynamics_track_npz/`` 或 ``dynamics_track_projections/``）
 - dynamics_divergence_plot.png: 可視化圖表
 - plot_data_csv/: 與 dynamics_divergence_plot 四個子圖對應之原始數據 CSV（各一檔）
   - dynamics_divergence_subplot_01_mass.csv
@@ -82,6 +88,12 @@ except ImportError as e:
     print("Make sure unet_diffusion_16_voxel.py is in the same directory.")
     sys.exit(1)
 
+from utils.export_csv import (
+    sample_label_row_from_metrics,
+    write_dynamics_label_trace_csv,
+    write_sample_labels_csv,
+    write_sample_labels_summary_csv,
+)
 from utils.voxel_label_projections import save_labels_and_projections
 from utils.voxel_npz_io import save_voxel_npz
 from utils.voxel_sample_metrics import (
@@ -853,6 +865,79 @@ def save_batch_results(batch_metrics: List[Dict], output_dir: str, console: Opti
         writer.writerows(batch_metrics)
     
     console.print(f"[green]✓[/green] Saved batch results: {csv_path} ({len(batch_metrics)} samples)")
+
+
+def save_simple_label_outputs(
+    batch_metrics: List[Dict],
+    output_dir: str,
+    *,
+    save_npz: bool,
+    save_projections: bool,
+    run_seed: Optional[int],
+    console: Optional[Console] = None,
+) -> None:
+    """
+    寫入 simple_label.csv / simple_label_summary.csv（欄位與 generate 的 sample_labels 一致）。
+    """
+    if console is None:
+        console = Console()
+
+    rows: List[Dict] = []
+    for i, m in enumerate(batch_metrics):
+        row = sample_label_row_from_metrics(m, sample_id=i + 1, run_seed=run_seed)
+        if save_npz:
+            row["source_name"] = f"simple_npz/simple_sample_{i + 1:03d}.npz"
+        elif save_projections:
+            row["source_name"] = f"simple_projections/simple_sample_{i + 1:03d}.png"
+        else:
+            row["source_name"] = ""
+        rows.append(row)
+
+    labels_path = os.path.join(output_dir, "simple_label.csv")
+    summary_path = os.path.join(output_dir, "simple_label_summary.csv")
+    write_sample_labels_csv(rows, labels_path)
+    write_sample_labels_summary_csv(rows, summary_path)
+    console.print(f"[green]✓[/green] Saved simple labels: {labels_path} ({len(rows)} samples)")
+    console.print(f"[green]✓[/green] Saved simple label summary: {summary_path}")
+
+
+def save_dynamics_label_outputs(
+    dynamics_metrics: List[Dict],
+    output_dir: str,
+    *,
+    save_npz: bool,
+    save_projections: bool,
+    run_seed: Optional[int],
+    console: Optional[Console] = None,
+) -> None:
+    """
+    寫入 dynamics_label.csv / dynamics_label_summary.csv（欄位與 simple_label / generate sample_labels 一致）。
+    ``dynamics_result.csv`` 每列的 ``ID``（例如 ``001``）用於對齊檔名 ``dynamics_sample_001.*``。
+    """
+    if console is None:
+        console = Console()
+
+    rows: List[Dict] = []
+    for m in dynamics_metrics:
+        try:
+            sid = int(str(m.get("ID", "0")).strip())
+        except ValueError:
+            sid = len(rows) + 1
+        row = sample_label_row_from_metrics(m, sample_id=sid, run_seed=run_seed)
+        if save_npz:
+            row["source_name"] = f"dynamics_npz/dynamics_sample_{sid:03d}.npz"
+        elif save_projections:
+            row["source_name"] = f"dynamics_projections/dynamics_sample_{sid:03d}.png"
+        else:
+            row["source_name"] = ""
+        rows.append(row)
+
+    labels_path = os.path.join(output_dir, "dynamics_label.csv")
+    summary_path = os.path.join(output_dir, "dynamics_label_summary.csv")
+    write_sample_labels_csv(rows, labels_path)
+    write_sample_labels_summary_csv(rows, summary_path)
+    console.print(f"[green]✓[/green] Saved dynamics labels: {labels_path} ({len(rows)} samples)")
+    console.print(f"[green]✓[/green] Saved dynamics label summary: {summary_path}")
 
 
 def save_dynamics_samples(dynamics_metrics: List[Dict], output_dir: str, console: Optional[Console] = None):
@@ -2322,10 +2407,15 @@ def main():
         "guidance_lambda_ratio": f"{guidance_lambda_ratio:.10g}",
         # New standardized output filenames
         "simple_eval_csv": os.path.join(exp_output_dir, "simple_result.csv"),
+        "simple_label_csv": os.path.join(exp_output_dir, "simple_label.csv"),
+        "simple_label_summary_csv": os.path.join(exp_output_dir, "simple_label_summary.csv"),
         "simple_summary_csv": os.path.join(exp_output_dir, "simple_summary.csv"),
         "dynamics_result_csv": os.path.join(exp_output_dir, "dynamics_result.csv"),
+        "dynamics_label_csv": os.path.join(exp_output_dir, "dynamics_label.csv"),
+        "dynamics_label_summary_csv": os.path.join(exp_output_dir, "dynamics_label_summary.csv"),
         "dynamics_summary_csv": os.path.join(exp_output_dir, "dynamics_summary.csv"),
         "dynamics_trace_csv": os.path.join(exp_output_dir, "dynamics_trace.csv"),
+        "dynamics_label_trace_csv": os.path.join(exp_output_dir, "dynamics_label_trace.csv"),
         "dynamics_divergence_plot_png": os.path.join(exp_output_dir, "dynamics_divergence_plot.png"),
         "plot_data_csv_dir": os.path.join(exp_output_dir, "plot_data_csv"),
         "dynamics_timing_distribution_plot_png": os.path.join(exp_output_dir, "dynamics_timing_distribution_plot.png"),
@@ -2385,7 +2475,15 @@ def main():
     
     # Save batch results (Level A)
     save_batch_results(batch_metrics, exp_output_dir, console)
-    
+    save_simple_label_outputs(
+        batch_metrics,
+        exp_output_dir,
+        save_npz=args.save_npz,
+        save_projections=not args.no_projections,
+        run_seed=args.seed,
+        console=console,
+    )
+
     # Compute and save summary (Level B)
     summary = compute_summary_statistics(batch_metrics)
     save_summary(summary, exp_output_dir, console, exp_name=out_dir_leaf)
@@ -2431,14 +2529,31 @@ def main():
     
     # Save dynamics samples final results (Level C - final states)
     save_dynamics_samples(dynamics_final_metrics, exp_output_dir, console)
-    
+    save_dynamics_label_outputs(
+        dynamics_final_metrics,
+        exp_output_dir,
+        save_npz=args.save_npz,
+        save_projections=not args.no_projections,
+        run_seed=args.seed,
+        console=console,
+    )
+
     # Compute and save dynamics summary (Level C - summary)
     dynamics_summary = compute_dynamics_summary_statistics(dynamics_final_metrics)
     save_dynamics_summary(dynamics_summary, exp_output_dir, console, exp_name=out_dir_leaf)
     
     # Save dynamics trace (Level C)
     save_dynamics_trace(trace_data, exp_output_dir, console)
-    
+    label_trace_path = os.path.join(exp_output_dir, "dynamics_label_trace.csv")
+    write_dynamics_label_trace_csv(
+        trace_data,
+        label_trace_path,
+        run_seed=args.seed,
+        save_npz=args.save_npz,
+        save_track_projections=args.save_track_projections,
+    )
+    console.print(f"[green]✓[/green] Saved dynamics label trace: {label_trace_path}")
+
     # Plot divergence
     plot_divergence(trace_data, exp_output_dir, args.n_dynamics_samples, console)
     
