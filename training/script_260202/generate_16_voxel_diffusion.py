@@ -16,16 +16,6 @@
 - metadata.csv / metadata_flat.csv：重現用參數
 - generate_16_voxel_diffusion_snapshot_YYYYMMDD_HHMMSS.py：執行當下本腳本完整備份
 
-sample_labels.csv 欄位（順序如下）：
-- id, seed, category（positive | neg_float | neg_easy | neg_hard）
-- is_main_trunk_broken(0/1), is_broken(0/1), largest_log_ratio（無效時 -1）
-- mass, height
-- base_connected_ratio, base_connected_size, log_size, leaf_size
-- occupancy_non_air, occupancy_log, occupancy_leaf
-- components_non_air, components_log, components_leaf
-- source_name：相對於 ``--out_dir`` 的 POSIX 路徑，優先對應寫出的 ``npz/<category>/<stem>.npz``；若 ``--no_npz`` 則為 ``projections/<category>/<stem>.png``；兩者皆關則為空字串
-（以上對應 utils.voxel_sample_metrics.compute_sample_metrics 回傳之指標，外加 artifact 路徑）
-
 專案目錄即 --out_dir：所有輸出寫入該路徑（會自動建立）。
 實驗名稱與輸出檔名前綴（PNG/NPZ 的 ``<prefix>_<id>``）一律為 ``out_dir`` 路徑的最後一層目錄名稱（例如 ``--out_dir ./runs/exp_001`` → ``exp_001``）。
 
