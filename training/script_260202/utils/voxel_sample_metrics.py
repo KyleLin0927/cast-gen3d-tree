@@ -81,6 +81,8 @@ def compute_sample_metrics(
             - Mass, Height, Log_Size, Leaf_Size
             - Base_Connected_Size, Total_Log_Size, Base_Connected_Ratio
             - Largest_Log_Ratio
+            - Log_AABB_Span_X, Log_AABB_Span_Y, Log_AABB_Span_Z
+            - Log_AABB_Volume, Log_BBO (= Log_Size / Log_AABB_Volume)
             - Scorer_Category: positive | neg_float | neg_easy | neg_hard
             - Occupancy_Non_Air, Occupancy_Log, Occupancy_Leaf
             - Components_Non_Air, Components_Log, Components_Leaf
@@ -114,6 +116,23 @@ def compute_sample_metrics(
     log_size = int((labels == 1).sum())
     leaf_size = int((labels == 2).sum())
 
+    log_coords = np.argwhere(labels == 1)
+    if len(log_coords) > 0:
+        min_coords = log_coords.min(axis=0)
+        max_coords = log_coords.max(axis=0)
+        log_aabb_dims = max_coords - min_coords + 1
+        log_aabb_span_x = int(log_aabb_dims[0])
+        log_aabb_span_y = int(log_aabb_dims[1])
+        log_aabb_span_z = int(log_aabb_dims[2])
+        log_aabb_volume = int(np.prod(log_aabb_dims))
+        log_bbo = (float(log_size) / float(log_aabb_volume)) if log_aabb_volume > 0 else 0.0
+    else:
+        log_aabb_span_x = 0
+        log_aabb_span_y = 0
+        log_aabb_span_z = 0
+        log_aabb_volume = 0
+        log_bbo = 0.0
+
     return {
         "Is_Main_Trunk_Broken": trunk_info["is_main_trunk_broken"],
         "Is_Broken": trunk_info["is_broken"],
@@ -125,6 +144,11 @@ def compute_sample_metrics(
         "Total_Log_Size": total_log,
         "Base_Connected_Ratio": base_connected_ratio,
         "Largest_Log_Ratio": largest_log_ratio if largest_log_ratio >= 0 else -1.0,
+        "Log_AABB_Span_X": log_aabb_span_x,
+        "Log_AABB_Span_Y": log_aabb_span_y,
+        "Log_AABB_Span_Z": log_aabb_span_z,
+        "Log_AABB_Volume": log_aabb_volume,
+        "Log_BBO": log_bbo,
         "Scorer_Category": scorer_category,
         "Occupancy_Non_Air": occ_rates["non_air"],
         "Occupancy_Log": occ_rates["log"],

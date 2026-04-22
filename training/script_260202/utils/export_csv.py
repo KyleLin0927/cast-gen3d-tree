@@ -44,6 +44,11 @@ SAMPLE_LABELS_CSV_FIELDNAMES: Tuple[str, ...] = (
     "components_non_air",
     "components_log",
     "components_leaf",
+    "log_aabb_span_x",
+    "log_aabb_span_y",
+    "log_aabb_span_z",
+    "log_aabb_volume",
+    "log_bbo",
     "source_name",
 )
 
@@ -81,6 +86,11 @@ def sample_label_row_from_metrics(
         "base_connected_size": int(m["Base_Connected_Size"]),
         "log_size": int(m["Log_Size"]),
         "leaf_size": int(m["Leaf_Size"]),
+        "log_aabb_span_x": int(m["Log_AABB_Span_X"]),
+        "log_aabb_span_y": int(m["Log_AABB_Span_Y"]),
+        "log_aabb_span_z": int(m["Log_AABB_Span_Z"]),
+        "log_aabb_volume": int(m["Log_AABB_Volume"]),
+        "log_bbo": round(float(m["Log_BBO"]), 6),
         "occupancy_non_air": round(float(m["Occupancy_Non_Air"]), 6),
         "occupancy_log": round(float(m["Occupancy_Log"]), 6),
         "occupancy_leaf": round(float(m["Occupancy_Leaf"]), 6),
@@ -330,6 +340,41 @@ def write_sample_labels_summary_csv(
     lines.append(["std", f"{float(comp_lf.std()):.4f}"])
     lines.append(["min", str(int(comp_lf.min()))])
     lines.append(["max", str(int(comp_lf.max()))])
+
+    log_aabb_span_x = np.array([float(r["log_aabb_span_x"]) for r in rows])
+    add_section("log_aabb_span_x")
+    lines.append(["mean", f"{float(log_aabb_span_x.mean()):.4f}"])
+    lines.append(["std", f"{float(log_aabb_span_x.std()):.4f}"])
+    lines.append(["min", str(int(log_aabb_span_x.min()))])
+    lines.append(["max", str(int(log_aabb_span_x.max()))])
+
+    log_aabb_span_y = np.array([float(r["log_aabb_span_y"]) for r in rows])
+    add_section("log_aabb_span_y")
+    lines.append(["mean", f"{float(log_aabb_span_y.mean()):.4f}"])
+    lines.append(["std", f"{float(log_aabb_span_y.std()):.4f}"])
+    lines.append(["min", str(int(log_aabb_span_y.min()))])
+    lines.append(["max", str(int(log_aabb_span_y.max()))])
+
+    log_aabb_span_z = np.array([float(r["log_aabb_span_z"]) for r in rows])
+    add_section("log_aabb_span_z")
+    lines.append(["mean", f"{float(log_aabb_span_z.mean()):.4f}"])
+    lines.append(["std", f"{float(log_aabb_span_z.std()):.4f}"])
+    lines.append(["min", str(int(log_aabb_span_z.min()))])
+    lines.append(["max", str(int(log_aabb_span_z.max()))])
+
+    log_aabb_volume = np.array([float(r["log_aabb_volume"]) for r in rows])
+    add_section("log_aabb_volume")
+    lines.append(["mean", f"{float(log_aabb_volume.mean()):.4f}"])
+    lines.append(["std", f"{float(log_aabb_volume.std()):.4f}"])
+    lines.append(["min", str(int(log_aabb_volume.min()))])
+    lines.append(["max", str(int(log_aabb_volume.max()))])
+
+    log_bbo = np.array([float(r["log_bbo"]) for r in rows])
+    add_section("log_bbo")
+    lines.append(["mean", f"{float(log_bbo.mean()):.6f}"])
+    lines.append(["std", f"{float(log_bbo.std()):.6f}"])
+    lines.append(["min", f"{float(log_bbo.min()):.6f}"])
+    lines.append(["max", f"{float(log_bbo.max()):.6f}"])
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
