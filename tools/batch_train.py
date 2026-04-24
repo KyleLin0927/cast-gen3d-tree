@@ -126,24 +126,26 @@ def merge_configs(base_config, exp_params):
     merged.update(exp_params)
     return merged
 
-def build_command(train_script, params, exp_name):
+def build_command(train_script, params):
     """根據參數構建命令"""
     params = params.copy()
-    params['exp_name'] = exp_name
-    
     cmd = ['python', train_script]
-    
+
     for key, value in params.items():
-        if isinstance(value, bool) and value:
-            cmd.append(f'--{key}')
-        elif not isinstance(value, bool):
+        # 允許 YAML 裡出現 null，避免產生 `--key None` 這種參數
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            if value:
+                cmd.append(f'--{key}')
+        else:
             cmd.extend([f'--{key}', str(value)])
-    
+
     return cmd
 
 def run_experiment(exp_config, base_config, exp_idx, total_exps):
     """執行單個實驗"""
-    exp_name = exp_config['name']
+    exp_label = exp_config['name']
     
     # 合併配置
     params = merge_configs(base_config, exp_config.get('params', {}))
@@ -156,15 +158,15 @@ def run_experiment(exp_config, base_config, exp_idx, total_exps):
         ))
         sys.exit(1)
     
+    exp_name_param = params.get('exp_name')
+
     console.print(Panel.fit(
         f"[bold cyan]實驗 {exp_idx}/{total_exps}[/bold cyan]\n"
-        f"名稱: [magenta]{exp_name}[/magenta]\n"
-        f"說明: {exp_config.get('description', 'N/A')}\n"
-        f"完整名稱: [yellow]{exp_name}[/yellow]",
+        f"名稱: [magenta]{exp_label}[/magenta]",
         border_style="cyan"
     ))
     
-    cmd = build_command(train_script, params, exp_name)
+    cmd = build_command(train_script, params)
     console.print(f"[dim]指令: {' '.join(cmd)}[/dim]\n")
     
     start_time = time.time()
@@ -174,20 +176,20 @@ def run_experiment(exp_config, base_config, exp_idx, total_exps):
     try:
         result = subprocess.run(cmd, check=True, capture_output=False, text=True)
         success = True
-        console.print(f"\n[bold green]✓ 實驗 {exp_name} 完成！[/bold green]\n")
+        console.print(f"\n[bold green]✓ 實驗 {exp_label} 完成！[/bold green]\n")
     except subprocess.CalledProcessError as e:
         error_msg = f"Exit code: {e.returncode}"
-        console.print(f"\n[bold red]✗ 實驗 {exp_name} 失敗: {error_msg}[/bold red]\n")
+        console.print(f"\n[bold red]✗ 實驗 {exp_label} 失敗: {error_msg}[/bold red]\n")
     except Exception as e:
         error_msg = str(e)
-        console.print(f"\n[bold red]✗ 實驗 {exp_name} 錯誤: {error_msg}[/bold red]\n")
+        console.print(f"\n[bold red]✗ 實驗 {exp_label} 錯誤: {error_msg}[/bold red]\n")
     
     elapsed_time = time.time() - start_time
     
     return {
-        'exp_name': exp_name,
-        'exp_name_full': exp_name,
-        'description': exp_config.get('description', ''),
+        # `name` 用來做 batch 顯示與索引；`exp_name` 參數是否存在取決於 params（由 user 控制）
+        'name': exp_label,
+        'exp_name_param': exp_name_param,
         'success': success,
         'error_msg': error_msg,
         'duration_secs': elapsed_time,
@@ -233,13 +235,11 @@ def main():
     table = Table(title="\n實驗清單", box=box.ROUNDED)
     table.add_column("#", style="cyan", justify="right")
     table.add_column("名稱", style="magenta")
-    table.add_column("說明", style="white")
     
     for idx, exp in enumerate(experiments, 1):
         table.add_row(
             str(idx), 
-            exp['name'], 
-            exp.get('description', 'N/A')
+            exp['name']
         )
     
     console.print("\n", table, "\n")
@@ -283,7 +283,6 @@ def main():
     summary_table.add_column("實驗名稱", style="magenta")
     summary_table.add_column("狀態", justify="center")
     summary_table.add_column("耗時", style="cyan", justify="right")
-    summary_table.add_column("說明", style="white")
     
     success_count = 0
     for result in results:
@@ -294,10 +293,9 @@ def main():
             status = "[red]✗ 失敗[/red]"
         
         summary_table.add_row(
-            result['exp_name'],
+            result['name'],
             status,
-            format_duration(result['duration_secs']),
-            result['description']
+            format_duration(result['duration_secs'])
         )
     
     console.print(summary_table)
@@ -307,7 +305,7 @@ def main():
     csv_path = f'batch_training_summary_{timestamp}.csv'
     
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        fieldnames = ['exp_name', 'exp_name_full', 'description', 'success', 'error_msg', 
+        fieldnames = ['name', 'exp_name_param', 'success', 'error_msg',
                      'duration_secs', 'duration_formatted', 'start_time']
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
