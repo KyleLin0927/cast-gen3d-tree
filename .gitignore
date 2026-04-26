@@ -208,3 +208,6 @@ __marimo__/
 
 # os
 .DS_Store
+
+# batch train settings
+batch_train_settings/
