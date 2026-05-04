@@ -2,6 +2,8 @@
 
 CAST 是一個以深度學習生成 Minecraft 樹木 Voxel 結構的研究型專案。嘗試以 VAE／VQ-VAE、Transformer Prior、Diffusion 為不同實驗階段重心，支援從資料前處理、模型訓練，到取樣生成與結果聚合分析的完整流程。目前主力是 diffusion 加上 Guidance 量化對於連通性之影響。
 
+<img width="1708" height="960" alt="minecraft-like-tree" src="https://github.com/user-attachments/assets/8cc758ed-622c-48e1-a922-5e39a583155d" />
+
 ## 環境需求
 
 - Python `3.11.8`
