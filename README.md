@@ -4,6 +4,8 @@ CAST 是一個以深度學習生成 Minecraft 樹木 Voxel 結構的研究型專
 
 <img width="1708" height="960" alt="minecraft-like-tree" src="https://github.com/user-attachments/assets/8cc758ed-622c-48e1-a922-5e39a583155d" />
 
+<img width="900" height="370" alt="cast_comparison_11" src="https://github.com/user-attachments/assets/48f813df-9b32-42e5-9e2b-1beb6dfe93fe" />
+
 ## 環境需求
 
 - Python `3.11.8`
