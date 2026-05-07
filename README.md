@@ -71,6 +71,8 @@ Common flags (all have defaults):
 - `--batch_size` — batch size (default `8`)
 - `--guidance_t_start`, `--guidance_t_end` — intervention window (defaults reflect best operating point)
 
+You can find the checkpint in Hugging Face page.
+
 ### Output structure
 
 In `--out_dir`:
@@ -83,7 +85,7 @@ In `--out_dir`:
 
 ## Project History
 
-CAST went through several abandoned directions before settling on diffusion + sampling-time guidance: an early VAE / VQ-VAE attempt that lost spatial fidelity at 16³ resolution, and a Transformer prior over discrete codes that struggled with the long-range dependencies needed for connected trunk structure. The current diffusion-based approach was selected after these dead-ends; the repo retains traces of earlier attempts in `legacy/`.
+CAST went through several abandoned directions before settling on diffusion + sampling-time guidance: an early VAE / VQ-VAE attempt that lost spatial fidelity at 16³ resolution, and a Transformer prior over discrete codes that struggled with the long-range dependencies needed for connected trunk structure. The current diffusion-based approach was selected after these dead-ends.
 
 ---
 
