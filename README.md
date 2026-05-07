@@ -1,36 +1,98 @@
 # 🌳 CAST: Connectivity-Aware Sampling for Topology in 3D Voxel Diffusion
 
-CAST 是一個以深度學習生成 Minecraft 樹木 Voxel 結構的研究型專案。嘗試以 VAE／VQ-VAE、Transformer Prior、Diffusion 為不同實驗階段重心，支援從資料前處理、模型訓練，到取樣生成與結果聚合分析的完整流程。目前主力是 diffusion 加上 Guidance 量化對於連通性之影響。
+> Sampling-time guidance for topology preservation in 3D voxel diffusion.
+> Improves connectivity success rate from **6.5% → 46%** on Minecraft tree volumes — without retraining the base denoiser.
 
-<img width="1708" height="960" alt="minecraft-like-tree" src="https://github.com/user-attachments/assets/8cc758ed-622c-48e1-a922-5e39a583155d" />
+<img width="900" alt="cast_comparison_11" src="https://github.com/user-attachments/assets/48f813df-9b32-42e5-9e2b-1beb6dfe93fe" />
 
-<img width="900" height="370" alt="cast_comparison_11" src="https://github.com/user-attachments/assets/48f813df-9b32-42e5-9e2b-1beb6dfe93fe" />
+*Left: baseline DDPM samples (broken trunks, floating leaves). Right: same model with connectivity-aware sampling-time guidance.*
 
-## 環境需求
+---
 
-- Python `3.11.8`
-- macOS／Linux。
-- 建議具備 NVIDIA GPU。
+## Key Results
 
-## 安裝與環境設定
+Evaluated on 1,000 generated samples (16³ voxel grid):
 
-### 1）建立虛擬環境
+| Method | Connectivity Success ↑ | Floating-Tree Failures ↓ |
+|---|---|---|
+| Baseline DDPM | 6.5% | 20.0% |
+| **CAST (ours)** | **46.0%** | **0.3%** |
+
+Operating point selected via 5-metric sanity check (log_size, AABB spans, BBO) keeping all metrics within ±1σ of the ground-truth distribution.
+
+📄 [**Full PoC report**](https://www.notion.so/Connectivity-Aware-Sampling-for-Topology-CAST-PoC-32aaa15702ab8010b4ded7ec8110a79d) · 🤗 [**Pretrained checkpoints**](https://huggingface.co/jenkai-lin/cast-tree-voxel-diffusion)
+
+---
+
+## Method (TL;DR)
+
+1. **Base model**: 3D voxel DDPM (16³, T=1000, cosine schedule) trained from scratch on 1,500 Minecraft-style tree volumes
+2. **Connectivity scorer**: a separate 3D CNN trained with hard-negative mining on auto-labeled positive / floating / disconnected / fragmented structures
+3. **Sampling-time guidance**: at each denoising step, add `∇ C(x_t)` to the standard DDPM update — no retraining or architectural change to the base denoiser
+
+The key empirical finding: **connectivity failures form mid-sampling (t ≈ 800–600) and rarely self-recover**. Guidance applied only within an intermediate window (t = 700–200) outperforms either always-on or late-stage-only intervention.
+
+<img width="1708" alt="minecraft-like-tree" src="https://github.com/user-attachments/assets/8cc758ed-622c-48e1-a922-5e39a583155d" />
+
+---
+
+## Quick Start
+
+### Setup
 
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
-```
-
-### 2）安裝依賴
-
-```bash
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 3）驗證安裝
+Tested on Python 3.11.8, macOS / Linux, NVIDIA GPU recommended.
+
+### Generate samples (baseline, no guidance)
 
 ```bash
-python --version
-python -c "import torch; print('torch:', torch.__version__)"
+python sample.py --checkpoint /path/to/diffusion_best.pt
 ```
+
+### Generate with CAST guidance
+
+```bash
+python sample.py \
+  --checkpoint /path/to/diffusion_best.pt \
+  --scorer_checkpoint /path/to/scorer_best.pt \
+  --guidance_scale 2.0
+```
+
+Common flags (all have defaults):
+- `--n_samples` — number of samples to generate (default `32`)
+- `--out_dir` — output directory (default `./inference_outputs/run_001`)
+- `--n_steps` — sampling steps (default `1000`)
+- `--batch_size` — batch size (default `8`)
+- `--guidance_t_start`, `--guidance_t_end` — intervention window (defaults reflect best operating point)
+
+### Output structure
+
+In `--out_dir`:
+- `sample_labels.csv` — per-sample metrics
+- `sample_labels_summary.csv`, `sample_summary.csv` — aggregated statistics
+- `npz/{positive, neg_float, neg_easy, neg_hard}/` — raw voxel arrays per failure category
+- `projections/{positive, neg_float, neg_easy, neg_hard}/` — three-view PNGs per sample
+
+---
+
+## Project History
+
+CAST went through several abandoned directions before settling on diffusion + sampling-time guidance: an early VAE / VQ-VAE attempt that lost spatial fidelity at 16³ resolution, and a Transformer prior over discrete codes that struggled with the long-range dependencies needed for connected trunk structure. The current diffusion-based approach was selected after these dead-ends; the repo retains traces of earlier attempts in `legacy/`.
+
+---
+
+## Contact
+
+Kyle Lin (林仁凱) — KyleLin0927@gmail.com · [GitHub](https://github.com/KyleLin0927)
+
+---
+
+## Citation
+
+If you find this work useful for your research, please feel free to reach out for discussion.
