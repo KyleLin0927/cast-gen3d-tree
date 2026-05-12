@@ -20,6 +20,9 @@ Evaluated on 1,000 generated samples (16³ voxel grid):
 
 Operating point selected via 5-metric sanity check (log_size, AABB spans, BBO) keeping all metrics within ±1σ of the ground-truth distribution.
 
+- **Failures emerge in the middle of sampling time.** Successful and failed samples begin to diverge around `t≈800-600`; once trunk connectivity breaks during this middle phase, baseline denoising almost never repairs it in later steps.
+- **The guidance schedule window effects quality.** Extending guidance too early compresses trunk structure and reduces leaf blocks, leading to oversimplified samples. However, too late increases abnormal one and sampling instability, making the intermediate window the most stable operating point.
+
 📄 [**Full PoC report**](https://www.notion.so/Connectivity-Aware-Sampling-for-Topology-CAST-PoC-32aaa15702ab8010b4ded7ec8110a79d) · 🤗 [**Pretrained checkpoints**](https://huggingface.co/jenkai-lin/cast-tree-voxel-diffusion)
 
 ---
