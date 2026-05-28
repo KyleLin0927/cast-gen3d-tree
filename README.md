@@ -21,7 +21,7 @@ Evaluated on 1,000 generated samples (16³ voxel grid):
 
 Operating point selected via a 5-metric sanity check (log_size, AABB spans, BBO) keeping all metrics within ±1σ of the ground-truth distribution — to filter out shortcut solutions where a single thick pillar trivially satisfies connectivity but no longer looks like a tree.
 
-📄 [**Full PoC report**](https://www.notion.so/Connectivity-Aware-Sampling-for-Topology-CAST-PoC-32aaa15702ab8010b4ded7ec8110a79d) · 🤗 [**Pretrained checkpoints**](https://huggingface.co/jenkai-lin/cast-tree-voxel-diffusion)
+📄 [**Full PoC report**](https://drinkai.notion.site/Connectivity-Aware-Sampling-for-Topology-CAST-report-v2-36daa15702ab801f8291d71c2bc043c5) · 🤗 [**Pretrained checkpoints**](https://huggingface.co/jenkai-lin/cast-tree-voxel-diffusion)
 
 ---
 
