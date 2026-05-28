@@ -1,9 +1,10 @@
 # 🌳 CAST: Connectivity-Aware Sampling for Topology in 3D Voxel Diffusion
 
-> Sampling-time guidance for topology preservation in 3D voxel diffusion.
-> Improves connectivity success rate from **6.5% → 46%** on Minecraft tree volumes — without retraining the base denoiser.
+> Training-free sampling-time guidance for topology preservation in 3D voxel diffusion.
+> Improves connectivity success rate from **6.5% → 30%** on Minecraft tree volumes — no retraining of the base denoiser, no architectural change.
 
-<img width="900" alt="cast_comparison_11" src="https://github.com/user-attachments/assets/48f813df-9b32-42e5-9e2b-1beb6dfe93fe" />
+<img width="900" height="419" alt="baseline_vs_specific_window" src="https://github.com/user-attachments/assets/08e3cf4f-21d6-4f83-9a20-8afbcba1a18a" />
+
 
 *Left: baseline DDPM samples (broken trunks, floating leaves). Right: same model with connectivity-aware sampling-time guidance.*
 
@@ -13,29 +14,34 @@
 
 Evaluated on 1,000 generated samples (16³ voxel grid):
 
-| Method | Connectivity Success ↑ | Floating-Tree Failures ↓ |
-|---|---|---|
-| Baseline DDPM | 6.5% | 20.0% |
-| **CAST (ours)** | **46.0%** | **0.3%** |
+| Method | Connectivity Success ↑ |
+|---|---|
+| Baseline DDPM | 6.5% |
+| **CAST (ours)** | **30.0%** (≈5× baseline) |
 
-Operating point selected via 5-metric sanity check (log_size, AABB spans, BBO) keeping all metrics within ±1σ of the ground-truth distribution.
-
-- **Failures emerge in the middle of sampling time.** Successful and failed samples begin to diverge around `t≈800-600`; once trunk connectivity breaks during this middle phase, baseline denoising almost never repairs it in later steps.
-- **The guidance schedule window effects quality.** Extending guidance too early compresses trunk structure and reduces leaf blocks, leading to oversimplified samples. However, too late increases abnormal one and sampling instability, making the intermediate window the most stable operating point.
+Operating point selected via a 5-metric sanity check (log_size, AABB spans, BBO) keeping all metrics within ±1σ of the ground-truth distribution — to filter out shortcut solutions where a single thick pillar trivially satisfies connectivity but no longer looks like a tree.
 
 📄 [**Full PoC report**](https://www.notion.so/Connectivity-Aware-Sampling-for-Topology-CAST-PoC-32aaa15702ab8010b4ded7ec8110a79d) · 🤗 [**Pretrained checkpoints**](https://huggingface.co/jenkai-lin/cast-tree-voxel-diffusion)
 
 ---
 
-## Method (TL;DR)
+## Three Main Findings
 
-1. **Base model**: 3D voxel DDPM (16³, T=1000, cosine schedule) trained from scratch on 1,500 Minecraft-style tree volumes
-2. **Connectivity scorer**: a separate 3D CNN trained with hard-negative mining on auto-labeled positive / floating / disconnected / fragmented structures
-3. **Sampling-time guidance**: at each denoising step, add `∇ C(x_t)` to the standard DDPM update — no retraining or architectural change to the base denoiser
+**1. Connectivity failure is a sampling-dynamics problem, not a model-capacity problem.** Successful and failed samples diverge between t = 800 and t = 600 (T = 1000), and once trunk connectivity breaks during this middle phase, baseline denoising almost never repairs it in later steps. Applying guidance over the window t = 800–300 raises connectivity success from 6.5% to 30%, showing that structural failure in 3D can be fixed by intervening on the sampling trajectory rather than by scaling the model.
 
-The key empirical finding: **connectivity failures form mid-sampling (t ≈ 800–600) and rarely self-recover**. Guidance applied only within an intermediate window (t = 700–200) outperforms either always-on or late-stage-only intervention.
+**2. Guidance applied in a mid-sampling window passes both connectivity and naturalness sanity checks.** Intervening too early pushes the overall structure toward oversimplified, compressed forms; intervening too late doesn't give the diffusion prior enough time to pull samples back to the natural distribution. The intermediate window is the most stable operating point.
+
+**3. A lightweight, on-demand scorer is a practical alternative to conditioning-based control when data is scarce.** CAST's scorer has only **346K parameters and trains in 145 seconds**, with no human annotation needed (auto-labeled from base-model samples). Instead of relying on a single general scorer (e.g., CLIP in DreamFusion) to carry all control objectives, control can be split into multiple narrow, domain-specific scorers, each lightweight and aligned directly with its target metric. Multi-objective control then becomes a composition problem.
 
 <img width="1708" alt="minecraft-like-tree" src="https://github.com/user-attachments/assets/8cc758ed-622c-48e1-a922-5e39a583155d" />
+
+---
+
+## Method (TL;DR)
+
+1. **Base model**: 3D voxel DDPM (16³, T=1000, cosine schedule) trained from scratch on 1,286 Minecraft-style tree volumes.
+2. **Connectivity scorer**: a 346K-parameter 3D CNN trained with hard-negative mining on auto-labeled positive / floating / disconnected / fragmented structures. Training completes in 145 seconds on a single GPU.
+3. **Sampling-time guidance**: at each denoising step within the window t = 800–300, add `∇ C(x_t)` to the standard DDPM update — no retraining, no architectural change to the base denoiser.
 
 ---
 
@@ -72,9 +78,9 @@ Common flags (all have defaults):
 - `--out_dir` — output directory (default `./inference_outputs/run_001`)
 - `--n_steps` — sampling steps (default `1000`)
 - `--batch_size` — batch size (default `8`)
-- `--guidance_t_start`, `--guidance_t_end` — intervention window (defaults reflect best operating point)
+- `--guidance_t_start`, `--guidance_t_end` — intervention window (defaults reflect best operating point: t = 800–300)
 
-You can find the checkpint in Hugging Face page.
+Pretrained checkpoints are available on the [Hugging Face page](https://huggingface.co/jenkai-lin/cast-tree-voxel-diffusion).
 
 ### Output structure
 
