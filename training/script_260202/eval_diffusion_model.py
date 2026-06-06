@@ -75,9 +75,9 @@ try:
     from train_unet_diffusion import (
         UNet3DDiffusion,
         BetaSchedule,
-        sample_voxels,
         centered_to_onehot,
     )
+    from diffusion_sampling import sample_guided_voxels, sample_voxels
 except ImportError as e:
     print(f"[ERROR] Failed to import from training script: {e}")
     print("Make sure unet_diffusion_16_voxel.py is in the same directory.")
@@ -275,92 +275,6 @@ def load_scorer(checkpoint_path: str, device: torch.device) -> nn.Module:
             f"[green]✓[/green] Scorer checkpoint epoch: {scorer_ckpt.get('epoch', 'unknown')}"
         )
     return scorer
-
-
-@torch.no_grad()
-def sample_guided_voxels(
-    denoiser_model: nn.Module,
-    scorer_model: nn.Module,
-    betas: BetaSchedule,
-    shape: Tuple[int, ...],
-    device: torch.device,
-    guidance_scale: float = 50.0,
-    lambda_ratio: float = 10.0,
-    t_start: int = 900,
-    t_end: int = 400,
-    n_steps: Optional[int] = None,
-    use_amp: bool = False,
-    track_every: Optional[int] = None,
-    track_callback=None,
-) -> torch.Tensor:
-    """
-    Guided DDPM sampling with scorer-based gradient intervention.
-    Guidance is applied only for timesteps in [min(t_start,t_end), max(t_start,t_end)].
-    """
-    T = betas.T
-    if n_steps is None:
-        n_steps = T
-
-    B, C, H, W, D = shape
-    if (C, H, W, D) != (3, 16, 16, 16):
-        raise ValueError(f"Expected shape=(B,3,16,16,16), got {shape}")
-
-    guidance_lo = int(min(t_start, t_end))
-    guidance_hi = int(max(t_start, t_end))
-    guidance_lo = max(0, guidance_lo)
-    guidance_hi = min(T - 1, guidance_hi)
-
-    x = torch.randn(shape, device=device)
-
-    if n_steps < T:
-        timesteps = torch.linspace(T - 1, 0, n_steps, dtype=torch.long, device=device)
-    else:
-        timesteps = torch.arange(T - 1, -1, -1, device=device)
-
-    for i, t_int_tensor in enumerate(timesteps):
-        t_int = t_int_tensor.item() if isinstance(t_int_tensor, torch.Tensor) else int(t_int_tensor)
-        t = torch.full((B,), t_int, device=device, dtype=torch.long)
-
-        if guidance_scale > 0.0 and guidance_lo <= t_int <= guidance_hi:
-            with torch.enable_grad():
-                x = x.detach().requires_grad_(True)
-                pred_break_logits, pred_ratio = scorer_model(x, t)
-                energy = pred_break_logits.sum() - lambda_ratio * pred_ratio.sum()
-                grad = torch.autograd.grad(energy, x)[0]
-                x = (x - guidance_scale * grad).detach()
-
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            eps_pred = denoiser_model(x, t)
-
-        beta_t = betas.beta[t_int]
-        alpha_t = betas.alpha[t_int]
-        alpha_bar_t = betas.alpha_bar[t_int]
-        sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
-
-        pred_x0 = (x - sqrt_one_minus_alpha_bar_t * eps_pred) / torch.sqrt(alpha_bar_t)
-        pred_x0 = pred_x0.clamp(-1.0, 1.0)
-
-        if t_int > 0:
-            alpha_bar_prev = betas.alpha_bar[t_int - 1]
-        else:
-            alpha_bar_prev = torch.tensor(1.0, device=device)
-
-        coef1 = torch.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar_t)
-        coef2 = torch.sqrt(alpha_t) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
-        posterior_mean = coef1 * pred_x0 + coef2 * x
-
-        if t_int > 0:
-            posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
-            noise = torch.randn_like(x)
-            x = posterior_mean + torch.sqrt(posterior_var) * noise
-        else:
-            x = posterior_mean
-
-        if track_every is not None and track_callback is not None and i % track_every == 0:
-            for sample_idx in range(B):
-                track_callback(sample_idx, i, t_int, x[sample_idx], pred_x0[sample_idx])
-
-    return x
 
 
 def batch_evaluation(
