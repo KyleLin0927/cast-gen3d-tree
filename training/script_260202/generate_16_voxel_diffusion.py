@@ -53,7 +53,11 @@ try:
         UNet3DDiffusion,
         centered_to_onehot,
     )
-    from diffusion_sampling import sample_guided_voxels, sample_voxels
+    from diffusion_sampling import (
+        sample_guided_voxels,
+        sample_ug_guided_voxels,
+        sample_voxels,
+    )
 except ImportError as e:
     print(f"[ERROR] Failed to import from unet_diffusion_16_voxel: {e}")
     sys.exit(1)
@@ -200,6 +204,8 @@ def generate_samples(
     t_start: int = 900,
     t_end: int = 400,
     guidance_lambda_ratio: float = 10.0,
+    guidance_mode: str = "xt",
+    ug_inject: str = "eps",
     console: Optional[Console] = None,
 ) -> Tuple[float, List[Dict[str, Any]]]:
     if console is None:
@@ -238,7 +244,25 @@ def generate_samples(
         for batch_start in range(0, n_samples, batch_size):
             b = min(batch_size, n_samples - batch_start)
             with torch.no_grad():
-                if scorer_model is not None:
+                if scorer_model is not None and guidance_mode == "ug":
+                    # UG / x̂_0 route: scorer sees the Tweedie clean estimate; the
+                    # function re-enables grad internally so the gradient can flow
+                    # through the denoiser (the outer no_grad does not block it).
+                    x_0 = sample_ug_guided_voxels(
+                        denoiser_model=model,
+                        scorer_model=scorer_model,
+                        betas=betas,
+                        shape=(b, 3, 16, 16, 16),
+                        device=device,
+                        guidance_scale=guidance_scale,
+                        lambda_ratio=guidance_lambda_ratio,
+                        t_start=t_start,
+                        t_end=t_end,
+                        inject=ug_inject,
+                        n_steps=n_steps,
+                        use_amp=use_amp,
+                    )
+                elif scorer_model is not None:
                     x_0 = sample_guided_voxels(
                         denoiser_model=model,
                         scorer_model=scorer_model,
@@ -415,6 +439,29 @@ def main() -> None:
         default=400,
         help="Guidance end timestep (inclusive).",
     )
+    parser.add_argument(
+        "--guidance_mode",
+        type=str,
+        default="xt",
+        choices=["xt", "ug"],
+        help=(
+            "Guided-sampling mode (only used with --scorer_ckpt): "
+            "'xt'=scorer sees noisy x_t (Path-A, needs a --train_on xt scorer); "
+            "'ug'=Universal Guidance, scorer sees the Tweedie clean x_hat_0 "
+            "(needs a --train_on x0 clean scorer)."
+        ),
+    )
+    parser.add_argument(
+        "--ug_inject",
+        type=str,
+        default="eps",
+        choices=["eps", "x"],
+        help=(
+            "How UG injects the guidance gradient (only used with --guidance_mode ug): "
+            "'eps'=forward guidance eps_hat=eps+s*sqrt(1-abar)*grad (canonical); "
+            "'x'=direct update x_t-=s*grad (matches Path-A injection, cleanest A/B)."
+        ),
+    )
 
     args = parser.parse_args()
     t_start = datetime.now()
@@ -461,8 +508,13 @@ def main() -> None:
     guidance_lambda_ratio = args.lambda_ratio
     if args.scorer_ckpt:
         scorer_model = load_scorer(args.scorer_ckpt, device)
+        mode_desc = (
+            f"UG (x̂_0 route, inject={args.ug_inject}; needs a --train_on x0 scorer)"
+            if args.guidance_mode == "ug"
+            else "Path-A (noisy x_t; needs a --train_on xt scorer)"
+        )
         console.print(
-            f"[green]✓[/green] Guided sampling enabled: scale={args.guidance_scale} "
+            f"[green]✓[/green] Guided sampling enabled [{mode_desc}]: scale={args.guidance_scale} "
             f"window t={args.t_start}..{args.t_end} (lambda_ratio={guidance_lambda_ratio})"
         )
 
@@ -511,6 +563,8 @@ def main() -> None:
         ),
         "scorer_ckpt": args.scorer_ckpt if args.scorer_ckpt else "None",
         "guidance_scale": f"{args.guidance_scale:.10g}",
+        "guidance_mode": args.guidance_mode,
+        "ug_inject": args.ug_inject if args.guidance_mode == "ug" else "None",
         "guidance_t_start": str(args.t_start),
         "guidance_t_end": str(args.t_end),
         "guidance_lambda_ratio": f"{guidance_lambda_ratio:.10g}",
@@ -561,6 +615,8 @@ def main() -> None:
         t_start=args.t_start,
         t_end=args.t_end,
         guidance_lambda_ratio=guidance_lambda_ratio,
+        guidance_mode=args.guidance_mode,
+        ug_inject=args.ug_inject,
         console=console,
     )
 

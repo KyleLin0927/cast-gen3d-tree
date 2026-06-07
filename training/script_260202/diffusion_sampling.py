@@ -230,3 +230,118 @@ def sample_guided_voxels(
                 track_callback(sample_idx, i, t_int, x[sample_idx], pred_x0[sample_idx])
 
     return x
+
+
+def sample_ug_guided_voxels(
+    denoiser_model: nn.Module,
+    scorer_model: nn.Module,
+    betas,
+    shape: Tuple[int, ...],
+    device: torch.device,
+    guidance_scale: float = 50.0,
+    lambda_ratio: float = 10.0,
+    t_start: int = 900,
+    t_end: int = 400,
+    inject: str = "eps",
+    clamp_x0_for_scorer: bool = False,
+    n_steps: Optional[int] = None,
+    use_amp: bool = False,
+    track_every: Optional[int] = None,
+    track_callback: Optional[Callable] = None,
+) -> torch.Tensor:
+    """
+    Universal-Guidance-style sampling.
+
+    Difference vs ``sample_guided_voxels`` (Path-A):
+      - Path-A feeds the *noisy* x_t to the scorer (noise-aware classifier).
+      - Here the scorer is evaluated on the *Tweedie clean estimate* x̂_0, so the
+        guidance gradient flows THROUGH the denoiser (its Jacobian). This is the
+        core "UG / x̂_0 route".
+
+    The scorer is assumed to be a clean-domain scorer
+    (``train_scorer.py --train_on x0``) and is queried at t=0.
+
+    ``inject`` controls how the guidance gradient is injected:
+      - "eps": forward universal guidance, eps_hat = eps + s*sqrt(1-abar_t)*grad_{x_t} loss
+               (canonical UG; one denoiser forward + one backward per guided step).
+      - "x"  : direct latent update, x_t <- x_t - s*grad_{x_t} loss
+               (matches Path-A's injection, so the *only* changed variable vs
+               Path-A is "scorer sees x_hat_0 instead of x_t" -- cleanest A/B.
+               Costs an extra denoiser forward because x_t is changed before
+               the posterior step.)
+    where loss = break_logits.sum() - lambda_ratio * ratio.sum() evaluated on x_hat_0.
+
+    Not decorated with @torch.no_grad(): guidance needs grad through the denoiser.
+    Guidance is applied only for t in [min(t_start,t_end), max(t_start,t_end)].
+
+    NOTE: x_hat_0 fed to the scorer is NOT clamped by default -- clamping zeroes the
+    gradient wherever it saturates. Set ``clamp_x0_for_scorer=True`` to override.
+    """
+    if inject not in ("eps", "x"):
+        raise ValueError(f"inject must be 'eps' or 'x', got {inject!r}")
+
+    T = betas.T
+    if n_steps is None:
+        n_steps = T
+
+    B, C, H, W, D = shape
+    if (C, H, W, D) != (3, 16, 16, 16):
+        raise ValueError(f"Expected shape=(B,3,16,16,16), got {shape}")
+
+    guidance_lo = max(0, int(min(t_start, t_end)))
+    guidance_hi = min(T - 1, int(max(t_start, t_end)))
+
+    with torch.no_grad():
+        x = torch.randn(shape, device=device)
+
+    if n_steps < T:
+        timesteps = torch.linspace(T - 1, 0, n_steps, dtype=torch.long, device=device)
+    else:
+        timesteps = torch.arange(T - 1, -1, -1, device=device)
+
+    # clean-domain scorer is queried at t=0
+    t0 = torch.zeros(B, device=device, dtype=torch.long)
+
+    for i, t_int_tensor in enumerate(timesteps):
+        t_int = t_int_tensor.item() if isinstance(t_int_tensor, torch.Tensor) else int(t_int_tensor)
+        t = torch.full((B,), t_int, device=device, dtype=torch.long)
+
+        apply_guidance = guidance_scale > 0.0 and guidance_lo <= t_int <= guidance_hi
+
+        if apply_guidance:
+            with torch.enable_grad():
+                x = x.detach().requires_grad_(True)
+                # denoiser forward MUST carry grad: the guidance gradient flows
+                # through the Tweedie estimate back to x_t.
+                eps_pred = denoiser_model(x, t)
+                x0_hat = _predict_x0(x, eps_pred, t_int, betas)
+                if clamp_x0_for_scorer:
+                    x0_hat = x0_hat.clamp(-1.0, 1.0)
+                pred_break_logits, pred_ratio = scorer_model(x0_hat, t0)
+                loss = pred_break_logits.sum() - lambda_ratio * pred_ratio.sum()
+                grad = torch.autograd.grad(loss, x)[0]
+
+            with torch.no_grad():
+                if inject == "eps":
+                    sqrt_one_minus_abar_t = torch.sqrt(1.0 - betas.alpha_bar[t_int])
+                    eps_guided = (
+                        eps_pred + guidance_scale * sqrt_one_minus_abar_t * grad
+                    ).detach()
+                    x = x.detach()
+                    x, pred_x0 = _ddpm_posterior_step(x, eps_guided, t_int, betas, device)
+                else:  # inject == "x"
+                    x = (x - guidance_scale * grad).detach()
+                    with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                        eps_clean = denoiser_model(x, t)
+                    x, pred_x0 = _ddpm_posterior_step(x, eps_clean, t_int, betas, device)
+        else:
+            with torch.no_grad():
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    eps_pred = denoiser_model(x, t)
+                x, pred_x0 = _ddpm_posterior_step(x, eps_pred, t_int, betas, device)
+
+        if track_every is not None and track_callback is not None and i % track_every == 0:
+            for sample_idx in range(B):
+                track_callback(sample_idx, i, t_int, x[sample_idx], pred_x0[sample_idx])
+
+    return x

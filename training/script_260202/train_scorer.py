@@ -154,13 +154,25 @@ def prepare_scorer_data_zip(zip_path: str) -> Tuple[pd.DataFrame, str]:
 # 1. Dataset: 動態加噪與標籤處理
 # ==========================================
 class VoxelScorerDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, data_root: str, betas: BetaSchedule, t_range=(300, 950)):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        data_root: str,
+        betas: BetaSchedule,
+        t_range=(300, 950),
+        train_on: str = "xt",
+    ):
+        if train_on not in ("xt", "x0"):
+            raise ValueError(f"train_on must be 'xt' or 'x0', got {train_on!r}")
         self.df = df.reset_index(drop=True)
         self.data_root = data_root
         self._root_path = Path(data_root).resolve()
         # DataLoader workers 在 CPU 上取樣；alpha_bar 固定放 CPU，與 q_sample 一致
         self.alpha_bar_cpu = betas.alpha_bar.detach().cpu().contiguous().clone()
         self.t_min, self.t_max = t_range
+        # "xt"：加噪 voxel + 隨機時間步（noise-aware classifier，原 CAST Path-A）
+        # "x0"：乾淨 voxel + t=0（clean-domain scorer，給 Universal Guidance 用）
+        self.train_on = train_on
 
     def _resolve_npz_path(self, row) -> Path:
         cat = str(row["category"]).strip()
@@ -231,18 +243,24 @@ class VoxelScorerDataset(Dataset):
         # 轉為 [-1, 1] 的連續特徵 [3, 16, 16, 16]
         x_0 = self._labels_to_centered(labels)
 
-        # 動態抽樣時間步 t
-        t_int = np.random.randint(self.t_min, self.t_max + 1)
-        t_tensor = torch.tensor([t_int], dtype=torch.long)
+        # 依 train_on 決定 scorer 看到的輸入
+        if self.train_on == "x0":
+            # clean-domain scorer：不加噪、t 固定為 0，直接吃乾淨 voxel
+            t_tensor = torch.tensor([0], dtype=torch.long)
+            model_input = x_0
+        else:
+            # 動態抽樣時間步 t
+            t_int = np.random.randint(self.t_min, self.t_max + 1)
+            t_tensor = torch.tensor([t_int], dtype=torch.long)
 
-        # 動態加噪：與 train_unet_diffusion.q_sample 一致（噪聲在函式內抽樣）
-        x_t, _ = q_sample(
-            x_0.unsqueeze(0),
-            t_tensor,
-            self.alpha_bar_cpu,
-            x_0.device,
-        )
-        x_t = x_t.squeeze(0)
+            # 動態加噪：與 train_unet_diffusion.q_sample 一致（噪聲在函式內抽樣）
+            x_t, _ = q_sample(
+                x_0.unsqueeze(0),
+                t_tensor,
+                self.alpha_bar_cpu,
+                x_0.device,
+            )
+            model_input = x_t.squeeze(0)
 
         # 準備雙頭標籤
         # y_break: gt / positive 為 0 (完美)，其餘為 1 (瑕疵)
@@ -252,7 +270,7 @@ class VoxelScorerDataset(Dataset):
         # y_ratio: 直接取 csv 中的 base_connected_ratio
         y_ratio = torch.tensor([row["base_connected_ratio"]], dtype=torch.float32)
 
-        return x_t, t_tensor.squeeze(0), y_break, y_ratio
+        return model_input, t_tensor.squeeze(0), y_break, y_ratio
 
     def _labels_to_centered(self, labels: np.ndarray) -> torch.Tensor:
         t_labels = torch.from_numpy(labels).long()
@@ -364,6 +382,17 @@ def parse_args():
     p.add_argument("--lambda_ratio", type=float, default=10.0, help="MSE (ratio) loss 權重")
     p.add_argument("--t_min", type=int, default=300)
     p.add_argument("--t_max", type=int, default=950)
+    p.add_argument(
+        "--train_on",
+        type=str,
+        default="xt",
+        choices=["xt", "x0"],
+        help=(
+            "scorer 訓練輸入：'xt'＝加噪 voxel + 隨機 t（原 noise-aware classifier，Path-A）；"
+            "'x0'＝乾淨 voxel + t=0（Universal Guidance 用的 clean-domain scorer）。"
+            "選 'x0' 時 --t_min/--t_max 不生效。"
+        ),
+    )
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--save_every", type=int, default=10, help="每 N 個 epoch 存一次 checkpoint（0 表示只訓練不存）")
     p.add_argument("--beta_T", type=int, default=1000, help="BetaSchedule T（與 diffusion 訓練一致）")
@@ -413,8 +442,11 @@ def main():
 
     betas = BetaSchedule(T=args.beta_T, schedule=args.beta_schedule)
     dataset = VoxelScorerDataset(
-        labels_df, zip_extract_root, betas, t_range=(args.t_min, args.t_max)
+        labels_df, zip_extract_root, betas, t_range=(args.t_min, args.t_max),
+        train_on=args.train_on,
     )
+    print(f"Scorer training input: train_on={args.train_on} "
+          f"({'乾淨 x_0 + t=0 (UG clean scorer)' if args.train_on == 'x0' else '加噪 x_t + 隨機 t (Path-A)'})")
     n_total = len(dataset)
     if n_total < 2:
         raise ValueError(f"Need at least 2 samples for train/val split, got {n_total}")
@@ -463,6 +495,7 @@ def main():
         "lambda_ratio": args.lambda_ratio,
         "t_min": args.t_min,
         "t_max": args.t_max,
+        "train_on": args.train_on,
         "num_workers": args.num_workers,
         "save_every": args.save_every,
         "beta_T": args.beta_T,
