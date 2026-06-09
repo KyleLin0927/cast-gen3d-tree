@@ -79,7 +79,7 @@ def sample_voxels(
     Args:
         model: UNet3DDiffusion model
         betas: BetaSchedule instance
-        shape: (B, C, H, W, D) where C=3, H=W=D=16
+        shape: (B, C, H, W, D) where C=3 and H=W=D=N (cube; 16 for Minecraft, 32 for ShapeNet)
         device: torch device
         n_steps: number of sampling steps (default: T, can use fewer for speed)
         use_amp: whether to use mixed precision
@@ -191,8 +191,9 @@ def sample_guided_voxels(
         n_steps = T
 
     B, C, H, W, D = shape
-    if (C, H, W, D) != (3, 16, 16, 16):
-        raise ValueError(f"Expected shape=(B,3,16,16,16), got {shape}")
+    # 解析度無關：接受任意立方體 (B,3,N,N,N)，例如 16³（Minecraft）或 32³（ShapeNet）。
+    if C != 3 or not (H == W == D):
+        raise ValueError(f"Expected shape=(B,3,N,N,N) cubic with C=3, got {shape}")
 
     guidance_lo = int(min(t_start, t_end))
     guidance_hi = int(max(t_start, t_end))
@@ -285,8 +286,9 @@ def sample_ug_guided_voxels(
         n_steps = T
 
     B, C, H, W, D = shape
-    if (C, H, W, D) != (3, 16, 16, 16):
-        raise ValueError(f"Expected shape=(B,3,16,16,16), got {shape}")
+    # 解析度無關：接受任意立方體 (B,3,N,N,N)，例如 16³（Minecraft）或 32³（ShapeNet）。
+    if C != 3 or not (H == W == D):
+        raise ValueError(f"Expected shape=(B,3,N,N,N) cubic with C=3, got {shape}")
 
     guidance_lo = max(0, int(min(t_start, t_end)))
     guidance_hi = min(T - 1, int(max(t_start, t_end)))

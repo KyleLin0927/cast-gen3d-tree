@@ -149,6 +149,7 @@ def generate_samples(
     target_counts: Dict[str, int],
     out_dir: str,
     batch_size: int = 10,
+    res: int = 32,
     n_steps: Optional[int] = None,
     use_amp: bool = False,
     save_projections: bool = True,
@@ -214,7 +215,7 @@ def generate_samples(
                     x_0 = sample_voxels(
                         model,
                         betas,
-                        shape=(b, 3, 16, 16, 16),
+                        shape=(b, 3, res, res, res),
                         device=device,
                         n_steps=n_steps,
                         use_amp=use_amp,
@@ -340,6 +341,7 @@ def main() -> None:
     parser.add_argument("--n_easy", type=int, default=0, help="Target number of neg_easy samples")
     parser.add_argument("--n_hard", type=int, default=0, help="Target number of neg_hard samples")
     parser.add_argument("--batch_size", type=int, default=10)
+    parser.add_argument("--res", type=int, default=32, help="Voxel cube resolution N (N×N×N). 32 for ShapeNet; must match the checkpoint's training resolution.")
     parser.add_argument("--n_steps", type=int, default=None, help="Sampling steps (default: T)")
     parser.add_argument("--base_channels", type=int, default=64)
     parser.add_argument("--time_dim", type=int, default=128)
@@ -501,6 +503,7 @@ def main() -> None:
         target_counts=targets,
         out_dir=args.out_dir,
         batch_size=args.batch_size,
+        res=args.res,
         n_steps=args.n_steps,
         use_amp=use_amp,
         save_projections=not args.no_projections,

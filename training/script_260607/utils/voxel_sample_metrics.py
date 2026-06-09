@@ -47,17 +47,20 @@ ALL_SCORER_CATEGORIES = (
 
 
 def classify_scorer_category(
-    base_connected_size: int,
     log_components: int,
+    total_log_size: int,
 ) -> str:
     """
-    分類依 scorer 設定：
-    1) neg_float: 連地板都沒碰到（base_connected_size==0）
-    2) positive: 有碰到地板且全樹只有 1 個連通塊（log_components==1；Absolute Connectivity）
-    3) neg_hard / neg_easy: 在 base_connected_size>0 且 log_components>1 時，
-       log_components==2 為 neg_hard，否則為 neg_easy。
+    Category-agnostic 分類（不依賴地板 / trunk，適用任意 3D 物件，如 ShapeNet 椅子）：
+    1) neg_float: 沒有任何 wood voxel（total_log_size==0；空結構 / 退化樣本）
+    2) positive : wood 恰好形成 1 個連通塊（log_components==1；Absolute Connectivity）
+    3) neg_hard : log_components==2
+    4) neg_easy : log_components>=3
+
+    註：保留原 4 個類別常數名（positive/neg_float/neg_easy/neg_hard），讓 generate 分桶與
+    scorer 目錄結構不必更動；只是 neg_float 從「沒碰到地板」改為「完全沒有結構」。
     """
-    if base_connected_size == 0:
+    if total_log_size == 0:
         return CAT_NEG_FLOAT
     if log_components == 1:
         return CAT_POSITIVE
@@ -70,13 +73,17 @@ def compute_sample_metrics(
     labels: np.ndarray,
 ) -> Dict[str, Any]:
     """
-    計算單個樣本的所有指標。
+    計算單個樣本的所有指標（category-agnostic：連通度以「最大 wood 連通塊」與「連通塊數」
+    定義，不依賴地板，適用任意解析度的立方體，如 16³ / 32³）。
 
     Args:
-        labels: [16, 16, 16] numpy array with class labels (0=air, 1=log, 2=leaf)
+        labels: [D, H, W] numpy array with class labels (0=air, 1=log/occupancy, 2=leaf)；
+                任意立方體尺寸皆可（ShapeNet 為 32³）。
 
     Returns:
-        dict，鍵名含：
+        dict，鍵名含（為相容下游，鍵名沿用舊名，但語意改為 category-agnostic）：
+            - Is_Main_Trunk_Broken (= 非單一連通塊), Is_Broken (= wood 斷成多塊)
+            - Base_Connected_Size (= 最大連通塊大小), Base_Connected_Ratio (= 最大連通塊比例)
             - Is_Main_Trunk_Broken, Is_Broken
             - Mass, Height, Log_Size, Leaf_Size
             - Base_Connected_Size, Total_Log_Size, Base_Connected_Ratio
@@ -88,20 +95,26 @@ def compute_sample_metrics(
             - Components_Non_Air, Components_Log, Components_Leaf
         （ID 由呼叫端另行寫入，例如 eval 腳本。）
     """
-    trunk_info = compute_trunk_breakage(labels, debug=False)
     occ_rates = compute_occupancy_rates(labels)
     comp_counts = compute_component_counts_26neighbor(labels)
     largest_log_ratio = compute_largest_log_component_ratio(labels)
 
-    base_sz = int(trunk_info["base_connected_size"])
-    total_log = int(trunk_info["total_wood_size"])
-    base_connected_ratio = (float(base_sz) / float(total_log)) if total_log > 0 else 0.0
-
+    total_log = int((labels == 1).sum())
     log_components = int(comp_counts["log"])
 
+    # === Category-agnostic 連通度 ===
+    # 以「最大 wood 連通塊」取代原本「連到地板(Y=0)的塊」。
+    # largest_log_ratio = 最大連通塊 / 全部 wood，落在 [0,1]（無 wood 時 0；無 scipy 時 -1）。
+    llr = largest_log_ratio if largest_log_ratio >= 0 else 0.0
+    base_connected_ratio = llr                       # 重新定義：最大連通塊比例（scorer 的 y_ratio）
+    base_sz = int(round(llr * total_log))            # 重新定義：最大連通塊大小
+    is_connected = (total_log > 0 and log_components == 1)  # 單一連通塊＝結構完整
+    is_broken = bool(total_log > 0 and log_components > 1)  # 斷成多塊
+    is_main_trunk_broken = bool(not is_connected)          # 非單一連通塊即視為主結構斷裂
+
     scorer_category = classify_scorer_category(
-        base_connected_size=base_sz,
         log_components=log_components,
+        total_log_size=total_log,
     )
 
     mass = int((labels != 0).sum())
@@ -134,8 +147,8 @@ def compute_sample_metrics(
         log_bbo = 0.0
 
     return {
-        "Is_Main_Trunk_Broken": trunk_info["is_main_trunk_broken"],
-        "Is_Broken": trunk_info["is_broken"],
+        "Is_Main_Trunk_Broken": is_main_trunk_broken,
+        "Is_Broken": is_broken,
         "Mass": mass,
         "Height": height,
         "Log_Size": log_size,

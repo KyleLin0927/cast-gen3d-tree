@@ -284,6 +284,7 @@ def batch_evaluation(
     n_samples: int,
     n_steps: Optional[int] = None,
     batch_size: int = 10,
+    res: int = 32,
     use_amp: bool = False,
     output_dir: Optional[str] = None,
     exp_name: Optional[str] = None,
@@ -364,7 +365,7 @@ def batch_evaluation(
                         denoiser_model=model,
                         scorer_model=scorer_model,
                         betas=betas,
-                        shape=(current_batch_size, 3, 16, 16, 16),
+                        shape=(current_batch_size, 3, res, res, res),
                         device=device,
                         guidance_scale=guidance_scale,
                         lambda_ratio=guidance_lambda_ratio,
@@ -379,7 +380,7 @@ def batch_evaluation(
                     x_0_batch = sample_voxels(
                         model,
                         betas,
-                        shape=(current_batch_size, 3, 16, 16, 16),
+                        shape=(current_batch_size, 3, res, res, res),
                         device=device,
                         n_steps=n_steps,
                         use_amp=use_amp,
@@ -441,6 +442,7 @@ def dynamics_evaluation(
     n_steps: Optional[int] = None,
     track_every: int = 50,
     batch_size: int = 5,
+    res: int = 32,
     use_amp: bool = False,
     output_dir: Optional[str] = None,
     exp_name: Optional[str] = None,
@@ -629,7 +631,7 @@ def dynamics_evaluation(
                         denoiser_model=model,
                         scorer_model=scorer_model,
                         betas=betas,
-                        shape=(current_batch_size, 3, 16, 16, 16),
+                        shape=(current_batch_size, 3, res, res, res),
                         device=device,
                         guidance_scale=guidance_scale,
                         lambda_ratio=guidance_lambda_ratio,
@@ -644,7 +646,7 @@ def dynamics_evaluation(
                     x_0_batch = sample_voxels(
                         model,
                         betas,
-                        shape=(current_batch_size, 3, 16, 16, 16),
+                        shape=(current_batch_size, 3, res, res, res),
                         device=device,
                         n_steps=n_steps,
                         use_amp=use_amp,
@@ -1782,6 +1784,7 @@ def main():
     parser.add_argument("--time_dim", type=int, default=128, help="Time embedding dimension (if not in checkpoint)")
     
     # Sampling
+    parser.add_argument("--res", type=int, default=32, help="Voxel cube resolution N (N×N×N). 32 for ShapeNet; must match the checkpoint's training resolution.")
     parser.add_argument("--n_samples", type=int, default=100, help="Number of samples for batch evaluation")
     parser.add_argument("--n_dynamics_samples", type=int, default=5, help="Number of samples for dynamics analysis")
     parser.add_argument("--n_steps", type=int, default=None, help="Number of sampling steps (default: T from checkpoint)")
@@ -2029,6 +2032,7 @@ def main():
         n_samples=args.n_samples,
         n_steps=args.n_steps,
         batch_size=batch_eval_batch_size,
+        res=args.res,
         use_amp=use_amp,
         output_dir=exp_output_dir,
         exp_name=out_dir_leaf,
@@ -2079,6 +2083,7 @@ def main():
         n_steps=args.n_steps,
         track_every=args.track_every,
         batch_size=dynamics_batch_size,
+        res=args.res,
         use_amp=use_amp,
         output_dir=exp_output_dir,
         exp_name=out_dir_leaf,

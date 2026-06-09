@@ -143,9 +143,15 @@ def main() -> None:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--res",
+        type=int,
+        default=32,
+        help="Required voxel cube resolution N (N×N×N). 32 for ShapeNet, 16 for old Minecraft data.",
+    )
+    parser.add_argument(
         "--no_require_16_cube",
         action="store_true",
-        help="Do not require shape (16, 16, 16)",
+        help="Do not enforce the (res, res, res) shape check at all.",
     )
     parser.add_argument(
         "--seed",
@@ -192,7 +198,9 @@ def main() -> None:
             f"([dim]from last component of --out_dir[/dim])"
         )
 
-    expected: Optional[Tuple[int, int, int]] = None if args.no_require_16_cube else (16, 16, 16)
+    expected: Optional[Tuple[int, int, int]] = (
+        None if args.no_require_16_cube else (args.res, args.res, args.res)
+    )
 
     t0 = time.time()
     scan_root = npz_root.resolve()

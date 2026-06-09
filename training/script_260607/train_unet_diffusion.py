@@ -239,7 +239,7 @@ class VoxelDataset(Dataset):
                 console.print(f"[cyan]Preloading {len(files)} files into RAM...[/cyan]")
             for i, path in enumerate(files):
                 arr = load_voxel_npz(path)
-                assert arr.shape == (16, 16, 16), f"Expected (16,16,16), got {arr.shape} from {path}"
+                assert arr.ndim == 3 and arr.shape[0] == arr.shape[1] == arr.shape[2], f"Expected a cubic voxel array (N,N,N), got {arr.shape} from {path}"
                 # 優化：使用 int8 而不是 int64，節省記憶體
                 arr_int8 = arr.astype(np.int8)
                 tensor = torch.from_numpy(arr_int8)
@@ -249,8 +249,9 @@ class VoxelDataset(Dataset):
                 if console and (i + 1) % 1000 == 0:
                     console.print(f"  Loaded {i + 1}/{len(files)} files...")
             if console:
-                # 更新記憶體計算：int8 而不是 int64
-                mem_mb = len(files) * 16 * 16 * 16 * 1 / (1024**2)
+                # 更新記憶體計算：int8 而不是 int64；解析度無關（由實際 voxel 數推算）
+                vox_per_file = self.data_cache[0].numel() if self.data_cache else 0
+                mem_mb = len(files) * vox_per_file * 1 / (1024**2)
                 console.print(f"[green]✓[/green] Preloaded {len(files)} files (~{mem_mb:.1f} MB)")
 
         if aug_mode == "enumerate":
@@ -326,7 +327,7 @@ class VoxelDataset(Dataset):
         else:
             path = self.files[file_idx]
             arr = load_voxel_npz(path)
-            assert arr.shape == (16, 16, 16), f"Expected (16,16,16), got {arr.shape} from {path}"
+            assert arr.ndim == 3 and arr.shape[0] == arr.shape[1] == arr.shape[2], f"Expected a cubic voxel array (N,N,N), got {arr.shape} from {path}"
             labels = torch.from_numpy(arr.astype(np.int64))
 
         labels = self._apply_rot_flip(labels, kx, ky, kz, fx, fy, fz)
@@ -1983,7 +1984,7 @@ def train_diffusion(args):
                         x_0_samples = sample_voxels(
                             model,
                             betas,
-                            shape=(args.n_samples, 3, 16, 16, 16),
+                            shape=(args.n_samples, 3, args.res, args.res, args.res),
                             device=device,
                             n_steps=sample_steps,
                             use_amp=use_amp,
@@ -2628,6 +2629,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train 3D Voxel Diffusion Model")
     
     # Data
+    parser.add_argument("--res", type=int, default=32, help="Voxel cube resolution N (N×N×N). 32 for ShapeNetVox32; 16 for the old Minecraft data.")
     parser.add_argument("--data_root", type=str, default=None, help="Path to data directory (with train/val subdirs)")
     parser.add_argument("--data_zip", type=str, default=None, help="Path to zip file containing train/val/test subdirs")
     parser.add_argument(
