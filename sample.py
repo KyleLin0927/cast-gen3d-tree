@@ -10,6 +10,7 @@ Default behavior:
 
 Optional:
 - Enable scorer guidance by providing --scorer_checkpoint
+- Use --guidance_mode xt (noisy x_t, Path-A) or ug (Universal Guidance, Tweedie x_hat_0)
 """
 
 from __future__ import annotations
@@ -71,6 +72,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--guidance_t_start", type=int, default=900, help="Guidance start timestep")
     parser.add_argument("--guidance_t_end", type=int, default=400, help="Guidance end timestep")
+    parser.add_argument(
+        "--guidance_mode",
+        type=str,
+        default="xt",
+        choices=["xt", "ug"],
+        help=(
+            "Guided-sampling mode (only with --scorer_checkpoint): "
+            "'xt'=scorer sees noisy x_t (Path-A, needs --train_on xt scorer); "
+            "'ug'=Universal Guidance, scorer sees Tweedie x_hat_0 (needs --train_on x0 scorer)."
+        ),
+    )
+    parser.add_argument(
+        "--ug_inject",
+        type=str,
+        default="eps",
+        choices=["eps", "x"],
+        help=(
+            "How UG injects the guidance gradient (only with --guidance_mode ug): "
+            "'eps'=forward guidance eps_hat=eps+s*sqrt(1-abar)*grad; "
+            "'x'=direct update x_t-=s*grad."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -108,8 +131,13 @@ def main() -> None:
     scorer_model: Optional[nn.Module] = None
     if args.scorer_checkpoint:
         scorer_model = load_scorer(str(Path(args.scorer_checkpoint).expanduser().resolve()), device)
+        mode_desc = (
+            f"UG (x̂_0 route, inject={args.ug_inject}; needs a --train_on x0 scorer)"
+            if args.guidance_mode == "ug"
+            else "Path-A (noisy x_t; needs a --train_on xt scorer)"
+        )
         console.print(
-            f"[green]Guidance ON[/green]: scale={args.guidance_scale}, "
+            f"[green]Guidance ON[/green] [{mode_desc}]: scale={args.guidance_scale}, "
             f"lambda_ratio={args.guidance_lambda_ratio}, "
             f"t=[{args.guidance_t_start}, {args.guidance_t_end}]"
         )
@@ -136,6 +164,8 @@ def main() -> None:
         t_start=int(args.guidance_t_start),
         t_end=int(args.guidance_t_end),
         guidance_lambda_ratio=float(args.guidance_lambda_ratio),
+        guidance_mode=str(args.guidance_mode),
+        ug_inject=str(args.ug_inject),
         console=console,
     )
 
