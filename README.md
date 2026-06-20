@@ -12,14 +12,18 @@
 
 ## Key Results
 
-Evaluated on 1,000 generated samples (16³ voxel grid):
+Connectivity success = fraction of generated samples whose trunk forms a **single connected component** *and* passes a geometric **sanity check** (so a thick single pillar that trivially satisfies connectivity but no longer looks like a tree does **not** count). 16³ voxel grid; each guided cell is the best group passing the sanity check.
 
-| Method | Connectivity Success ↑ |
-|---|---|
-| Baseline DDPM | 6.5% |
-| **CAST (ours)** | **30.0%** (≈5× baseline) |
+| Connectivity success ↑ | Full-time guidance | **Windowed** (t = 800–300) |
+|---|---|---|
+| **Universal Guidance** (x̂₀, clean-domain) | 15% | **39%** |
+| **Classifier Guidance** (xₜ, noise-aware) | 36% | 30% |
 
-Operating point selected via a 5-metric sanity check (log_size, AABB spans, BBO) keeping all metrics within ±1σ of the ground-truth distribution — to filter out shortcut solutions where a single thick pillar trivially satisfies connectivity but no longer looks like a tree.
+Baseline DDPM (no guidance): **6.5%**.
+
+**The takeaway is the asymmetry, not a single number.** Windowing helps the clean-domain scorer a lot (UG: 15 → 39) but slightly *hurts* the noise-aware one (CG: 36 → 30). x̂₀ is only reliable in the middle of denoising (its early-step Tweedie estimate diverges), so restricting it to a mid window is exactly right; xₜ is noise-aware and can act across all timesteps, but pays for it with more shortcut solutions. **The value and form of intervention depend on which domain the scorer reads.**
+
+> 📌 *Coming from the v2 report?* v2 reported the **30%** windowed (xₜ) result. v3 adds the UG × CG 2×2 above; the clean-domain scorer in the mid-window reaches **39%**. Both numbers are in the table — nothing was retracted, the picture was completed.
 
 📄 [**Full PoC report**](https://drinkai.notion.site/Connectivity-Aware-Sampling-for-Topology-CAST-report-v2-36daa15702ab801f8291d71c2bc043c5) · 🤗 [**Pretrained checkpoints**](https://huggingface.co/jenkai-lin/cast-tree-voxel-diffusion)
 
@@ -27,11 +31,11 @@ Operating point selected via a 5-metric sanity check (log_size, AABB spans, BBO)
 
 ## Three Main Findings
 
-**1. Connectivity failure is a sampling-dynamics problem, not a model-capacity problem.** Successful and failed samples diverge between t = 800 and t = 600 (T = 1000), and once trunk connectivity breaks during this middle phase, baseline denoising almost never repairs it in later steps. Applying guidance over the window t = 800–300 raises connectivity success from 6.5% to 30%, showing that structural failure in 3D can be fixed by intervening on the sampling trajectory rather than by scaling the model.
+**1. Connectivity failure is a sampling-dynamics problem, not a model-capacity problem.** Successful and failed samples diverge between t = 800 and t = 600 (T = 1000), and once trunk connectivity breaks during this middle phase, baseline denoising almost never repairs it in later steps. Intervening over the window t = 800–300 raises connectivity success up to **39%** (and to 30% for the noise-aware scorer), showing that structural failure in 3D can be fixed by acting on the sampling *trajectory* rather than by scaling the model.
 
-**2. Guidance applied in a mid-sampling window passes both connectivity and naturalness sanity checks.** Intervening too early pushes the overall structure toward oversimplified, compressed forms; intervening too late doesn't give the diffusion prior enough time to pull samples back to the natural distribution. The intermediate window is the most stable operating point.
+**2. Guidance applied in a mid-sampling window passes both connectivity and naturalness sanity checks.** Intervening too early pushes the overall structure toward oversimplified, compressed forms; intervening too late doesn't give the diffusion prior enough time to pull samples back to the natural distribution. The intermediate window is the most stable operating point — and *how much* the window helps depends on the scorer's operating domain (see Key Results).
 
-**3. A lightweight, on-demand scorer is a practical alternative to conditioning-based control when data is scarce.** CAST's scorer has only **346K parameters and trains in 145 seconds**, with no human annotation needed (auto-labeled from base-model samples). Instead of relying on a single general scorer (e.g., CLIP in DreamFusion) to carry all control objectives, control can be split into multiple narrow, domain-specific scorers, each lightweight and aligned directly with its target metric. Multi-objective control then becomes a composition problem.
+**3. A lightweight, on-demand scorer is a practical alternative to conditioning-based control when data is scarce.** CAST's scorer has only **346K parameters (1.3% of the 26M base denoiser) and trains in 145 seconds** on a single GPU, with no human annotation — it is auto-labeled from the base model's own samples. Instead of relying on one general scorer (e.g., CLIP in DreamFusion) to carry every control objective, control can be split into multiple narrow, domain-specific scorers, each lightweight and aligned directly with its target metric. Multi-objective control then becomes a composition problem.
 
 <img width="1708" alt="minecraft-like-tree" src="https://github.com/user-attachments/assets/8cc758ed-622c-48e1-a922-5e39a583155d" />
 
@@ -39,9 +43,13 @@ Operating point selected via a 5-metric sanity check (log_size, AABB spans, BBO)
 
 ## Method (TL;DR)
 
-1. **Base model**: 3D voxel DDPM (16³, T=1000, cosine schedule) trained from scratch on 1,286 Minecraft-style tree volumes.
-2. **Connectivity scorer**: a 346K-parameter 3D CNN trained with hard-negative mining on auto-labeled positive / floating / disconnected / fragmented structures. Training completes in 145 seconds on a single GPU.
-3. **Sampling-time guidance**: at each denoising step within the window t = 800–300, add `∇ C(x_t)` to the standard DDPM update — no retraining, no architectural change to the base denoiser.
+1. **Base model** — a 3D voxel DDPM (16³, T = 1000, cosine schedule) trained from scratch on 1,286 Minecraft-style tree volumes. No conditioning.
+2. **Connectivity scorer** — a 346K-parameter 3D CNN trained with hard-negative mining on auto-labeled `positive / floating / disconnected / fragmented` structures (labels come from the base model's own outputs via a BFS connectivity check). Training completes in ~145 seconds on a single GPU.
+3. **Sampling-time guidance** — at each denoising step inside the window t = 800–300, nudge the standard DDPM update with the scorer gradient. Two routes are compared:
+   - **xₜ (noise-aware, classifier-guidance style)** — the scorer reads the noisy state directly.
+   - **x̂₀ (clean-domain, Universal-Guidance style)** — the scorer reads the Tweedie-estimated clean voxel.
+
+   No retraining and no architectural change to the base denoiser in either route.
 
 ---
 
@@ -64,13 +72,31 @@ Tested on Python 3.11.8, macOS / Linux, NVIDIA GPU recommended.
 python sample.py --checkpoint /path/to/diffusion_best.pt
 ```
 
-### Generate with CAST guidance
+### Generate with guidance
+
+CAST supports two sampling-time guidance routes. Pair each route with the matching scorer checkpoint (`--train_on xt` for CG, `--train_on x0` for UG). Pretrained checkpoints are on the [Hugging Face page](https://huggingface.co/jenkai-lin/cast-tree-voxel-diffusion).
+
+**Classifier Guidance** (xₜ, noise-aware — windowed **30%** in Key Results):
 
 ```bash
 python sample.py \
   --checkpoint /path/to/diffusion_best.pt \
-  --scorer_checkpoint /path/to/scorer_best.pt \
-  --guidance_scale 2.0
+  --scorer_checkpoint /path/to/scorer_xt_best.pt \
+  --guidance_mode xt \
+  --guidance_t_start 800 \
+  --guidance_t_end 300
+```
+
+**Universal Guidance** (x̂₀, clean-domain — windowed **39%** in Key Results):
+
+```bash
+python sample.py \
+  --checkpoint /path/to/diffusion_best.pt \
+  --scorer_checkpoint /path/to/scorer_x0_best.pt \
+  --guidance_mode ug \
+  --ug_inject eps \
+  --guidance_t_start 800 \
+  --guidance_t_end 300
 ```
 
 Common flags (all have defaults):
@@ -78,9 +104,10 @@ Common flags (all have defaults):
 - `--out_dir` — output directory (default `./inference_outputs/run_001`)
 - `--n_steps` — sampling steps (default `1000`)
 - `--batch_size` — batch size (default `8`)
-- `--guidance_t_start`, `--guidance_t_end` — intervention window (defaults reflect best operating point: t = 800–300)
-
-Pretrained checkpoints are available on the [Hugging Face page](https://huggingface.co/jenkai-lin/cast-tree-voxel-diffusion).
+- `--guidance_mode` — `xt` (classifier / noise-aware) or `ug` (Universal Guidance / clean x̂₀)
+- `--ug_inject` — UG gradient injection: `eps` (default) or `x` (only with `--guidance_mode ug`)
+- `--guidance_scale`, `--guidance_lambda_ratio` — guidance strength (tune per route; see report)
+- `--guidance_t_start`, `--guidance_t_end` — intervention window (Key Results use **t = 800–300**; script default is 900–400)
 
 ### Output structure
 
