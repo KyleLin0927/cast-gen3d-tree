@@ -52,8 +52,8 @@ try:
         BetaSchedule,
         UNet3DDiffusion,
         centered_to_onehot,
-        sample_voxels,
     )
+    from diffusion_sampling import sample_voxels
 except ImportError as e:
     print(f"[ERROR] Failed to import from unet_diffusion_16_voxel: {e}")
     sys.exit(1)

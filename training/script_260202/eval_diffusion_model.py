@@ -77,7 +77,11 @@ try:
         BetaSchedule,
         centered_to_onehot,
     )
-    from diffusion_sampling import sample_guided_voxels, sample_voxels
+    from diffusion_sampling import (
+        sample_guided_voxels,
+        sample_ug_guided_voxels,
+        sample_voxels,
+    )
 except ImportError as e:
     print(f"[ERROR] Failed to import from training script: {e}")
     print("Make sure unet_diffusion_16_voxel.py is in the same directory.")
@@ -295,6 +299,8 @@ def batch_evaluation(
     t_start: int = 900,
     t_end: int = 400,
     guidance_lambda_ratio: float = 10.0,
+    guidance_mode: str = "xt",
+    ug_inject: str = "eps",
     console: Optional[Console] = None,
 ) -> Tuple[List[Dict], float]:
     """
@@ -359,7 +365,24 @@ def batch_evaluation(
             
             # Generate batch of samples
             with torch.no_grad():
-                if scorer_model is not None:
+                if scorer_model is not None and guidance_mode == "ug":
+                    x_0_batch = sample_ug_guided_voxels(
+                        denoiser_model=model,
+                        scorer_model=scorer_model,
+                        betas=betas,
+                        shape=(current_batch_size, 3, 16, 16, 16),
+                        device=device,
+                        guidance_scale=guidance_scale,
+                        lambda_ratio=guidance_lambda_ratio,
+                        t_start=t_start,
+                        t_end=t_end,
+                        inject=ug_inject,
+                        n_steps=n_steps,
+                        use_amp=use_amp,
+                        track_every=None,
+                        track_callback=None,
+                    )
+                elif scorer_model is not None:
                     x_0_batch = sample_guided_voxels(
                         denoiser_model=model,
                         scorer_model=scorer_model,
@@ -454,6 +477,8 @@ def dynamics_evaluation(
     t_start: int = 900,
     t_end: int = 400,
     guidance_lambda_ratio: float = 10.0,
+    guidance_mode: str = "xt",
+    ug_inject: str = "eps",
     console: Optional[Console] = None,
 ) -> Tuple[List[Dict], float]:
     """
@@ -624,7 +649,24 @@ def dynamics_evaluation(
             track_callback = make_track_callback(batch_start)
             
             with torch.no_grad():
-                if scorer_model is not None:
+                if scorer_model is not None and guidance_mode == "ug":
+                    x_0_batch = sample_ug_guided_voxels(
+                        denoiser_model=model,
+                        scorer_model=scorer_model,
+                        betas=betas,
+                        shape=(current_batch_size, 3, 16, 16, 16),
+                        device=device,
+                        guidance_scale=guidance_scale,
+                        lambda_ratio=guidance_lambda_ratio,
+                        t_start=t_start,
+                        t_end=t_end,
+                        inject=ug_inject,
+                        n_steps=n_steps,
+                        use_amp=use_amp,
+                        track_every=track_every,
+                        track_callback=track_callback,
+                    )
+                elif scorer_model is not None:
                     x_0_batch = sample_guided_voxels(
                         denoiser_model=model,
                         scorer_model=scorer_model,
@@ -1849,6 +1891,27 @@ def main():
         default=400,
         help="Guidance end timestep (inclusive).",
     )
+    parser.add_argument(
+        "--guidance_mode",
+        type=str,
+        default="xt",
+        choices=["xt", "ug"],
+        help=(
+            "Guided-sampling mode (with --scorer_ckpt): "
+            "'xt'=scorer sees noisy x_t (Path-A, needs a --train_on xt scorer); "
+            "'ug'=Universal Guidance, scorer sees Tweedie x_hat_0 (needs a --train_on x0 scorer)."
+        ),
+    )
+    parser.add_argument(
+        "--ug_inject",
+        type=str,
+        default="eps",
+        choices=["eps", "x"],
+        help=(
+            "How UG injects the guidance gradient (with --guidance_mode ug): "
+            "'eps'=forward guidance; 'x'=direct x_t update."
+        ),
+    )
     
     args = parser.parse_args()
     
@@ -1914,8 +1977,13 @@ def main():
     guidance_lambda_ratio = args.lambda_ratio
     if args.scorer_ckpt:
         scorer_model = load_scorer(args.scorer_ckpt, device)
+        mode_desc = (
+            f"UG (x_hat_0 route, inject={args.ug_inject}; needs a --train_on x0 scorer)"
+            if args.guidance_mode == "ug"
+            else "Path-A (noisy x_t; needs a --train_on xt scorer)"
+        )
         console.print(
-            f"[green]✓[/green] Guided sampling enabled: scale={args.guidance_scale} "
+            f"[green]✓[/green] Guided sampling enabled [{mode_desc}]: scale={args.guidance_scale} "
             f"window t={args.t_start}..{args.t_end} (lambda_ratio={guidance_lambda_ratio})"
         )
     
@@ -2040,6 +2108,8 @@ def main():
         t_start=args.t_start,
         t_end=args.t_end,
         guidance_lambda_ratio=guidance_lambda_ratio,
+        guidance_mode=args.guidance_mode,
+        ug_inject=args.ug_inject,
         console=console,
     )
     
@@ -2092,6 +2162,8 @@ def main():
         t_start=args.t_start,
         t_end=args.t_end,
         guidance_lambda_ratio=guidance_lambda_ratio,
+        guidance_mode=args.guidance_mode,
+        ug_inject=args.ug_inject,
         console=console,
     )
     
