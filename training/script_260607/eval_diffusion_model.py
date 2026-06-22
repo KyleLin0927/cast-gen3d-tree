@@ -97,6 +97,7 @@ from utils.voxel_sample_metrics import (
     CAT_NEG_HARD,
     CAT_POSITIVE,
     compute_sample_metrics,
+    set_min_component_voxels,
 )
 
 
@@ -1785,6 +1786,13 @@ def main():
     
     # Sampling
     parser.add_argument("--res", type=int, default=32, help="Voxel cube resolution N (N×N×N). 32 for ShapeNet; must match the checkpoint's training resolution.")
+    parser.add_argument(
+        "--min_component_voxels",
+        type=int,
+        default=0,
+        help="Speckle filter: ignore wood fragments smaller than this many voxels when "
+        "classifying connectivity (positive/broken). 0=off. Try 5 to discount tiny noise.",
+    )
     parser.add_argument("--n_samples", type=int, default=100, help="Number of samples for batch evaluation")
     parser.add_argument("--n_dynamics_samples", type=int, default=5, help="Number of samples for dynamics analysis")
     parser.add_argument("--n_steps", type=int, default=None, help="Number of sampling steps (default: T from checkpoint)")
@@ -1854,7 +1862,10 @@ def main():
     )
     
     args = parser.parse_args()
-    
+
+    # speckle 過濾門檻（影響連通度 positive/broken 分類）
+    set_min_component_voxels(args.min_component_voxels)
+
     # Set random seeds if seed is provided
     if args.seed is not None:
         random.seed(args.seed)

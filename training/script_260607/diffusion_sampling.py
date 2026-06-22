@@ -26,9 +26,14 @@ def _ddpm_posterior_step(
     device: torch.device,
     *,
     clamp_x0: bool = True,
+    temperature: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Given x_t and predicted noise, compute pred_x0 and sample x_{t-1}.
+
+    ``temperature`` scales the stochastic posterior noise (1.0 = standard ancestral
+    DDPM; 0.0 = deterministic, take the posterior mean every step). Used for the
+    sampling ablation (is the connectivity failure stochastic-sampling-driven?).
 
     Returns:
         x_prev: next latent (x_{t-1}, or x_0 when t_int == 0)
@@ -51,11 +56,12 @@ def _ddpm_posterior_step(
     coef2 = torch.sqrt(alpha_t) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
     posterior_mean = coef1 * pred_x0 + coef2 * x
 
-    if t_int > 0:
+    if t_int > 0 and temperature > 0.0:
         posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
         noise = torch.randn_like(x)
-        x_prev = posterior_mean + torch.sqrt(posterior_var) * noise
+        x_prev = posterior_mean + temperature * torch.sqrt(posterior_var) * noise
     else:
+        # t_int == 0 (final step) or temperature == 0 (deterministic): posterior mean only
         x_prev = posterior_mean
 
     return x_prev, pred_x0
@@ -72,9 +78,13 @@ def sample_voxels(
     track_every=None,
     track_callback=None,
     verbose: bool = True,
+    temperature: float = 1.0,
 ):
     """
     Reverse diffusion process: sample voxels from noise.
+
+    ``temperature`` scales the per-step stochastic noise (1.0 = standard DDPM;
+    0.0 = deterministic). For the sampling-ablation experiment.
 
     Args:
         model: UNet3DDiffusion model
@@ -153,7 +163,7 @@ def sample_voxels(
                 )
 
         x, pred_x0 = _ddpm_posterior_step(
-            x, eps_pred, t_int, betas, device, clamp_x0=True
+            x, eps_pred, t_int, betas, device, clamp_x0=True, temperature=temperature
         )
 
         if track_every is not None and track_callback is not None and i % track_every == 0:

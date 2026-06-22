@@ -14,6 +14,15 @@ from typing import Any, Dict
 
 import numpy as np
 
+try:
+    from scipy.ndimage import label as _ndi_label
+
+    _HAS_SCIPY_LOCAL = True
+except Exception:  # pragma: no cover
+    _HAS_SCIPY_LOCAL = False
+
+_STRUCT_26 = np.ones((3, 3, 3), dtype=np.int32)
+
 # utils/ 的上一層即 script_260202（unet_diffusion_16_voxel.py 所在目錄）
 _script_260202 = Path(__file__).resolve().parents[1]
 if str(_script_260202) not in sys.path:
@@ -44,6 +53,42 @@ ALL_SCORER_CATEGORIES = (
     CAT_NEG_EASY,
     CAT_NEG_HARD,
 )
+
+
+# speckle 過濾門檻：分類連通度時，忽略小於此體素數的 wood 碎片。0＝關閉（行為與原本一致）。
+# 由各入口腳本的 --min_component_voxels 旗標在 main() 開頭呼叫 set_min_component_voxels() 設定。
+_MIN_COMPONENT_VOXELS = 0
+
+
+def set_min_component_voxels(k: int) -> None:
+    """設定 speckle 過濾門檻 k（忽略 < k 顆的 wood 連通塊）。0 = 關閉。"""
+    global _MIN_COMPONENT_VOXELS
+    try:
+        _MIN_COMPONENT_VOXELS = max(0, int(k))
+    except (TypeError, ValueError):
+        _MIN_COMPONENT_VOXELS = 0
+
+
+def get_min_component_voxels() -> int:
+    """目前的 speckle 過濾門檻。"""
+    return _MIN_COMPONENT_VOXELS
+
+
+def _effective_log_components(labels: np.ndarray, min_voxels: int, raw_components: int) -> int:
+    """
+    忽略小於 ``min_voxels`` 顆的 wood 連通塊（碎片）後，剩下的「有效」連通塊數。
+    ``min_voxels<=0`` 或無 scipy 時，直接回傳 ``raw_components``（即原始計數）。
+    """
+    if min_voxels <= 0 or not _HAS_SCIPY_LOCAL:
+        return raw_components
+    mask = (labels == 1).astype(np.int32)
+    if int(mask.sum()) == 0:
+        return 0
+    lab, n = _ndi_label(mask, structure=_STRUCT_26)
+    if n == 0:
+        return 0
+    sizes = np.bincount(lab.ravel())[1:]  # 去掉背景 (label 0)
+    return int((sizes >= int(min_voxels)).sum())
 
 
 def classify_scorer_category(
@@ -100,7 +145,7 @@ def compute_sample_metrics(
     largest_log_ratio = compute_largest_log_component_ratio(labels)
 
     total_log = int((labels == 1).sum())
-    log_components = int(comp_counts["log"])
+    log_components = int(comp_counts["log"])  # 原始連通塊數（含雜點），仍寫入 Components_Log
 
     # === Category-agnostic 連通度 ===
     # 以「最大 wood 連通塊」取代原本「連到地板(Y=0)的塊」。
@@ -108,12 +153,17 @@ def compute_sample_metrics(
     llr = largest_log_ratio if largest_log_ratio >= 0 else 0.0
     base_connected_ratio = llr                       # 重新定義：最大連通塊比例（scorer 的 y_ratio）
     base_sz = int(round(llr * total_log))            # 重新定義：最大連通塊大小
-    is_connected = (total_log > 0 and log_components == 1)  # 單一連通塊＝結構完整
-    is_broken = bool(total_log > 0 and log_components > 1)  # 斷成多塊
-    is_main_trunk_broken = bool(not is_connected)          # 非單一連通塊即視為主結構斷裂
+
+    # speckle 容忍：若 --min_component_voxels>0，分類時忽略小碎片，只看「有效連通塊數」。
+    # 預設 0＝關閉，effective == log_components（行為不變）。Components_Log 仍記原始計數。
+    effective_components = _effective_log_components(labels, _MIN_COMPONENT_VOXELS, log_components)
+
+    is_connected = (total_log > 0 and effective_components == 1)  # 單一(有效)連通塊＝結構完整
+    is_broken = bool(total_log > 0 and effective_components > 1)  # 斷成多塊
+    is_main_trunk_broken = bool(not is_connected)                # 非單一連通塊即視為主結構斷裂
 
     scorer_category = classify_scorer_category(
-        log_components=log_components,
+        log_components=effective_components,
         total_log_size=total_log,
     )
 

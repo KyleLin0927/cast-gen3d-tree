@@ -40,6 +40,7 @@ from utils.export_csv import (
 )
 from utils.voxel_label_projections import save_labels_and_projections
 from utils.voxel_npz_io import load_voxel_npz
+from utils.voxel_sample_metrics import set_min_component_voxels
 
 
 def source_name_for_csv(file_path: Path, scan_root: Path) -> str:
@@ -149,6 +150,13 @@ def main() -> None:
         help="Required voxel cube resolution N (N×N×N). 32 for ShapeNet, 16 for old Minecraft data.",
     )
     parser.add_argument(
+        "--min_component_voxels",
+        type=int,
+        default=0,
+        help="Speckle filter: ignore wood fragments smaller than this many voxels when "
+        "classifying connectivity (positive/broken). 0=off. Try 5 to discount tiny noise.",
+    )
+    parser.add_argument(
         "--no_require_16_cube",
         action="store_true",
         help="Do not enforce the (res, res, res) shape check at all.",
@@ -171,6 +179,9 @@ def main() -> None:
         help="Directory for PNGs (default: <out_dir>/projections)",
     )
     args = parser.parse_args()
+
+    # speckle 過濾門檻（影響連通度 positive/broken 分類）
+    set_min_component_voxels(args.min_component_voxels)
 
     console = Console()
     npz_root = Path(args.npz_dir).expanduser()

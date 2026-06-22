@@ -75,6 +75,7 @@ from utils.voxel_sample_metrics import (
     CAT_NEG_FLOAT,
     CAT_NEG_HARD,
     CAT_POSITIVE,
+    set_min_component_voxels,
 )
 
 
@@ -193,6 +194,7 @@ def generate_samples(
     batch_size: int = 10,
     res: int = 32,
     n_steps: Optional[int] = None,
+    temperature: float = 1.0,
     use_amp: bool = False,
     save_projections: bool = True,
     save_npz: bool = False,
@@ -288,6 +290,7 @@ def generate_samples(
                         track_every=None,
                         track_callback=None,
                         verbose=sample_verbose,
+                        temperature=temperature,
                     )
 
             for i in range(b):
@@ -383,6 +386,20 @@ def main() -> None:
     parser.add_argument("--res", type=int, default=32, help="Voxel cube resolution N (N×N×N). 32 for ShapeNet; must match the checkpoint's training resolution.")
     parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--n_steps", type=int, default=None, help="Sampling steps (default: T)")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Stochastic noise scale during ancestral sampling. 1.0=standard DDPM, "
+        "0.0=deterministic (posterior mean only). For the sampling ablation.",
+    )
+    parser.add_argument(
+        "--min_component_voxels",
+        type=int,
+        default=0,
+        help="Speckle filter: ignore wood fragments smaller than this many voxels when "
+        "classifying connectivity (positive/broken). 0=off. Try 5 to discount tiny noise.",
+    )
     parser.add_argument("--base_channels", type=int, default=64)
     parser.add_argument("--time_dim", type=int, default=128)
     parser.add_argument("--T", type=int, default=1000)
@@ -468,6 +485,9 @@ def main() -> None:
     args = parser.parse_args()
     t_start = datetime.now()
 
+    # speckle 過濾門檻（影響 sample_labels.csv 的 positive/broken 分類）
+    set_min_component_voxels(args.min_component_voxels)
+
     out_dir_leaf = Path(args.out_dir).expanduser().resolve().name
     if not out_dir_leaf:
         out_dir_leaf = "sample"
@@ -546,6 +566,7 @@ def main() -> None:
         "n_samples": args.n_samples,
         "batch_size": args.batch_size,
         "n_steps": args.n_steps if args.n_steps is not None else T,
+        "temperature": args.temperature,
         "T": T,
         "beta_schedule": beta_schedule,
         "beta_start": beta_start,
@@ -606,6 +627,7 @@ def main() -> None:
         batch_size=args.batch_size,
         res=args.res,
         n_steps=args.n_steps,
+        temperature=args.temperature,
         use_amp=use_amp,
         save_projections=not args.no_projections,
         save_npz=save_npz,
