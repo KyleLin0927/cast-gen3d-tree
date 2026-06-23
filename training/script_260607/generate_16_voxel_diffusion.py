@@ -4,6 +4,7 @@
 
 輸出（預設）：
 - projections/{positive,neg_float,neg_easy,neg_hard}/：各類別三視圖 PNG
+- orthoslices/{...}/：與 projections 平行的正交切片蒙太奇（--no_projections 時兩者皆不存）
 - npz/{...}/：同上，每檔僅含陣列鍵 ``voxel``（--no_npz 可關閉）
 - sample_labels.csv: 每個樣本的 id、seed、分類與 compute_sample_metrics 之完整指標（見下方欄位）
 - sample_labels_summary.csv: 全體樣本指標統計（兩欄 Metric, Value）；由
@@ -62,7 +63,7 @@ except ImportError as e:
     print(f"[ERROR] Failed to import from unet_diffusion_16_voxel: {e}")
     sys.exit(1)
 
-from utils.voxel_label_projections import save_labels_and_projections
+from utils.voxel_orthoslices import save_labels_projections_and_orthoslices
 from utils.voxel_npz_io import save_voxel_npz
 from utils.export_csv import (
     compute_sample_label_row,
@@ -215,12 +216,16 @@ def generate_samples(
         console = Console()
 
     proj_roots: Dict[str, Optional[str]] = {c: None for c in ALL_SCORER_CATEGORIES}
+    ortho_roots: Dict[str, Optional[str]] = {c: None for c in ALL_SCORER_CATEGORIES}
     npz_roots: Dict[str, Optional[str]] = {c: None for c in ALL_SCORER_CATEGORIES}
     if save_projections:
         for c in ALL_SCORER_CATEGORIES:
             p = os.path.join(out_dir, "projections", c)
             os.makedirs(p, exist_ok=True)
             proj_roots[c] = p
+            o = os.path.join(out_dir, "orthoslices", c)
+            os.makedirs(o, exist_ok=True)
+            ortho_roots[c] = o
     if save_npz:
         for c in ALL_SCORER_CATEGORIES:
             p = os.path.join(out_dir, "npz", c)
@@ -309,7 +314,7 @@ def generate_samples(
                 pr = proj_roots.get(cat)
                 if pr:
                     png_path = os.path.join(pr, f"{stem}.png")
-                    save_labels_and_projections(
+                    save_labels_projections_and_orthoslices(
                         labels,
                         png_path,
                         exp_name=stem,
@@ -355,6 +360,13 @@ def generate_samples(
         for c in ALL_SCORER_CATEGORIES:
             if proj_roots[c]:
                 console.print(f"    [dim]→[/dim] [cyan]projections/{c}/[/cyan]")
+        console.print(
+            "[green]✓[/green] Orthoslices: [cyan]orthoslices/[/cyan]"
+            "{positive, neg_float, neg_easy, neg_hard}/"
+        )
+        for c in ALL_SCORER_CATEGORIES:
+            if ortho_roots[c]:
+                console.print(f"    [dim]→[/dim] [cyan]orthoslices/{c}/[/cyan]")
     if any(npz_roots.values()):
         console.print(
             "[green]✓[/green] NPZ: [cyan]npz/[/cyan]"
@@ -410,7 +422,11 @@ def main() -> None:
     parser.add_argument("--beta_end", type=float, default=0.02)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--no_amp", action="store_true")
-    parser.add_argument("--no_projections", action="store_true", help="Skip PNG projections")
+    parser.add_argument(
+        "--no_projections",
+        action="store_true",
+        help="Skip PNG projections and orthoslice montages",
+    )
     parser.add_argument(
         "--no_npz",
         action="store_true",
@@ -592,6 +608,7 @@ def main() -> None:
         "guidance_t_end": str(args.t_end),
         "guidance_lambda_ratio": f"{guidance_lambda_ratio:.10g}",
         "projections_root": os.path.join(os.path.abspath(args.out_dir), "projections"),
+        "orthoslices_root": os.path.join(os.path.abspath(args.out_dir), "orthoslices"),
         "npz_root": os.path.join(os.path.abspath(args.out_dir), "npz"),
         "projections_positive_dir": os.path.join(
             os.path.abspath(args.out_dir), "projections", CAT_POSITIVE
@@ -604,6 +621,18 @@ def main() -> None:
         ),
         "projections_neg_hard_dir": os.path.join(
             os.path.abspath(args.out_dir), "projections", CAT_NEG_HARD
+        ),
+        "orthoslices_positive_dir": os.path.join(
+            os.path.abspath(args.out_dir), "orthoslices", CAT_POSITIVE
+        ),
+        "orthoslices_neg_float_dir": os.path.join(
+            os.path.abspath(args.out_dir), "orthoslices", CAT_NEG_FLOAT
+        ),
+        "orthoslices_neg_easy_dir": os.path.join(
+            os.path.abspath(args.out_dir), "orthoslices", CAT_NEG_EASY
+        ),
+        "orthoslices_neg_hard_dir": os.path.join(
+            os.path.abspath(args.out_dir), "orthoslices", CAT_NEG_HARD
         ),
         "npz_positive_dir": os.path.join(os.path.abspath(args.out_dir), "npz", CAT_POSITIVE),
         "npz_neg_float_dir": os.path.join(
