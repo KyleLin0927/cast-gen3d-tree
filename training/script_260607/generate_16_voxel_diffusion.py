@@ -6,6 +6,10 @@
 - projections/{positive,neg_float,neg_easy,neg_hard}/：各類別三視圖 PNG
 - orthoslices/{...}/：與 projections 平行的正交切片蒙太奇（--no_projections 時兩者皆不存）
 - npz/{...}/：同上，每檔僅含陣列鍵 ``voxel``（--no_npz 可關閉）
+- renders/{...}/：matplotlib 3D 立體方塊圖（論文式定性圖）；**預設不產生**，加 --render_3d 才開，
+  且只算前 --render_3d_max 張（算圖較慢，故設上限）。
+- viewers/{...}/：互動式 3D HTML（瀏覽器滑鼠旋轉、連通配色看斷裂）；**預設不產生**，
+  加 --render_html 才開，只出前 --render_html_max 個。
 - sample_labels.csv: 每個樣本的 id、seed、分類與 compute_sample_metrics 之完整指標（見下方欄位）
 - sample_labels_summary.csv: 全體樣本指標統計（兩欄 Metric, Value）；由
   ``utils.export_csv.write_sample_labels_summary_csv`` 產生（與 aggregate 解析規則對齊）
@@ -64,6 +68,7 @@ except ImportError as e:
     sys.exit(1)
 
 from utils.voxel_orthoslices import save_labels_projections_and_orthoslices
+from utils.voxel_render import save_voxel_render, save_voxel_html
 from utils.voxel_npz_io import save_voxel_npz
 from utils.export_csv import (
     compute_sample_label_row,
@@ -199,6 +204,13 @@ def generate_samples(
     use_amp: bool = False,
     save_projections: bool = True,
     save_npz: bool = False,
+    save_renders: bool = False,
+    render_max: int = 16,
+    render_color: str = "component",
+    render_elev: float = 22.0,
+    render_azim: float = -60.0,
+    save_html: bool = False,
+    html_max: int = 8,
     log_mask_threshold: Optional[float] = None,
     filename_prefix: str = "sample",
     sample_verbose: bool = False,
@@ -218,6 +230,8 @@ def generate_samples(
     proj_roots: Dict[str, Optional[str]] = {c: None for c in ALL_SCORER_CATEGORIES}
     ortho_roots: Dict[str, Optional[str]] = {c: None for c in ALL_SCORER_CATEGORIES}
     npz_roots: Dict[str, Optional[str]] = {c: None for c in ALL_SCORER_CATEGORIES}
+    render_roots: Dict[str, Optional[str]] = {c: None for c in ALL_SCORER_CATEGORIES}
+    viewer_roots: Dict[str, Optional[str]] = {c: None for c in ALL_SCORER_CATEGORIES}
     if save_projections:
         for c in ALL_SCORER_CATEGORIES:
             p = os.path.join(out_dir, "projections", c)
@@ -231,9 +245,21 @@ def generate_samples(
             p = os.path.join(out_dir, "npz", c)
             os.makedirs(p, exist_ok=True)
             npz_roots[c] = p
+    if save_renders:
+        for c in ALL_SCORER_CATEGORIES:
+            r = os.path.join(out_dir, "renders", c)
+            os.makedirs(r, exist_ok=True)
+            render_roots[c] = r
+    if save_html:
+        for c in ALL_SCORER_CATEGORIES:
+            v = os.path.join(out_dir, "viewers", c)
+            os.makedirs(v, exist_ok=True)
+            viewer_roots[c] = v
 
     t0 = time.time()
     idx = 0
+    n_rendered = 0
+    n_html = 0
     label_rows: List[Dict[str, Any]] = []
 
     with Progress(
@@ -324,6 +350,35 @@ def generate_samples(
                 if nz:
                     save_voxel_npz(os.path.join(nz, f"{stem}.npz"), labels)
 
+                rr = render_roots.get(cat)
+                if rr and n_rendered < render_max:
+                    # 算圖失敗（如 matplotlib 版本差異）絕不可中斷生成 → 包起來、只記警告。
+                    try:
+                        save_voxel_render(
+                            labels,
+                            os.path.join(rr, f"{stem}.png"),
+                            color_mode=render_color,
+                            elev=render_elev,
+                            azim=render_azim,
+                            exp_name=stem,
+                        )
+                        n_rendered += 1
+                    except Exception as e:  # noqa: BLE001
+                        console.print(f"[yellow]⚠ 3D render 跳過 {stem}: {e}[/yellow]")
+
+                vr = viewer_roots.get(cat)
+                if vr and n_html < html_max:
+                    # 同樣包起來：HTML 產生失敗也不可中斷生成。
+                    try:
+                        save_voxel_html(
+                            labels,
+                            os.path.join(vr, f"{stem}.html"),
+                            title=stem,
+                        )
+                        n_html += 1
+                    except Exception as e:  # noqa: BLE001
+                        console.print(f"[yellow]⚠ HTML viewer 跳過 {stem}: {e}[/yellow]")
+
                 if save_npz:
                     row["source_name"] = f"npz/{cat}/{stem}.npz"
                 elif save_projections and pr:
@@ -367,6 +422,18 @@ def generate_samples(
         for c in ALL_SCORER_CATEGORIES:
             if ortho_roots[c]:
                 console.print(f"    [dim]→[/dim] [cyan]orthoslices/{c}/[/cyan]")
+    if any(render_roots.values()):
+        console.print(
+            f"[green]✓[/green] 3D renders: [cyan]renders/[/cyan]"
+            f"{{positive, neg_float, neg_easy, neg_hard}}/ "
+            f"([dim]{n_rendered} 張，上限 {render_max}[/dim])"
+        )
+    if any(viewer_roots.values()):
+        console.print(
+            f"[green]✓[/green] HTML viewers: [cyan]viewers/[/cyan]"
+            f"{{positive, neg_float, neg_easy, neg_hard}}/ "
+            f"([dim]{n_html} 個，上限 {html_max}[/dim])"
+        )
     if any(npz_roots.values()):
         console.print(
             "[green]✓[/green] NPZ: [cyan]npz/[/cyan]"
@@ -431,6 +498,55 @@ def main() -> None:
         "--no_npz",
         action="store_true",
         help="Do not save per-sample .npz under npz/ (default: save npz)",
+    )
+    parser.add_argument(
+        "--render_3d",
+        action="store_true",
+        help="Also save matplotlib 3D voxel renders under renders/<cat>/ (paper-style "
+        "qualitative figures). Off by default; renders are slow so only the first "
+        "--render_3d_max samples are drawn.",
+    )
+    parser.add_argument(
+        "--render_3d_max",
+        type=int,
+        default=16,
+        help="Max number of 3D renders to save (total across categories, in generation order). "
+        "Only used with --render_3d.",
+    )
+    parser.add_argument(
+        "--render_3d_color",
+        type=str,
+        default="component",
+        choices=["component", "clay", "occupancy"],
+        help="3D render coloring: 'component'=connectivity colors (matches projections/orthoslices); "
+        "'clay'=uniform matte (cleanest hero look); 'occupancy'=density. Only used with --render_3d.",
+    )
+    parser.add_argument(
+        "--render_3d_elev",
+        type=float,
+        default=22.0,
+        help="3D render camera elevation (degrees). Only used with --render_3d.",
+    )
+    parser.add_argument(
+        "--render_3d_azim",
+        type=float,
+        default=-60.0,
+        help="3D render camera azimuth (degrees); rotate to change which way the chair faces. "
+        "Only used with --render_3d.",
+    )
+    parser.add_argument(
+        "--render_html",
+        action="store_true",
+        help="Also save interactive 3D HTML viewers under viewers/<cat>/ (browser mouse-rotate, "
+        "connectivity-colored to inspect breakage). Off by default; only the first "
+        "--render_html_max samples are written.",
+    )
+    parser.add_argument(
+        "--render_html_max",
+        type=int,
+        default=8,
+        help="Max number of HTML viewers to save (total across categories, in generation order). "
+        "Only used with --render_html.",
     )
     parser.add_argument(
         "--log_mask_threshold",
@@ -602,6 +718,11 @@ def main() -> None:
         "save_projections": str(not args.no_projections),
         "save_npz": str(save_npz),
         "no_npz": str(args.no_npz),
+        "render_3d": str(args.render_3d),
+        "render_3d_max": str(args.render_3d_max),
+        "render_3d_color": args.render_3d_color,
+        "render_html": str(args.render_html),
+        "render_html_max": str(args.render_html_max),
         "filename_prefix": out_dir_leaf,
         "sample_labels_csv": os.path.join(os.path.abspath(args.out_dir), "sample_labels.csv"),
         "sample_labels_summary_csv": os.path.join(
@@ -617,6 +738,7 @@ def main() -> None:
         "projections_root": os.path.join(os.path.abspath(args.out_dir), "projections"),
         "orthoslices_root": os.path.join(os.path.abspath(args.out_dir), "orthoslices"),
         "npz_root": os.path.join(os.path.abspath(args.out_dir), "npz"),
+        "renders_root": os.path.join(os.path.abspath(args.out_dir), "renders"),
         "projections_positive_dir": os.path.join(
             os.path.abspath(args.out_dir), "projections", CAT_POSITIVE
         ),
@@ -667,6 +789,13 @@ def main() -> None:
         use_amp=use_amp,
         save_projections=not args.no_projections,
         save_npz=save_npz,
+        save_renders=args.render_3d,
+        render_max=args.render_3d_max,
+        render_color=args.render_3d_color,
+        render_elev=args.render_3d_elev,
+        render_azim=args.render_3d_azim,
+        save_html=args.render_html,
+        html_max=args.render_html_max,
         log_mask_threshold=args.log_mask_threshold,
         filename_prefix=out_dir_leaf,
         sample_verbose=args.sample_verbose,
