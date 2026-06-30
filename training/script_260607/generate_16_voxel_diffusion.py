@@ -515,10 +515,17 @@ def main() -> None:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
         if torch.cuda.is_available():
+            # Reduce CuBLAS non-determinism warnings on CUDA>=10.2.
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
             torch.cuda.manual_seed_all(args.seed)
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
-        torch.use_deterministic_algorithms(True, warn_only=True)
+        # Scorer-guided sampling runs backward inside sampling steps; some CUDA ops
+        # (e.g. max_pool3d backward) have no deterministic implementation.
+        if args.scorer_ckpt:
+            torch.use_deterministic_algorithms(False)
+        else:
+            torch.use_deterministic_algorithms(True, warn_only=True)
 
     console = Console()
     console.print("[bold]16³ Voxel Diffusion — sample generation only[/bold]\n")
